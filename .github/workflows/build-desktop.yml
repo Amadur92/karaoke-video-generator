@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -27,7 +27,7 @@ jobs:
           python-version: '3.11'
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -37,7 +37,7 @@ jobs:
           restore-keys: windows-box-cargo-
 
       - name: Cache Python packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: windows-box-pip-${{ hashFiles('worker/requirements.txt') }}
@@ -67,7 +67,7 @@ jobs:
           Compress-Archive -Path "packaging\dist\KaraokeGenerator-windows\*" -DestinationPath $zipPath
 
       - name: Upload Windows box artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: KaraokeGenerator-Windows-x64-portable
           path: packaging/dist/KaraokeGenerator-Windows-x64-portable.zip
@@ -96,7 +96,7 @@ jobs:
         working-directory: desktop_app
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -134,7 +134,7 @@ jobs:
           Compress-Archive -Path ${{ matrix.binary_name }} -DestinationPath ../${{ matrix.artifact_name }}.zip
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: desktop_app/${{ matrix.artifact_name }}.*
