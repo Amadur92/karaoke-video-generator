@@ -1829,30 +1829,98 @@ impl eframe::App for KaraokeApp {
             }
 
             if self.generated_file.is_some() {
-                if let Some(texture) = &self.video_texture {
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(page_margin);
-                        let available_width = ui.available_width() - page_margin * 2.0;
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(page_margin);
+                    let available_width = ui.available_width() - page_margin * 2.0;
+                    let preview_size = if let Some(texture) = &self.video_texture {
                         let texture_size = texture.size_vec2();
                         let aspect = if texture_size.y > 0.0 {
                             texture_size.x / texture_size.y
                         } else {
                             16.0 / 9.0
                         };
-                        let preview_size =
-                            egui::vec2(available_width, (available_width / aspect).min(360.0));
+                        egui::vec2(available_width, (available_width / aspect).min(380.0))
+                    } else {
+                        egui::vec2(available_width, (available_width * 9.0 / 16.0).min(380.0))
+                    };
 
-                        card_frame.show(ui, |ui| {
-                            ui.add(
-                                egui::Image::new(texture)
-                                    .fit_to_exact_size(preview_size)
-                                    .rounding(egui::Rounding::same(8.0)),
-                            );
+                    card_frame.show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Предпросмотр")
+                                        .strong()
+                                        .size(13.0)
+                                        .color(text),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(if self.is_video_playing() {
+                                                "идет воспроизведение"
+                                            } else {
+                                                "готов к запуску"
+                                            })
+                                            .size(11.0)
+                                            .color(muted),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(8.0);
+
+                            if let Some(texture) = &self.video_texture {
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(preview_size)
+                                        .rounding(egui::Rounding::same(8.0)),
+                                );
+                            } else {
+                                let (preview_rect, _) =
+                                    ui.allocate_exact_size(preview_size, egui::Sense::hover());
+                                let painter = ui.painter();
+                                painter.rect_filled(
+                                    preview_rect,
+                                    8.0,
+                                    egui::Color32::from_rgb(8, 10, 14),
+                                );
+                                painter.rect_stroke(
+                                    preview_rect,
+                                    8.0,
+                                    egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgb(48, 58, 74),
+                                    ),
+                                );
+                                painter.circle_filled(
+                                    preview_rect.center(),
+                                    28.0,
+                                    egui::Color32::from_rgb(45, 118, 255),
+                                );
+                                painter.text(
+                                    preview_rect.center() + egui::vec2(2.0, 0.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "▶",
+                                    egui::FontId::proportional(26.0),
+                                    egui::Color32::WHITE,
+                                );
+                                painter.text(
+                                    egui::pos2(
+                                        preview_rect.center().x,
+                                        preview_rect.center().y + 52.0,
+                                    ),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Нажмите «Воспроизвести», чтобы посмотреть видео здесь",
+                                    egui::FontId::proportional(13.0),
+                                    muted,
+                                );
+                            }
                         });
-                        ui.add_space(page_margin);
                     });
-                }
+                    ui.add_space(page_margin);
+                });
             }
         });
 
