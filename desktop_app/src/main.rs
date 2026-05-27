@@ -4,6 +4,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
 
 // Шрифты Montserrat вкомпилированы прямо в бинарник — нулевая зависимость от внешних файлов
 const MONTSERRAT_REGULAR: &[u8] = include_bytes!("../assets/Montserrat-Regular.ttf");
@@ -249,6 +250,9 @@ struct KaraokeApp {
     trim_status: String,
     preview_stream: Option<rodio::OutputStream>,
     preview_sink: Option<rodio::Sink>,
+    preview_started_at: Option<Instant>,
+    preview_started_ms: i64,
+    preview_end_ms: i64,
     artist: String,
     title: String,
     lyrics: String,
@@ -339,6 +343,9 @@ impl KaraokeApp {
             trim_status: String::new(),
             preview_stream: None,
             preview_sink: None,
+            preview_started_at: None,
+            preview_started_ms: 0,
+            preview_end_ms: 0,
             artist: settings.artist,
             title: settings.title,
             lyrics: settings.lyrics,
@@ -370,9 +377,17 @@ impl KaraokeApp {
             sink.stop();
         }
         self.preview_stream = None;
+        self.preview_started_at = None;
+        self.preview_started_ms = 0;
+        self.preview_end_ms = 0;
     }
 
-    fn play_audio_preview(&mut self, path: &Path) -> Result<(), String> {
+    fn play_audio_preview(
+        &mut self,
+        path: &Path,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<(), String> {
         self.stop_preview();
 
         let file = std::fs::File::open(path)
@@ -389,7 +404,39 @@ impl KaraokeApp {
 
         self.preview_stream = Some(stream);
         self.preview_sink = Some(sink);
+        self.preview_started_at = Some(Instant::now());
+        self.preview_started_ms = start_ms;
+        self.preview_end_ms = end_ms;
         Ok(())
+    }
+
+    fn sync_preview_playhead(&mut self, ctx: &egui::Context) {
+        let Some(started_at) = self.preview_started_at else {
+            return;
+        };
+
+        let elapsed_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        self.trim_playhead_ms = (self.preview_started_ms + elapsed_ms).min(self.preview_end_ms);
+
+        let finished = self
+            .preview_sink
+            .as_ref()
+            .map(|sink| sink.empty())
+            .unwrap_or(true)
+            || self.trim_playhead_ms >= self.preview_end_ms;
+
+        if finished {
+            self.trim_playhead_ms = self.preview_end_ms;
+            if let Some(sink) = self.preview_sink.take() {
+                sink.stop();
+            }
+            self.preview_stream = None;
+            self.preview_started_at = None;
+            self.preview_started_ms = 0;
+            self.preview_end_ms = 0;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
     }
 
     fn set_audio_file(&mut self, path: PathBuf) {
@@ -481,7 +528,7 @@ impl KaraokeApp {
 
         let preview_path = temp_dir().join("karaoke_trim_preview.wav");
         match render_trimmed_audio(&audio_path, play_start, end, &preview_path)
-            .and_then(|_| self.play_audio_preview(&preview_path))
+            .and_then(|_| self.play_audio_preview(&preview_path, play_start, end))
         {
             Ok(()) => {
                 self.trim_status = format!(
@@ -506,11 +553,11 @@ impl KaraokeApp {
     ) {
         self.normalize_trim_state();
 
-        let desired_size = egui::vec2(ui.available_width(), 46.0);
+        let desired_size = egui::vec2(ui.available_width(), 64.0);
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
         let track_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 8.0, rect.center().y - 4.0),
-            egui::pos2(rect.right() - 8.0, rect.center().y + 4.0),
+            egui::pos2(rect.left() + 8.0, rect.center().y - 3.0),
+            egui::pos2(rect.right() - 8.0, rect.center().y + 5.0),
         );
         let track_width = track_rect.width().max(1.0);
 
@@ -524,17 +571,22 @@ impl KaraokeApp {
 
         if (response.dragged() || response.clicked()) && !self.is_generating {
             if let Some(pointer) = response.interact_pointer_pos() {
+                if self.is_preview_playing() {
+                    self.stop_preview();
+                }
+
                 let target_ms = from_x(pointer.x);
-                let handles = [
-                    (self.trim_start_ms, 0usize),
-                    (self.trim_end_ms, 1usize),
-                    (self.trim_playhead_ms, 2usize),
-                ];
-                let nearest = handles
-                    .iter()
-                    .min_by_key(|(ms, _)| (to_x(*ms) - pointer.x).abs() as i64)
-                    .map(|(_, idx)| *idx)
-                    .unwrap_or(2);
+                let nearest = if pointer.y <= track_rect.center().y {
+                    if (to_x(self.trim_start_ms) - pointer.x).abs()
+                        <= (to_x(self.trim_end_ms) - pointer.x).abs()
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    2
+                };
 
                 match nearest {
                     0 => self.trim_start_ms = target_ms.min(self.trim_end_ms - 1000).max(0),
@@ -559,12 +611,27 @@ impl KaraokeApp {
         );
         painter.rect_filled(selected_rect, 4.0, egui::Color32::from_rgb(37, 78, 125));
 
+        painter.line_segment(
+            [
+                egui::pos2(track_rect.left(), track_rect.top() - 10.0),
+                egui::pos2(track_rect.right(), track_rect.top() - 10.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 66, 82)),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(track_rect.left(), track_rect.bottom() + 10.0),
+                egui::pos2(track_rect.right(), track_rect.bottom() + 10.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(39, 47, 60)),
+        );
+
         for tick in 0..=4 {
             let x = track_rect.left() + track_width * tick as f32 / 4.0;
             painter.line_segment(
                 [
-                    egui::pos2(x, track_rect.bottom() + 5.0),
-                    egui::pos2(x, track_rect.bottom() + 10.0),
+                    egui::pos2(x, track_rect.bottom() + 14.0),
+                    egui::pos2(x, track_rect.bottom() + 18.0),
                 ],
                 egui::Stroke::new(1.0, muted),
             );
@@ -574,26 +641,49 @@ impl KaraokeApp {
         let end_x = to_x(self.trim_end_ms);
         let play_x = to_x(self.trim_playhead_ms);
 
-        let handle_y = track_rect.center().y;
-        for (x, color, label) in [
-            (start_x, success, "S"),
-            (end_x, success, "E"),
-            (play_x, accent, "▶"),
-        ] {
-            painter.circle_filled(egui::pos2(x, handle_y), 8.0, color);
+        let draw_pin = |x: f32, color: egui::Color32, label: &str, above: bool| {
+            let tip_y = if above {
+                track_rect.top() - 1.0
+            } else {
+                track_rect.bottom() + 1.0
+            };
+            let head_y = if above { tip_y - 22.0 } else { tip_y + 22.0 };
+            let head_rect = egui::Rect::from_center_size(
+                egui::pos2(x, head_y),
+                egui::vec2(if label == "▶" { 22.0 } else { 18.0 }, 18.0),
+            );
+            let stem = if above {
+                vec![
+                    egui::pos2(x - 6.0, head_rect.bottom() - 2.0),
+                    egui::pos2(x + 6.0, head_rect.bottom() - 2.0),
+                    egui::pos2(x, tip_y),
+                ]
+            } else {
+                vec![
+                    egui::pos2(x - 6.0, head_rect.top() + 2.0),
+                    egui::pos2(x, tip_y),
+                    egui::pos2(x + 6.0, head_rect.top() + 2.0),
+                ]
+            };
+            painter.add(egui::Shape::convex_polygon(stem, color, egui::Stroke::NONE));
+            painter.rect_filled(head_rect, 5.0, color);
             painter.text(
-                egui::pos2(x, handle_y - 19.0),
+                head_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 label,
-                egui::FontId::proportional(11.0),
-                color,
+                egui::FontId::proportional(10.0),
+                egui::Color32::WHITE,
             );
-        }
+        };
+
+        draw_pin(start_x, success, "S", true);
+        draw_pin(end_x, success, "E", true);
+        draw_pin(play_x, accent, "▶", false);
 
         painter.line_segment(
             [
-                egui::pos2(play_x, track_rect.top() - 10.0),
-                egui::pos2(play_x, track_rect.bottom() + 12.0),
+                egui::pos2(play_x, track_rect.top() - 1.0),
+                egui::pos2(play_x, track_rect.bottom() + 1.0),
             ],
             egui::Stroke::new(1.0, accent),
         );
@@ -830,6 +920,8 @@ impl KaraokeApp {
 
 impl eframe::App for KaraokeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_preview_playhead(ctx);
+
         let old_settings = AppSettings {
             model: self.model.clone(),
             quality: self.quality.clone(),
@@ -1136,6 +1228,7 @@ impl eframe::App for KaraokeApp {
                                                             )
                                                             .clicked()
                                                         {
+                                                            self.stop_preview();
                                                             self.trim_start_ms = 0;
                                                             self.trim_end_ms = duration_ms;
                                                             self.trim_playhead_ms = 0;
