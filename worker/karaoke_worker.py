@@ -69,11 +69,19 @@ def clean_word(w):
 def get_system_font(font_name='montserrat', bold=False):
     font_name = font_name.lower().strip()
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_dir = os.path.dirname(base_dir)
+    font_search_dirs = (
+        RESOURCE_DIR,
+        base_dir,
+        os.path.join(base_dir, "assets"),
+        os.path.join(repo_dir, "desktop_app", "assets"),
+        os.path.join(repo_dir, "assets"),
+    )
     
     # 1. Montserrat
     if font_name == 'montserrat':
         font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
-        for search_dir in (RESOURCE_DIR, base_dir, os.path.join(base_dir, "assets")):
+        for search_dir in font_search_dirs:
             montserrat_path = os.path.join(search_dir, font_file)
             if os.path.exists(montserrat_path):
                 return montserrat_path
@@ -113,7 +121,7 @@ def get_system_font(font_name='montserrat', bold=False):
                 
     # Default fallback to Montserrat
     font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
-    for search_dir in (RESOURCE_DIR, base_dir, os.path.join(base_dir, "assets")):
+    for search_dir in font_search_dirs:
         montserrat_path = os.path.join(search_dir, font_file)
         if os.path.exists(montserrat_path):
             return montserrat_path
