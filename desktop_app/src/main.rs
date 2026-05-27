@@ -172,34 +172,6 @@ fn render_trimmed_audio(
     }
 }
 
-fn open_file(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut cmd = std::process::Command::new("open");
-        cmd.arg(path);
-        cmd
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", ""])
-            .arg(path.to_string_lossy().to_string());
-        cmd
-    };
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut cmd = {
-        let mut cmd = std::process::Command::new("xdg-open");
-        cmd.arg(path);
-        cmd
-    };
-
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Не удалось открыть файл: {}", e))
-}
-
 /// Путь к папке экспорта видео
 fn exports_dir() -> PathBuf {
     let exports = app_data_dir().join("exports");
@@ -275,6 +247,8 @@ struct KaraokeApp {
     trim_end_ms: i64,
     trim_playhead_ms: i64,
     trim_status: String,
+    preview_stream: Option<rodio::OutputStream>,
+    preview_sink: Option<rodio::Sink>,
     artist: String,
     title: String,
     lyrics: String,
@@ -363,6 +337,8 @@ impl KaraokeApp {
             trim_end_ms: 0,
             trim_playhead_ms: 0,
             trim_status: String::new(),
+            preview_stream: None,
+            preview_sink: None,
             artist: settings.artist,
             title: settings.title,
             lyrics: settings.lyrics,
@@ -382,7 +358,42 @@ impl KaraokeApp {
         }
     }
 
+    fn is_preview_playing(&self) -> bool {
+        self.preview_sink
+            .as_ref()
+            .map(|sink| !sink.empty())
+            .unwrap_or(false)
+    }
+
+    fn stop_preview(&mut self) {
+        if let Some(sink) = self.preview_sink.take() {
+            sink.stop();
+        }
+        self.preview_stream = None;
+    }
+
+    fn play_audio_preview(&mut self, path: &Path) -> Result<(), String> {
+        self.stop_preview();
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Не удалось открыть preview-аудио: {}", e))?;
+        let source = rodio::Decoder::new(std::io::BufReader::new(file))
+            .map_err(|e| format!("Не удалось декодировать preview-аудио: {}", e))?;
+        let (stream, stream_handle) = rodio::OutputStream::try_default()
+            .map_err(|e| format!("Не удалось открыть аудиовыход: {}", e))?;
+        let sink = rodio::Sink::try_new(&stream_handle)
+            .map_err(|e| format!("Не удалось создать аудио-плеер: {}", e))?;
+
+        sink.append(source);
+        sink.play();
+
+        self.preview_stream = Some(stream);
+        self.preview_sink = Some(sink);
+        Ok(())
+    }
+
     fn set_audio_file(&mut self, path: PathBuf) {
+        self.stop_preview();
         let path_str = path.to_string_lossy().to_string();
         self.audio_path = Some(path_str.clone());
         self.generated_file = None;
@@ -470,11 +481,11 @@ impl KaraokeApp {
 
         let preview_path = temp_dir().join("karaoke_trim_preview.wav");
         match render_trimmed_audio(&audio_path, play_start, end, &preview_path)
-            .and_then(|_| open_file(&preview_path))
+            .and_then(|_| self.play_audio_preview(&preview_path))
         {
             Ok(()) => {
                 self.trim_status = format!(
-                    "Открыт предпросмотр: {} - {}",
+                    "Проигрывается предпросмотр: {} - {}",
                     format_time_ms(play_start),
                     format_time_ms(end)
                 );
@@ -1093,10 +1104,26 @@ impl eframe::App for KaraokeApp {
                                                         egui::Align::Center,
                                                     ),
                                                     |ui| {
-                                                        if ui
+                                                        let is_playing = self.is_preview_playing();
+                                                        if is_playing {
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !self.is_generating,
+                                                                    egui::Button::new("Стоп"),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.stop_preview();
+                                                                self.trim_status =
+                                                                    "Предпросмотр остановлен."
+                                                                        .to_string();
+                                                            }
+                                                        } else if ui
                                                             .add_enabled(
                                                                 !self.is_generating,
-                                                                egui::Button::new("Прослушать с позиции"),
+                                                                egui::Button::new(
+                                                                    "Прослушать с позиции",
+                                                                ),
                                                             )
                                                             .clicked()
                                                         {
