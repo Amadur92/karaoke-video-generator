@@ -273,6 +273,7 @@ struct KaraokeApp {
     audio_duration_ms: Option<i64>,
     trim_start_ms: i64,
     trim_end_ms: i64,
+    trim_playhead_ms: i64,
     trim_status: String,
     artist: String,
     title: String,
@@ -360,6 +361,7 @@ impl KaraokeApp {
             audio_duration_ms: None,
             trim_start_ms: 0,
             trim_end_ms: 0,
+            trim_playhead_ms: 0,
             trim_status: String::new(),
             artist: settings.artist,
             title: settings.title,
@@ -390,12 +392,14 @@ impl KaraokeApp {
                 self.audio_duration_ms = Some(duration_ms);
                 self.trim_start_ms = 0;
                 self.trim_end_ms = duration_ms;
+                self.trim_playhead_ms = 0;
                 self.trim_status = format!("Длительность: {}", format_time_ms(duration_ms));
             }
             Err(err) => {
                 self.audio_duration_ms = None;
                 self.trim_start_ms = 0;
                 self.trim_end_ms = 0;
+                self.trim_playhead_ms = 0;
                 self.trim_status = format!("Не удалось прочитать длительность: {}", err);
             }
         }
@@ -430,6 +434,25 @@ impl KaraokeApp {
         Some((start, end))
     }
 
+    fn normalize_trim_state(&mut self) {
+        if let Some(duration) = self.audio_duration_ms {
+            let min_gap = 1000;
+            self.trim_start_ms = self
+                .trim_start_ms
+                .clamp(0, duration.saturating_sub(min_gap));
+            self.trim_end_ms = self.trim_end_ms.clamp(min_gap, duration);
+            if self.trim_end_ms - self.trim_start_ms < min_gap {
+                self.trim_end_ms = (self.trim_start_ms + min_gap).min(duration);
+                if self.trim_end_ms - self.trim_start_ms < min_gap {
+                    self.trim_start_ms = self.trim_end_ms.saturating_sub(min_gap);
+                }
+            }
+            self.trim_playhead_ms = self
+                .trim_playhead_ms
+                .clamp(self.trim_start_ms, self.trim_end_ms);
+        }
+    }
+
     fn preview_trimmed_audio(&mut self) {
         let audio_path = match &self.audio_path {
             Some(path) => path.clone(),
@@ -442,15 +465,17 @@ impl KaraokeApp {
                 return;
             }
         };
+        self.normalize_trim_state();
+        let play_start = self.trim_playhead_ms.clamp(start, end.saturating_sub(500));
 
         let preview_path = temp_dir().join("karaoke_trim_preview.wav");
-        match render_trimmed_audio(&audio_path, start, end, &preview_path)
+        match render_trimmed_audio(&audio_path, play_start, end, &preview_path)
             .and_then(|_| open_file(&preview_path))
         {
             Ok(()) => {
                 self.trim_status = format!(
                     "Открыт предпросмотр: {} - {}",
-                    format_time_ms(start),
+                    format_time_ms(play_start),
                     format_time_ms(end)
                 );
             }
@@ -458,6 +483,109 @@ impl KaraokeApp {
                 self.trim_status = err;
             }
         }
+    }
+
+    fn trim_timeline_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        duration_ms: i64,
+        accent: egui::Color32,
+        success: egui::Color32,
+        muted: egui::Color32,
+    ) {
+        self.normalize_trim_state();
+
+        let desired_size = egui::vec2(ui.available_width(), 46.0);
+        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+        let track_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.center().y - 4.0),
+            egui::pos2(rect.right() - 8.0, rect.center().y + 4.0),
+        );
+        let track_width = track_rect.width().max(1.0);
+
+        let to_x = |ms: i64| -> f32 {
+            track_rect.left() + (ms as f32 / duration_ms.max(1) as f32) * track_width
+        };
+        let from_x = |x: f32| -> i64 {
+            let ratio = ((x - track_rect.left()) / track_width).clamp(0.0, 1.0);
+            (ratio * duration_ms as f32).round() as i64
+        };
+
+        if (response.dragged() || response.clicked()) && !self.is_generating {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let target_ms = from_x(pointer.x);
+                let handles = [
+                    (self.trim_start_ms, 0usize),
+                    (self.trim_end_ms, 1usize),
+                    (self.trim_playhead_ms, 2usize),
+                ];
+                let nearest = handles
+                    .iter()
+                    .min_by_key(|(ms, _)| (to_x(*ms) - pointer.x).abs() as i64)
+                    .map(|(_, idx)| *idx)
+                    .unwrap_or(2);
+
+                match nearest {
+                    0 => self.trim_start_ms = target_ms.min(self.trim_end_ms - 1000).max(0),
+                    1 => {
+                        self.trim_end_ms = target_ms.max(self.trim_start_ms + 1000).min(duration_ms)
+                    }
+                    _ => {
+                        self.trim_playhead_ms =
+                            target_ms.clamp(self.trim_start_ms, self.trim_end_ms)
+                    }
+                }
+                self.normalize_trim_state();
+            }
+        }
+
+        let painter = ui.painter();
+        painter.rect_filled(track_rect, 4.0, egui::Color32::from_rgb(34, 40, 52));
+
+        let selected_rect = egui::Rect::from_min_max(
+            egui::pos2(to_x(self.trim_start_ms), track_rect.top()),
+            egui::pos2(to_x(self.trim_end_ms), track_rect.bottom()),
+        );
+        painter.rect_filled(selected_rect, 4.0, egui::Color32::from_rgb(37, 78, 125));
+
+        for tick in 0..=4 {
+            let x = track_rect.left() + track_width * tick as f32 / 4.0;
+            painter.line_segment(
+                [
+                    egui::pos2(x, track_rect.bottom() + 5.0),
+                    egui::pos2(x, track_rect.bottom() + 10.0),
+                ],
+                egui::Stroke::new(1.0, muted),
+            );
+        }
+
+        let start_x = to_x(self.trim_start_ms);
+        let end_x = to_x(self.trim_end_ms);
+        let play_x = to_x(self.trim_playhead_ms);
+
+        let handle_y = track_rect.center().y;
+        for (x, color, label) in [
+            (start_x, success, "S"),
+            (end_x, success, "E"),
+            (play_x, accent, "▶"),
+        ] {
+            painter.circle_filled(egui::pos2(x, handle_y), 8.0, color);
+            painter.text(
+                egui::pos2(x, handle_y - 19.0),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(11.0),
+                color,
+            );
+        }
+
+        painter.line_segment(
+            [
+                egui::pos2(play_x, track_rect.top() - 10.0),
+                egui::pos2(play_x, track_rect.bottom() + 12.0),
+            ],
+            egui::Stroke::new(1.0, accent),
+        );
     }
 
     fn start_generation(&mut self, ctx: egui::Context) {
@@ -937,71 +1065,24 @@ impl eframe::App for KaraokeApp {
                                         ui.add_space(8.0);
 
                                         if let Some(duration_ms) = self.audio_duration_ms {
-                                            if self.trim_end_ms <= self.trim_start_ms {
-                                                self.trim_end_ms =
-                                                    (self.trim_start_ms + 1000).min(duration_ms);
-                                            }
-
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Начало")
-                                                        .color(muted)
-                                                        .size(12.0),
-                                                );
-                                                ui.add_sized(
-                                                    egui::vec2(ui.available_width() - 92.0, 20.0),
-                                                    egui::Slider::new(
-                                                        &mut self.trim_start_ms,
-                                                        0..=duration_ms.saturating_sub(1000),
-                                                    )
-                                                    .show_value(false),
-                                                );
-                                                if self.trim_start_ms > self.trim_end_ms - 1000 {
-                                                    self.trim_start_ms =
-                                                        (self.trim_end_ms - 1000).max(0);
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(format_time_ms(
-                                                        self.trim_start_ms,
-                                                    ))
-                                                    .strong()
-                                                    .color(accent),
-                                                );
-                                            });
-
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Конец")
-                                                        .color(muted)
-                                                        .size(12.0),
-                                                );
-                                                ui.add_sized(
-                                                    egui::vec2(ui.available_width() - 92.0, 20.0),
-                                                    egui::Slider::new(
-                                                        &mut self.trim_end_ms,
-                                                        1000..=duration_ms,
-                                                    )
-                                                    .show_value(false),
-                                                );
-                                                if self.trim_end_ms < self.trim_start_ms + 1000 {
-                                                    self.trim_end_ms =
-                                                        (self.trim_start_ms + 1000).min(duration_ms);
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(format_time_ms(
-                                                        self.trim_end_ms,
-                                                    ))
-                                                    .strong()
-                                                    .color(accent),
-                                                );
-                                            });
+                                            self.trim_timeline_ui(
+                                                ui,
+                                                duration_ms,
+                                                accent,
+                                                success,
+                                                muted,
+                                            );
+                                            ui.add_space(4.0);
 
                                             let selected_ms = self.trim_end_ms - self.trim_start_ms;
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     egui::RichText::new(format!(
-                                                        "Фрагмент: {}",
-                                                        format_time_ms(selected_ms)
+                                                        "{} - {} · фрагмент {} · слушаем с {}",
+                                                        format_time_ms(self.trim_start_ms),
+                                                        format_time_ms(self.trim_end_ms),
+                                                        format_time_ms(selected_ms),
+                                                        format_time_ms(self.trim_playhead_ms)
                                                     ))
                                                     .size(12.0)
                                                     .color(muted),
@@ -1015,7 +1096,7 @@ impl eframe::App for KaraokeApp {
                                                         if ui
                                                             .add_enabled(
                                                                 !self.is_generating,
-                                                                egui::Button::new("Прослушать"),
+                                                                egui::Button::new("Прослушать с позиции"),
                                                             )
                                                             .clicked()
                                                         {
@@ -1030,6 +1111,7 @@ impl eframe::App for KaraokeApp {
                                                         {
                                                             self.trim_start_ms = 0;
                                                             self.trim_end_ms = duration_ms;
+                                                            self.trim_playhead_ms = 0;
                                                             self.trim_status = format!(
                                                                 "Обрезка сброшена: {}",
                                                                 format_time_ms(duration_ms)
