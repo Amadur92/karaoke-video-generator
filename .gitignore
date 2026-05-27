@@ -1,0 +1,6 @@
+.DS_Store
+.packaging-venv/
+.packaging-venv-win/
+packaging/build/
+packaging/dist/
+worker/__pycache__/

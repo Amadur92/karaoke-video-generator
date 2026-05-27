@@ -1,0 +1,161 @@
+name: Build Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-box:
+    name: Build Windows portable box
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop_app/target
+          key: windows-box-cargo-${{ hashFiles('desktop_app/Cargo.lock') }}
+          restore-keys: windows-box-cargo-
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: windows-box-pip-${{ hashFiles('worker/requirements.txt') }}
+          restore-keys: windows-box-pip-
+
+      - name: Install FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Build portable Windows folder
+        shell: pwsh
+        run: |
+          $ffmpegExe = Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if ($null -eq $ffmpegExe) {
+            throw "ffmpeg.exe was not found after Chocolatey install."
+          }
+          $ffmpegDir = $ffmpegExe.Directory.FullName
+          .\packaging\windows\build_box.ps1 -Python python -FfmpegDir $ffmpegDir
+
+      - name: Create Windows zip
+        shell: pwsh
+        run: |
+          $zipPath = "packaging\dist\KaraokeGenerator-windows-x64.zip"
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+          Compress-Archive -Path "packaging\dist\KaraokeGenerator-windows\*" -DestinationPath $zipPath
+
+      - name: Upload Windows box artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KaraokeGenerator-windows-x64
+          path: packaging/dist/KaraokeGenerator-windows-x64.zip
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: karaoke-generator-macos-x64
+            binary_name: desktop_app
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: karaoke-generator-macos-arm64
+            binary_name: desktop_app
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: karaoke-generator-windows-x64
+            binary_name: desktop_app.exe
+
+    runs-on: ${{ matrix.os }}
+    
+    defaults:
+      run:
+        working-directory: desktop_app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop_app/target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('desktop_app/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create distribution archive (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/
+          cd dist
+          chmod +x ${{ matrix.binary_name }}
+          tar -czf ../${{ matrix.artifact_name }}.tar.gz ${{ matrix.binary_name }}
+
+      - name: Create distribution archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/
+          cd dist
+          Compress-Archive -Path ${{ matrix.binary_name }} -DestinationPath ../${{ matrix.artifact_name }}.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: desktop_app/${{ matrix.artifact_name }}.*
+
+  release:
+    needs: [build, windows-box]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
