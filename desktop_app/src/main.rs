@@ -1353,8 +1353,12 @@ impl eframe::App for KaraokeApp {
             let spacing = 18.0;
             let col_width = ((total_width - page_margin * 2.0) - spacing) / 2.0;
 
-            let bottom_height = if self.generated_file.is_some() { 110.0 } else { 0.0 };
-            let main_height = ui.available_height() - bottom_height - 18.0;
+            let result_height = if self.generated_file.is_some() {
+                (ui.available_height() * 0.48).clamp(320.0, 520.0)
+            } else {
+                0.0
+            };
+            let main_height = (ui.available_height() - result_height - 18.0).max(220.0);
 
             ui.horizontal(|ui| {
                 ui.add_space(page_margin);
@@ -1833,6 +1837,7 @@ impl eframe::App for KaraokeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(page_margin);
                     let available_width = ui.available_width() - page_margin * 2.0;
+                    let preview_max_height = (result_height - 132.0).clamp(180.0, 380.0);
                     let preview_size = if let Some(texture) = &self.video_texture {
                         let texture_size = texture.size_vec2();
                         let aspect = if texture_size.y > 0.0 {
@@ -1840,9 +1845,12 @@ impl eframe::App for KaraokeApp {
                         } else {
                             16.0 / 9.0
                         };
-                        egui::vec2(available_width, (available_width / aspect).min(380.0))
+                        egui::vec2(available_width, (available_width / aspect).min(preview_max_height))
                     } else {
-                        egui::vec2(available_width, (available_width * 9.0 / 16.0).min(380.0))
+                        egui::vec2(
+                            available_width,
+                            (available_width * 9.0 / 16.0).min(preview_max_height),
+                        )
                     };
 
                     card_frame.show(ui, |ui| {
