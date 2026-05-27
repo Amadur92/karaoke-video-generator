@@ -225,9 +225,11 @@ fn preview_video_size(path: &str) -> Result<(usize, usize), String> {
     Ok((target_width, scaled_height))
 }
 
-fn render_video_preview_audio(input: &str, output: &Path) -> Result<(), String> {
+fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Result<(), String> {
     let status = std::process::Command::new(tool_path("ffmpeg"))
         .arg("-y")
+        .arg("-ss")
+        .arg(format!("{:.3}", start_ms.max(0) as f64 / 1000.0))
         .arg("-i")
         .arg(input)
         .arg("-vn")
@@ -366,6 +368,10 @@ struct KaraokeApp {
     video_status: String,
     video_stream: Option<rodio::OutputStream>,
     video_sink: Option<rodio::Sink>,
+    video_duration_ms: i64,
+    video_position_ms: i64,
+    video_started_at: Option<Instant>,
+    video_started_ms: i64,
 }
 
 impl KaraokeApp {
@@ -455,6 +461,10 @@ impl KaraokeApp {
             video_status: String::new(),
             video_stream: None,
             video_sink: None,
+            video_duration_ms: 0,
+            video_position_ms: 0,
+            video_started_at: None,
+            video_started_ms: 0,
         }
     }
 
@@ -533,15 +543,15 @@ impl KaraokeApp {
     }
 
     fn is_video_playing(&self) -> bool {
-        self.video_stop.is_some()
-            || self
+        self.video_started_at.is_some()
+            && self
                 .video_sink
                 .as_ref()
                 .map(|sink| !sink.empty())
                 .unwrap_or(false)
     }
 
-    fn stop_video_preview(&mut self) {
+    fn halt_video_preview(&mut self) {
         if let Some(stop) = self.video_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
@@ -550,16 +560,46 @@ impl KaraokeApp {
         }
         self.video_stream = None;
         self.video_rx = None;
+        self.video_started_at = None;
+        self.video_started_ms = 0;
+    }
+
+    fn stop_video_preview(&mut self) {
+        self.halt_video_preview();
+        self.video_position_ms = 0;
         self.video_status = "Предпросмотр видео остановлен.".to_string();
     }
 
+    fn pause_video_preview(&mut self) {
+        if let Some(started_at) = self.video_started_at {
+            let elapsed_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            self.video_position_ms = (self.video_started_ms + elapsed_ms)
+                .min(self.video_duration_ms.max(self.video_started_ms));
+        }
+        self.halt_video_preview();
+        self.video_status = format!(
+            "Пауза на {}.",
+            format_time_ms(self.video_position_ms.min(self.video_duration_ms))
+        );
+    }
+
     fn start_video_preview(&mut self, path: &str, ctx: &egui::Context) -> Result<(), String> {
-        self.stop_video_preview();
+        self.halt_video_preview();
         self.video_status = "Готовим встроенный предпросмотр...".to_string();
+
+        if self.video_duration_ms <= 0 {
+            self.video_duration_ms = probe_audio_duration_ms(path).unwrap_or(0);
+        }
+        if self.video_duration_ms > 0 && self.video_position_ms >= self.video_duration_ms - 250 {
+            self.video_position_ms = 0;
+        }
+        let start_ms = self
+            .video_position_ms
+            .clamp(0, self.video_duration_ms.max(0));
 
         let (width, height) = preview_video_size(path)?;
         let audio_path = temp_dir().join("karaoke_video_preview.wav");
-        render_video_preview_audio(path, &audio_path)?;
+        render_video_preview_audio(path, &audio_path, start_ms)?;
 
         let audio_file = std::fs::File::open(&audio_path)
             .map_err(|e| format!("Не удалось открыть звук видео: {}", e))?;
@@ -580,6 +620,8 @@ impl KaraokeApp {
             let mut child = match std::process::Command::new(tool_path("ffmpeg"))
                 .arg("-v")
                 .arg("error")
+                .arg("-ss")
+                .arg(format!("{:.3}", start_ms.max(0) as f64 / 1000.0))
                 .arg("-i")
                 .arg(path)
                 .arg("-vf")
@@ -651,11 +693,19 @@ impl KaraokeApp {
         self.video_sink = Some(sink);
         self.video_rx = Some(rx);
         self.video_stop = Some(stop);
+        self.video_started_at = Some(Instant::now());
+        self.video_started_ms = start_ms;
         self.video_status = "Видео воспроизводится внутри приложения.".to_string();
         Ok(())
     }
 
     fn sync_video_preview(&mut self, ctx: &egui::Context) {
+        if let Some(started_at) = self.video_started_at {
+            let elapsed_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            self.video_position_ms = (self.video_started_ms + elapsed_ms)
+                .min(self.video_duration_ms.max(self.video_started_ms));
+        }
+
         if let Some(rx) = &self.video_rx {
             let mut got_frame = false;
             while let Ok(frame) = rx.try_recv() {
@@ -675,7 +725,9 @@ impl KaraokeApp {
         }
 
         if let Some(sink) = &self.video_sink {
-            if !sink.empty() {
+            if !sink.empty()
+                && (self.video_duration_ms <= 0 || self.video_position_ms < self.video_duration_ms)
+            {
                 ctx.request_repaint_after(Duration::from_millis(33));
                 return;
             }
@@ -687,6 +739,11 @@ impl KaraokeApp {
             self.video_stream = None;
             self.video_sink = None;
             self.video_rx = None;
+            self.video_started_at = None;
+            self.video_started_ms = 0;
+            if self.video_duration_ms > 0 {
+                self.video_position_ms = self.video_duration_ms;
+            }
             self.video_status = "Предпросмотр видео завершен.".to_string();
         }
     }
@@ -1239,6 +1296,8 @@ impl eframe::App for KaraokeApp {
                         self.stop_video_preview();
                         self.video_texture = None;
                         self.video_status = String::new();
+                        self.video_duration_ms = probe_audio_duration_ms(&full_path).unwrap_or(0);
+                        self.video_position_ms = 0;
                         self.generated_file = Some(full_path);
                     }
                 }
@@ -1797,31 +1856,6 @@ impl eframe::App for KaraokeApp {
                                                 }
                                             }
 
-                                            ui.add_space(10.0);
-
-                                            let is_video_playing = self.is_video_playing();
-                                            let play_btn = egui::Button::new(
-                                                egui::RichText::new(if is_video_playing {
-                                                    "СТОП"
-                                                } else {
-                                                    "ВОСПРОИЗВЕСТИ"
-                                                })
-                                                    .strong()
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(egui::Color32::from_rgb(45, 118, 255))
-                                            .rounding(8.0)
-                                            .min_size(egui::vec2(150.0, 36.0));
-
-                                            if ui.add(play_btn).clicked() {
-                                                if is_video_playing {
-                                                    self.stop_video_preview();
-                                                } else if let Err(err) =
-                                                    self.start_video_preview(&file_path, ctx)
-                                                {
-                                                    self.video_status = err;
-                                                }
-                                            }
                                         },
                                     );
                                 });
@@ -1832,7 +1866,7 @@ impl eframe::App for KaraokeApp {
                 });
             }
 
-            if self.generated_file.is_some() {
+            if let Some(file_path) = self.generated_file.clone() {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.add_space(page_margin);
@@ -1925,6 +1959,86 @@ impl eframe::App for KaraokeApp {
                                     muted,
                                 );
                             }
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let is_video_playing = self.is_video_playing();
+                                let play_label = if is_video_playing { "Пауза" } else { "▶" };
+                                let play_btn = egui::Button::new(
+                                    egui::RichText::new(play_label)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(if is_video_playing {
+                                    egui::Color32::from_rgb(78, 86, 103)
+                                } else {
+                                    accent
+                                })
+                                .rounding(8.0)
+                                .min_size(egui::vec2(58.0, 34.0));
+
+                                if ui.add(play_btn).clicked() {
+                                    if is_video_playing {
+                                        self.pause_video_preview();
+                                    } else if let Err(err) =
+                                        self.start_video_preview(&file_path, ctx)
+                                    {
+                                        self.video_status = err;
+                                    }
+                                }
+
+                                let stop_btn = egui::Button::new(
+                                    egui::RichText::new("Стоп")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(48, 56, 70))
+                                .rounding(8.0)
+                                .min_size(egui::vec2(70.0, 34.0));
+
+                                if ui.add(stop_btn).clicked() {
+                                    self.stop_video_preview();
+                                }
+
+                                let mut position = self
+                                    .video_position_ms
+                                    .clamp(0, self.video_duration_ms.max(0));
+                                let slider_enabled = self.video_duration_ms > 0;
+                                let slider = egui::Slider::new(
+                                    &mut position,
+                                    0..=self.video_duration_ms.max(1),
+                                )
+                                .show_value(false);
+
+                                let slider_response = ui.add_enabled(
+                                    slider_enabled,
+                                    slider.text("Позиция воспроизведения"),
+                                );
+                                if slider_response.changed() {
+                                    self.video_position_ms = position;
+                                    if is_video_playing {
+                                        self.pause_video_preview();
+                                    }
+                                    self.video_status = format!(
+                                        "Позиция: {}.",
+                                        format_time_ms(self.video_position_ms)
+                                    );
+                                }
+
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} / {}",
+                                        format_time_ms(self.video_position_ms),
+                                        if self.video_duration_ms > 0 {
+                                            format_time_ms(self.video_duration_ms)
+                                        } else {
+                                            "--:--".to_string()
+                                        }
+                                    ))
+                                    .size(12.0)
+                                    .color(muted),
+                                );
+                            });
                         });
                     });
                     ui.add_space(page_margin);
