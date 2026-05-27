@@ -33,6 +33,13 @@ Output:
 packaging/dist/KaraokeGenerator-macos/
 ```
 
+GitHub Actions release artifact names:
+
+```text
+KaraokeGenerator-macOS-Intel-x64.tar.gz
+KaraokeGenerator-macOS-AppleSilicon-arm64.tar.gz
+```
+
 Run:
 
 ```bash
@@ -52,6 +59,15 @@ Output:
 ```text
 packaging\dist\KaraokeGenerator-windows\
 ```
+
+GitHub Actions release artifact name:
+
+```text
+KaraokeGenerator-Windows-x64-portable.zip
+```
+
+This is the file to give to Windows users. It contains the app, worker,
+FFmpeg, FFprobe, and bundled fonts.
 
 ## Notes
 

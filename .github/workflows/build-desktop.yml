@@ -60,7 +60,7 @@ jobs:
       - name: Create Windows zip
         shell: pwsh
         run: |
-          $zipPath = "packaging\dist\KaraokeGenerator-windows-x64.zip"
+          $zipPath = "packaging\dist\KaraokeGenerator-Windows-x64-portable.zip"
           if (Test-Path $zipPath) {
             Remove-Item $zipPath -Force
           }
@@ -69,8 +69,8 @@ jobs:
       - name: Upload Windows box artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KaraokeGenerator-windows-x64
-          path: packaging/dist/KaraokeGenerator-windows-x64.zip
+          name: KaraokeGenerator-Windows-x64-portable
+          path: packaging/dist/KaraokeGenerator-Windows-x64-portable.zip
 
   build:
     strategy:
@@ -78,15 +78,15 @@ jobs:
         include:
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: karaoke-generator-macos-x64
+            artifact_name: KaraokeGenerator-macOS-Intel-x64
             binary_name: desktop_app
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: karaoke-generator-macos-arm64
+            artifact_name: KaraokeGenerator-macOS-AppleSilicon-arm64
             binary_name: desktop_app
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: karaoke-generator-windows-x64
+            artifact_name: KaraokeGenerator-Windows-x64-binary
             binary_name: desktop_app.exe
 
     runs-on: ${{ matrix.os }}
