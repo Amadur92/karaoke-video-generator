@@ -2,7 +2,11 @@
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -173,6 +177,77 @@ fn render_trimmed_audio(
     }
 }
 
+fn probe_video_size(path: &str) -> Result<(usize, usize), String> {
+    let output = std::process::Command::new(tool_path("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            path,
+        ])
+        .output()
+        .map_err(|e| format!("Не удалось запустить ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe не смог прочитать видео: {}", err.trim()));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut parts = raw.trim().split('x');
+    let width = parts
+        .next()
+        .and_then(|part| part.parse::<usize>().ok())
+        .ok_or_else(|| "Не удалось прочитать ширину видео.".to_string())?;
+    let height = parts
+        .next()
+        .and_then(|part| part.parse::<usize>().ok())
+        .ok_or_else(|| "Не удалось прочитать высоту видео.".to_string())?;
+
+    Ok((width.max(1), height.max(1)))
+}
+
+fn preview_video_size(path: &str) -> Result<(usize, usize), String> {
+    let (width, height) = probe_video_size(path)?;
+    let target_width = width.min(720).max(2);
+    if target_width == width {
+        return Ok((width, height));
+    }
+
+    let scaled_height = ((height as f32 * target_width as f32 / width as f32).round() as usize)
+        .max(2)
+        .next_multiple_of(2);
+    Ok((target_width, scaled_height))
+}
+
+fn render_video_preview_audio(input: &str, output: &Path) -> Result<(), String> {
+    let status = std::process::Command::new(tool_path("ffmpeg"))
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-vn")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ar")
+        .arg("44100")
+        .arg("-ac")
+        .arg("2")
+        .arg(output)
+        .status()
+        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("ffmpeg не смог подготовить звук для предпросмотра.".to_string())
+    }
+}
+
 /// Путь к папке экспорта видео
 fn exports_dir() -> PathBuf {
     let exports = app_data_dir().join("exports");
@@ -241,6 +316,12 @@ enum ProgressUpdate {
     Finished(bool),
 }
 
+struct VideoFrame {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
 struct KaraokeApp {
     audio_path: Option<String>,
     audio_duration_ms: Option<i64>,
@@ -279,6 +360,12 @@ struct KaraokeApp {
 
     // Путь к сгенерированному видео-файлу
     generated_file: Option<String>,
+    video_rx: Option<Receiver<VideoFrame>>,
+    video_stop: Option<Arc<AtomicBool>>,
+    video_texture: Option<egui::TextureHandle>,
+    video_status: String,
+    video_stream: Option<rodio::OutputStream>,
+    video_sink: Option<rodio::Sink>,
 }
 
 impl KaraokeApp {
@@ -362,6 +449,12 @@ impl KaraokeApp {
             log_output: String::new(),
             rx: None,
             generated_file: None,
+            video_rx: None,
+            video_stop: None,
+            video_texture: None,
+            video_status: String::new(),
+            video_stream: None,
+            video_sink: None,
         }
     }
 
@@ -436,6 +529,165 @@ impl KaraokeApp {
             self.preview_end_ms = 0;
         } else {
             ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn is_video_playing(&self) -> bool {
+        self.video_stop.is_some()
+            || self
+                .video_sink
+                .as_ref()
+                .map(|sink| !sink.empty())
+                .unwrap_or(false)
+    }
+
+    fn stop_video_preview(&mut self) {
+        if let Some(stop) = self.video_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(sink) = self.video_sink.take() {
+            sink.stop();
+        }
+        self.video_stream = None;
+        self.video_rx = None;
+        self.video_status = "Предпросмотр видео остановлен.".to_string();
+    }
+
+    fn start_video_preview(&mut self, path: &str, ctx: &egui::Context) -> Result<(), String> {
+        self.stop_video_preview();
+        self.video_status = "Готовим встроенный предпросмотр...".to_string();
+
+        let (width, height) = preview_video_size(path)?;
+        let audio_path = temp_dir().join("karaoke_video_preview.wav");
+        render_video_preview_audio(path, &audio_path)?;
+
+        let audio_file = std::fs::File::open(&audio_path)
+            .map_err(|e| format!("Не удалось открыть звук видео: {}", e))?;
+        let source = rodio::Decoder::new(std::io::BufReader::new(audio_file))
+            .map_err(|e| format!("Не удалось декодировать звук видео: {}", e))?;
+        let (stream, stream_handle) = rodio::OutputStream::try_default()
+            .map_err(|e| format!("Не удалось открыть аудиовыход: {}", e))?;
+        let sink = rodio::Sink::try_new(&stream_handle)
+            .map_err(|e| format!("Не удалось создать аудио-плеер: {}", e))?;
+
+        let (tx, rx) = channel::<VideoFrame>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let ctx_thread = ctx.clone();
+        let path = path.to_string();
+
+        std::thread::spawn(move || {
+            let mut child = match std::process::Command::new(tool_path("ffmpeg"))
+                .arg("-v")
+                .arg("error")
+                .arg("-i")
+                .arg(path)
+                .arg("-vf")
+                .arg(format!("fps=24,scale={}:{}:flags=bicubic", width, height))
+                .arg("-an")
+                .arg("-pix_fmt")
+                .arg("rgba")
+                .arg("-f")
+                .arg("rawvideo")
+                .arg("pipe:1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => return,
+            };
+
+            let Some(mut stdout) = child.stdout.take() else {
+                let _ = child.kill();
+                return;
+            };
+
+            let frame_len = width.saturating_mul(height).saturating_mul(4);
+            let frame_duration = Duration::from_millis(1000 / 24);
+            let started_at = Instant::now();
+            let mut frame_index = 0u32;
+
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    return;
+                }
+
+                let mut pixels = vec![0u8; frame_len];
+                if stdout.read_exact(&mut pixels).is_err() {
+                    break;
+                }
+
+                let target_at = started_at + frame_duration * frame_index;
+                let now = Instant::now();
+                if target_at > now {
+                    std::thread::sleep(target_at - now);
+                }
+
+                if tx
+                    .send(VideoFrame {
+                        width,
+                        height,
+                        pixels,
+                    })
+                    .is_err()
+                {
+                    let _ = child.kill();
+                    return;
+                }
+                ctx_thread.request_repaint();
+                frame_index = frame_index.saturating_add(1);
+            }
+
+            let _ = child.wait();
+            ctx_thread.request_repaint();
+        });
+
+        sink.append(source);
+        sink.play();
+
+        self.video_stream = Some(stream);
+        self.video_sink = Some(sink);
+        self.video_rx = Some(rx);
+        self.video_stop = Some(stop);
+        self.video_status = "Видео воспроизводится внутри приложения.".to_string();
+        Ok(())
+    }
+
+    fn sync_video_preview(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.video_rx {
+            let mut got_frame = false;
+            while let Ok(frame) = rx.try_recv() {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width, frame.height],
+                    &frame.pixels,
+                );
+                let texture = self.video_texture.get_or_insert_with(|| {
+                    ctx.load_texture("video_preview", image.clone(), egui::TextureOptions::LINEAR)
+                });
+                texture.set(image, egui::TextureOptions::LINEAR);
+                got_frame = true;
+            }
+            if got_frame {
+                ctx.request_repaint();
+            }
+        }
+
+        if let Some(sink) = &self.video_sink {
+            if !sink.empty() {
+                ctx.request_repaint_after(Duration::from_millis(33));
+                return;
+            }
+        }
+
+        if self.video_stop.is_some() && self.video_sink.as_ref().map(|s| s.empty()).unwrap_or(true)
+        {
+            self.video_stop = None;
+            self.video_stream = None;
+            self.video_sink = None;
+            self.video_rx = None;
+            self.video_status = "Предпросмотр видео завершен.".to_string();
         }
     }
 
@@ -694,6 +946,7 @@ impl KaraokeApp {
             Some(p) => p.clone(),
             None => return,
         };
+        self.stop_video_preview();
 
         let worker_path = match find_worker() {
             Some(p) => p,
@@ -921,6 +1174,7 @@ impl KaraokeApp {
 impl eframe::App for KaraokeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_preview_playhead(ctx);
+        self.sync_video_preview(ctx);
 
         let old_settings = AppSettings {
             model: self.model.clone(),
@@ -965,41 +1219,47 @@ impl eframe::App for KaraokeApp {
         ctx.set_visuals(visuals);
 
         // Опрос прогресса из фонового канала
-        if let Some(rx) = &self.rx {
-            while let Ok(update) = rx.try_recv() {
-                match update {
-                    ProgressUpdate::Progress(prog) => {
-                        self.progress = prog.progress;
-                        self.status_text = prog.status;
-                        if let Some(err) = prog.error {
-                            self.log_output
-                                .push_str(&format!("❌ Ошибка ИИ: {}\n", err));
-                        }
-                        if let Some(full_path) = prog.file {
-                            self.log_output
-                                .push_str(&format!("🎉 Успешно сохранено: {}\n", full_path));
-                            self.generated_file = Some(full_path);
-                        }
+        loop {
+            let update = self.rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            let Some(update) = update else {
+                break;
+            };
+
+            match update {
+                ProgressUpdate::Progress(prog) => {
+                    self.progress = prog.progress;
+                    self.status_text = prog.status;
+                    if let Some(err) = prog.error {
+                        self.log_output
+                            .push_str(&format!("❌ Ошибка ИИ: {}\n", err));
                     }
-                    ProgressUpdate::RawLog(log) => {
-                        self.log_output.push_str(&format!("{}\n", log));
+                    if let Some(full_path) = prog.file {
+                        self.log_output
+                            .push_str(&format!("🎉 Успешно сохранено: {}\n", full_path));
+                        self.stop_video_preview();
+                        self.video_texture = None;
+                        self.video_status = String::new();
+                        self.generated_file = Some(full_path);
                     }
-                    ProgressUpdate::Error(err) => {
-                        self.is_generating = false;
-                        self.status_text = "Ошибка".to_string();
-                        self.log_output.push_str(&format!("❌ Ошибка: {}\n", err));
-                    }
-                    ProgressUpdate::Finished(success) => {
-                        self.is_generating = false;
-                        if success {
-                            self.progress = 1.0;
-                            self.status_text = "Генерация успешно завершена!".to_string();
-                            self.log_output.push_str("✅ Процесс успешно завершен.\n");
-                        } else {
-                            self.status_text = "Завершено с ошибкой".to_string();
-                            self.log_output
-                                .push_str("❌ Процесс завершился с кодом ошибки.\n");
-                        }
+                }
+                ProgressUpdate::RawLog(log) => {
+                    self.log_output.push_str(&format!("{}\n", log));
+                }
+                ProgressUpdate::Error(err) => {
+                    self.is_generating = false;
+                    self.status_text = "Ошибка".to_string();
+                    self.log_output.push_str(&format!("❌ Ошибка: {}\n", err));
+                }
+                ProgressUpdate::Finished(success) => {
+                    self.is_generating = false;
+                    if success {
+                        self.progress = 1.0;
+                        self.status_text = "Генерация успешно завершена!".to_string();
+                        self.log_output.push_str("✅ Процесс успешно завершен.\n");
+                    } else {
+                        self.status_text = "Завершено с ошибкой".to_string();
+                        self.log_output
+                            .push_str("❌ Процесс завершился с кодом ошибки.\n");
                     }
                 }
             }
@@ -1459,7 +1719,7 @@ impl eframe::App for KaraokeApp {
                 ui.add_space(page_margin);
             });
 
-            if let Some(file_path) = &self.generated_file {
+            if let Some(file_path) = self.generated_file.clone() {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.add_space(page_margin);
@@ -1478,11 +1738,18 @@ impl eframe::App for KaraokeApp {
                                         );
                                         ui.label(
                                             egui::RichText::new(
-                                                "Откройте результат в системном плеере или сохраните копию в нужное место.",
+                                                "Проверьте результат прямо здесь или сохраните копию в нужное место.",
                                             )
                                             .size(12.0)
                                             .color(muted),
                                         );
+                                        if !self.video_status.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&self.video_status)
+                                                    .size(11.0)
+                                                    .color(muted),
+                                            );
+                                        }
                                     });
 
                                     ui.with_layout(
@@ -1510,9 +1777,10 @@ impl eframe::App for KaraokeApp {
                                                     .add_filter("Видео", &["mp4"])
                                                     .save_file()
                                                 {
-                                                    if let Err(e) =
-                                                        std::fs::copy(file_path, dest_path)
-                                                    {
+                                                    if let Err(e) = std::fs::copy(
+                                                        file_path.as_str(),
+                                                        dest_path,
+                                                    ) {
                                                         self.log_output.push_str(&format!(
                                                             "❌ Ошибка копирования: {}\n",
                                                             e
@@ -1527,8 +1795,13 @@ impl eframe::App for KaraokeApp {
 
                                             ui.add_space(10.0);
 
+                                            let is_video_playing = self.is_video_playing();
                                             let play_btn = egui::Button::new(
-                                                egui::RichText::new("ВОСПРОИЗВЕСТИ")
+                                                egui::RichText::new(if is_video_playing {
+                                                    "СТОП"
+                                                } else {
+                                                    "ВОСПРОИЗВЕСТИ"
+                                                })
                                                     .strong()
                                                     .color(egui::Color32::WHITE),
                                             )
@@ -1537,26 +1810,12 @@ impl eframe::App for KaraokeApp {
                                             .min_size(egui::vec2(150.0, 36.0));
 
                                             if ui.add(play_btn).clicked() {
-                                                #[cfg(target_os = "macos")]
+                                                if is_video_playing {
+                                                    self.stop_video_preview();
+                                                } else if let Err(err) =
+                                                    self.start_video_preview(&file_path, ctx)
                                                 {
-                                                    let _ = std::process::Command::new("open")
-                                                        .arg(file_path)
-                                                        .spawn();
-                                                }
-                                                #[cfg(target_os = "windows")]
-                                                {
-                                                    let _ = std::process::Command::new("cmd")
-                                                        .args(["/C", "start", "", file_path])
-                                                        .spawn();
-                                                }
-                                                #[cfg(not(any(
-                                                    target_os = "macos",
-                                                    target_os = "windows"
-                                                )))]
-                                                {
-                                                    let _ = std::process::Command::new("xdg-open")
-                                                        .arg(file_path)
-                                                        .spawn();
+                                                    self.video_status = err;
                                                 }
                                             }
                                         },
@@ -1567,6 +1826,33 @@ impl eframe::App for KaraokeApp {
                     );
                     ui.add_space(page_margin);
                 });
+            }
+
+            if self.generated_file.is_some() {
+                if let Some(texture) = &self.video_texture {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(page_margin);
+                        let available_width = ui.available_width() - page_margin * 2.0;
+                        let texture_size = texture.size_vec2();
+                        let aspect = if texture_size.y > 0.0 {
+                            texture_size.x / texture_size.y
+                        } else {
+                            16.0 / 9.0
+                        };
+                        let preview_size =
+                            egui::vec2(available_width, (available_width / aspect).min(360.0));
+
+                        card_frame.show(ui, |ui| {
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_exact_size(preview_size)
+                                    .rounding(egui::Rounding::same(8.0)),
+                            );
+                        });
+                        ui.add_space(page_margin);
+                    });
+                }
             }
         });
 
