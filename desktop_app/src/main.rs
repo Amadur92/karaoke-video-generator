@@ -85,6 +85,121 @@ fn bundled_bin_dir() -> Option<PathBuf> {
         .find(|candidate| candidate.exists() && candidate.is_dir())
 }
 
+fn tool_name(base_name: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{}.exe", base_name)
+    } else {
+        base_name.to_string()
+    }
+}
+
+fn tool_path(base_name: &str) -> PathBuf {
+    let name = tool_name(base_name);
+    bundled_bin_dir()
+        .map(|dir| dir.join(&name))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn format_time_ms(ms: i64) -> String {
+    let total_seconds = (ms.max(0) as f32 / 1000.0).round() as i64;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{:02}:{:02}", minutes, seconds)
+}
+
+fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
+    let output = std::process::Command::new(tool_path("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        .output()
+        .map_err(|e| format!("Не удалось запустить ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe не смог прочитать файл: {}", err.trim()));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let seconds = raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| format!("Не удалось прочитать длительность аудио: {}", e))?;
+    Ok((seconds * 1000.0).round() as i64)
+}
+
+fn render_trimmed_audio(
+    input: &str,
+    start_ms: i64,
+    end_ms: i64,
+    output: &Path,
+) -> Result<(), String> {
+    let duration_ms = end_ms - start_ms;
+    if duration_ms < 1000 {
+        return Err("Оставьте хотя бы 1 секунду аудио после обрезки.".to_string());
+    }
+
+    let status = std::process::Command::new(tool_path("ffmpeg"))
+        .arg("-y")
+        .arg("-ss")
+        .arg(format!("{:.3}", start_ms as f64 / 1000.0))
+        .arg("-t")
+        .arg(format!("{:.3}", duration_ms as f64 / 1000.0))
+        .arg("-i")
+        .arg(input)
+        .arg("-vn")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ar")
+        .arg("44100")
+        .arg("-ac")
+        .arg("2")
+        .arg(output)
+        .status()
+        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("ffmpeg не смог создать обрезанный аудиофайл.".to_string())
+    }
+}
+
+fn open_file(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg(path);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", ""])
+            .arg(path.to_string_lossy().to_string());
+        cmd
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(path);
+        cmd
+    };
+
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Не удалось открыть файл: {}", e))
+}
+
 /// Путь к папке экспорта видео
 fn exports_dir() -> PathBuf {
     let exports = app_data_dir().join("exports");
@@ -155,6 +270,10 @@ enum ProgressUpdate {
 
 struct KaraokeApp {
     audio_path: Option<String>,
+    audio_duration_ms: Option<i64>,
+    trim_start_ms: i64,
+    trim_end_ms: i64,
+    trim_status: String,
     artist: String,
     title: String,
     lyrics: String,
@@ -238,6 +357,10 @@ impl KaraokeApp {
 
         Self {
             audio_path: None,
+            audio_duration_ms: None,
+            trim_start_ms: 0,
+            trim_end_ms: 0,
+            trim_status: String::new(),
             artist: settings.artist,
             title: settings.title,
             lyrics: settings.lyrics,
@@ -254,6 +377,86 @@ impl KaraokeApp {
             log_output: String::new(),
             rx: None,
             generated_file: None,
+        }
+    }
+
+    fn set_audio_file(&mut self, path: PathBuf) {
+        let path_str = path.to_string_lossy().to_string();
+        self.audio_path = Some(path_str.clone());
+        self.generated_file = None;
+
+        match probe_audio_duration_ms(&path_str) {
+            Ok(duration_ms) => {
+                self.audio_duration_ms = Some(duration_ms);
+                self.trim_start_ms = 0;
+                self.trim_end_ms = duration_ms;
+                self.trim_status = format!("Длительность: {}", format_time_ms(duration_ms));
+            }
+            Err(err) => {
+                self.audio_duration_ms = None;
+                self.trim_start_ms = 0;
+                self.trim_end_ms = 0;
+                self.trim_status = format!("Не удалось прочитать длительность: {}", err);
+            }
+        }
+
+        let file_name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if file_name.contains(" - ") {
+            let parts: Vec<&str> = file_name.splitn(2, " - ").collect();
+            self.artist = parts[0].trim().to_string();
+            self.title = parts[1].trim().to_string();
+        } else {
+            self.title = file_name.trim().to_string();
+            self.artist = String::new();
+        }
+    }
+
+    fn clamped_trim_bounds(&self) -> Option<(i64, i64)> {
+        let duration = self.audio_duration_ms?;
+        let mut start = self.trim_start_ms.clamp(0, duration.saturating_sub(1000));
+        let mut end = self.trim_end_ms.clamp(1000, duration);
+        if end - start < 1000 {
+            if start + 1000 <= duration {
+                end = start + 1000;
+            } else {
+                start = duration.saturating_sub(1000);
+                end = duration;
+            }
+        }
+        Some((start, end))
+    }
+
+    fn preview_trimmed_audio(&mut self) {
+        let audio_path = match &self.audio_path {
+            Some(path) => path.clone(),
+            None => return,
+        };
+        let (start, end) = match self.clamped_trim_bounds() {
+            Some(bounds) => bounds,
+            None => {
+                self.trim_status = "Сначала выберите аудио с читаемой длительностью.".to_string();
+                return;
+            }
+        };
+
+        let preview_path = temp_dir().join("karaoke_trim_preview.wav");
+        match render_trimmed_audio(&audio_path, start, end, &preview_path)
+            .and_then(|_| open_file(&preview_path))
+        {
+            Ok(()) => {
+                self.trim_status = format!(
+                    "Открыт предпросмотр: {} - {}",
+                    format_time_ms(start),
+                    format_time_ms(end)
+                );
+            }
+            Err(err) => {
+                self.trim_status = err;
+            }
         }
     }
 
@@ -291,6 +494,7 @@ impl KaraokeApp {
         let inactive_color = self.color_inactive;
         let bg_color = self.color_bg;
         let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
+        let trim_bounds = self.clamped_trim_bounds();
         let temp = temp_dir();
         let exports = exports_dir();
         let uploads = upload_dir();
@@ -326,6 +530,36 @@ impl KaraokeApp {
             )));
             ctx.request_repaint();
 
+            let worker_audio_path = if let Some((start, end)) = trim_bounds {
+                let should_trim = start > 0
+                    || probe_audio_duration_ms(&audio_path)
+                        .map(|duration| end < duration - 250)
+                        .unwrap_or(false);
+
+                if should_trim {
+                    let trimmed_path = temp.join("karaoke_trimmed_generation.wav");
+                    let _ = tx.send(ProgressUpdate::RawLog(format!(
+                        "✂️ Обрезка аудио: {} - {}",
+                        format_time_ms(start),
+                        format_time_ms(end)
+                    )));
+                    ctx.request_repaint();
+
+                    match render_trimmed_audio(&audio_path, start, end, &trimmed_path) {
+                        Ok(()) => trimmed_path.to_string_lossy().to_string(),
+                        Err(err) => {
+                            let _ = tx.send(ProgressUpdate::Error(err));
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                } else {
+                    audio_path.clone()
+                }
+            } else {
+                audio_path.clone()
+            };
+
             let mut cmd = if is_python_worker(&worker_path) {
                 let mut cmd = std::process::Command::new("python3");
                 cmd.arg(&worker_path);
@@ -348,7 +582,7 @@ impl KaraokeApp {
                 .env("PYTHONUTF8", "1")
                 .arg("--cli")
                 .arg("--audio")
-                .arg(&audio_path)
+                .arg(&worker_audio_path)
                 .arg("--artist")
                 .arg(if artist.is_empty() {
                     "Исполнитель"
@@ -547,21 +781,7 @@ impl eframe::App for KaraokeApp {
                     if let Some(path) = &file.path {
                         let path_str = path.to_string_lossy().to_string();
                         if path_str.ends_with(".mp3") {
-                            self.audio_path = Some(path_str);
-
-                            let file_name = path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            if file_name.contains(" - ") {
-                                let parts: Vec<&str> = file_name.splitn(2, " - ").collect();
-                                self.artist = parts[0].trim().to_string();
-                                self.title = parts[1].trim().to_string();
-                            } else {
-                                self.title = file_name.trim().to_string();
-                                self.artist = String::new();
-                            }
+                            self.set_audio_file(path.clone());
                         }
                     }
                 }
@@ -688,18 +908,7 @@ impl eframe::App for KaraokeApp {
                                                     .add_filter("Аудио", &["mp3"])
                                                     .pick_file()
                                                 {
-                                                    let path_str = path.to_string_lossy().to_string();
-                                                    self.audio_path = Some(path_str);
-
-                                                    let file_name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                                                    if file_name.contains(" - ") {
-                                                        let parts: Vec<&str> = file_name.splitn(2, " - ").collect();
-                                                        self.artist = parts[0].trim().to_string();
-                                                        self.title = parts[1].trim().to_string();
-                                                    } else {
-                                                        self.title = file_name.trim().to_string();
-                                                        self.artist = String::new();
-                                                    }
+                                                    self.set_audio_file(path);
                                                 }
                                             }
 
@@ -710,6 +919,139 @@ impl eframe::App for KaraokeApp {
                                         });
                                     });
                                     ui.add_space(16.0);
+
+                                    if self.audio_path.is_some() {
+                                        ui.label(
+                                            egui::RichText::new("Обрезка аудио")
+                                                .strong()
+                                                .size(14.0)
+                                                .color(text),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Выберите рабочий фрагмент и прослушайте его перед генерацией.",
+                                            )
+                                            .size(12.0)
+                                            .color(muted),
+                                        );
+                                        ui.add_space(8.0);
+
+                                        if let Some(duration_ms) = self.audio_duration_ms {
+                                            if self.trim_end_ms <= self.trim_start_ms {
+                                                self.trim_end_ms =
+                                                    (self.trim_start_ms + 1000).min(duration_ms);
+                                            }
+
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Начало")
+                                                        .color(muted)
+                                                        .size(12.0),
+                                                );
+                                                ui.add_sized(
+                                                    egui::vec2(ui.available_width() - 92.0, 20.0),
+                                                    egui::Slider::new(
+                                                        &mut self.trim_start_ms,
+                                                        0..=duration_ms.saturating_sub(1000),
+                                                    )
+                                                    .show_value(false),
+                                                );
+                                                if self.trim_start_ms > self.trim_end_ms - 1000 {
+                                                    self.trim_start_ms =
+                                                        (self.trim_end_ms - 1000).max(0);
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(format_time_ms(
+                                                        self.trim_start_ms,
+                                                    ))
+                                                    .strong()
+                                                    .color(accent),
+                                                );
+                                            });
+
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("Конец")
+                                                        .color(muted)
+                                                        .size(12.0),
+                                                );
+                                                ui.add_sized(
+                                                    egui::vec2(ui.available_width() - 92.0, 20.0),
+                                                    egui::Slider::new(
+                                                        &mut self.trim_end_ms,
+                                                        1000..=duration_ms,
+                                                    )
+                                                    .show_value(false),
+                                                );
+                                                if self.trim_end_ms < self.trim_start_ms + 1000 {
+                                                    self.trim_end_ms =
+                                                        (self.trim_start_ms + 1000).min(duration_ms);
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(format_time_ms(
+                                                        self.trim_end_ms,
+                                                    ))
+                                                    .strong()
+                                                    .color(accent),
+                                                );
+                                            });
+
+                                            let selected_ms = self.trim_end_ms - self.trim_start_ms;
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Фрагмент: {}",
+                                                        format_time_ms(selected_ms)
+                                                    ))
+                                                    .size(12.0)
+                                                    .color(muted),
+                                                );
+
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if ui
+                                                            .add_enabled(
+                                                                !self.is_generating,
+                                                                egui::Button::new("Прослушать"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.preview_trimmed_audio();
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                !self.is_generating,
+                                                                egui::Button::new("Сбросить"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.trim_start_ms = 0;
+                                                            self.trim_end_ms = duration_ms;
+                                                            self.trim_status = format!(
+                                                                "Обрезка сброшена: {}",
+                                                                format_time_ms(duration_ms)
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        }
+
+                                        if !self.trim_status.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&self.trim_status)
+                                                    .size(11.0)
+                                                    .color(muted),
+                                            );
+                                        }
+
+                                        ui.add_space(18.0);
+                                        ui.separator();
+                                        ui.add_space(18.0);
+                                    }
 
                                     ui.label(egui::RichText::new("Метаданные").strong().size(14.0).color(text));
                                     ui.add_space(8.0);
