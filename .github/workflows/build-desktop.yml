@@ -72,6 +72,68 @@ jobs:
           name: KaraokeGenerator-Windows-x64-portable
           path: packaging/dist/KaraokeGenerator-Windows-x64-portable.zip
 
+  macos-box:
+    name: Build macOS portable box (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            label: Intel x64
+            artifact_name: KaraokeGenerator-macOS-Intel-x64-portable
+          - os: macos-latest
+            label: Apple Silicon arm64
+            artifact_name: KaraokeGenerator-macOS-AppleSilicon-arm64-portable
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop_app/target
+          key: macos-box-${{ matrix.artifact_name }}-cargo-${{ hashFiles('desktop_app/Cargo.lock') }}
+          restore-keys: macos-box-${{ matrix.artifact_name }}-cargo-
+
+      - name: Cache Python packages
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/pip
+          key: macos-box-${{ matrix.artifact_name }}-pip-${{ hashFiles('worker/requirements.txt') }}
+          restore-keys: macos-box-${{ matrix.artifact_name }}-pip-
+
+      - name: Install FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+
+      - name: Build portable macOS folder
+        run: ./packaging/macos/build_box.sh
+
+      - name: Create macOS tarball
+        run: |
+          cd packaging/dist
+          tar -czf "${{ matrix.artifact_name }}.tar.gz" KaraokeGenerator-macos
+
+      - name: Upload macOS box artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: packaging/dist/${{ matrix.artifact_name }}.tar.gz
+
   build:
     strategy:
       matrix:
@@ -140,7 +202,7 @@ jobs:
           path: desktop_app/${{ matrix.artifact_name }}.*
 
   release:
-    needs: [build, windows-box]
+    needs: [build, windows-box, macos-box]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

@@ -36,9 +36,12 @@ packaging/dist/KaraokeGenerator-macos/
 GitHub Actions release artifact names:
 
 ```text
-KaraokeGenerator-macOS-Intel-x64.tar.gz
-KaraokeGenerator-macOS-AppleSilicon-arm64.tar.gz
+KaraokeGenerator-macOS-Intel-x64-portable.tar.gz
+KaraokeGenerator-macOS-AppleSilicon-arm64-portable.tar.gz
 ```
+
+These are the files to give to macOS users. They contain the app, PyInstaller
+worker with its own Python runtime, FFmpeg, FFprobe, and bundled fonts.
 
 Run:
 
@@ -66,8 +69,8 @@ GitHub Actions release artifact name:
 KaraokeGenerator-Windows-x64-portable.zip
 ```
 
-This is the file to give to Windows users. It contains the app, worker,
-FFmpeg, FFprobe, and bundled fonts.
+This is the file to give to Windows users. It contains the app, PyInstaller
+worker with its own Python runtime, FFmpeg, FFprobe, and bundled fonts.
 
 ## Notes
 

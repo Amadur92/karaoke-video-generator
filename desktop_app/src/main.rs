@@ -1913,34 +1913,52 @@ impl eframe::App for KaraokeApp {
                             });
                             ui.add_space(8.0);
 
+                            let (preview_rect, preview_response) =
+                                ui.allocate_exact_size(preview_size, egui::Sense::click());
+                            let painter = ui.painter();
+                            painter.rect_filled(
+                                preview_rect,
+                                8.0,
+                                egui::Color32::from_rgb(8, 10, 14),
+                            );
+
                             if let Some(texture) = &self.video_texture {
-                                ui.add(
-                                    egui::Image::new(texture)
-                                        .fit_to_exact_size(preview_size)
-                                        .rounding(egui::Rounding::same(8.0)),
+                                painter.image(
+                                    texture.id(),
+                                    preview_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
                                 );
                             } else {
-                                let (preview_rect, _) =
-                                    ui.allocate_exact_size(preview_size, egui::Sense::hover());
-                                let painter = ui.painter();
                                 painter.rect_filled(
                                     preview_rect,
                                     8.0,
                                     egui::Color32::from_rgb(8, 10, 14),
                                 );
-                                painter.rect_stroke(
-                                    preview_rect,
-                                    8.0,
-                                    egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgb(48, 58, 74),
+                                painter.text(
+                                    egui::pos2(
+                                        preview_rect.center().x,
+                                        preview_rect.center().y + 48.0,
                                     ),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Нажмите play, чтобы посмотреть видео здесь",
+                                    egui::FontId::proportional(13.0),
+                                    muted,
                                 );
-                                painter.circle_filled(
-                                    preview_rect.center(),
-                                    28.0,
-                                    egui::Color32::from_rgb(45, 118, 255),
-                                );
+                            }
+
+                            painter.rect_stroke(
+                                preview_rect,
+                                8.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 58, 74)),
+                            );
+
+                            let is_video_playing = self.is_video_playing();
+                            if !is_video_playing {
+                                painter.circle_filled(preview_rect.center(), 28.0, accent);
                                 painter.text(
                                     preview_rect.center() + egui::vec2(2.0, 0.0),
                                     egui::Align2::CENTER_CENTER,
@@ -1948,97 +1966,108 @@ impl eframe::App for KaraokeApp {
                                     egui::FontId::proportional(26.0),
                                     egui::Color32::WHITE,
                                 );
-                                painter.text(
-                                    egui::pos2(
-                                        preview_rect.center().x,
-                                        preview_rect.center().y + 52.0,
-                                    ),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Нажмите «Воспроизвести», чтобы посмотреть видео здесь",
-                                    egui::FontId::proportional(13.0),
-                                    muted,
-                                );
                             }
 
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                let is_video_playing = self.is_video_playing();
-                                let play_label = if is_video_playing { "Пауза" } else { "▶" };
-                                let play_btn = egui::Button::new(
-                                    egui::RichText::new(play_label)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(if is_video_playing {
-                                    egui::Color32::from_rgb(78, 86, 103)
-                                } else {
-                                    accent
-                                })
-                                .rounding(8.0)
-                                .min_size(egui::vec2(58.0, 34.0));
-
-                                if ui.add(play_btn).clicked() {
-                                    if is_video_playing {
-                                        self.pause_video_preview();
-                                    } else if let Err(err) =
-                                        self.start_video_preview(&file_path, ctx)
-                                    {
-                                        self.video_status = err;
-                                    }
+                            if preview_response.clicked() && !is_video_playing {
+                                if let Err(err) = self.start_video_preview(&file_path, ctx) {
+                                    self.video_status = err;
                                 }
+                            }
 
-                                let stop_btn = egui::Button::new(
-                                    egui::RichText::new("Стоп")
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(egui::Color32::from_rgb(48, 56, 70))
-                                .rounding(8.0)
-                                .min_size(egui::vec2(70.0, 34.0));
+                            let controls_rect = egui::Rect::from_min_max(
+                                egui::pos2(preview_rect.left() + 12.0, preview_rect.bottom() - 54.0),
+                                egui::pos2(preview_rect.right() - 12.0, preview_rect.bottom() - 12.0),
+                            );
+                            painter.rect_filled(
+                                controls_rect,
+                                8.0,
+                                egui::Color32::from_rgba_unmultiplied(12, 16, 24, 232),
+                            );
 
-                                if ui.add(stop_btn).clicked() {
-                                    self.stop_video_preview();
-                                }
+                            ui.allocate_new_ui(
+                                egui::UiBuilder::new().max_rect(controls_rect.shrink(6.0)),
+                                |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    let is_video_playing = self.is_video_playing();
+                                    let play_label = if is_video_playing { "Пауза" } else { "▶" };
+                                    let play_btn = egui::Button::new(
+                                        egui::RichText::new(play_label)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(if is_video_playing {
+                                        egui::Color32::from_rgb(78, 86, 103)
+                                    } else {
+                                        accent
+                                    })
+                                    .rounding(8.0)
+                                    .min_size(egui::vec2(58.0, 30.0));
 
-                                let mut position = self
-                                    .video_position_ms
-                                    .clamp(0, self.video_duration_ms.max(0));
-                                let slider_enabled = self.video_duration_ms > 0;
-                                let slider = egui::Slider::new(
-                                    &mut position,
-                                    0..=self.video_duration_ms.max(1),
-                                )
-                                .show_value(false);
-
-                                let slider_response = ui.add_enabled(
-                                    slider_enabled,
-                                    slider.text("Позиция воспроизведения"),
-                                );
-                                if slider_response.changed() {
-                                    self.video_position_ms = position;
-                                    if is_video_playing {
-                                        self.pause_video_preview();
-                                    }
-                                    self.video_status = format!(
-                                        "Позиция: {}.",
-                                        format_time_ms(self.video_position_ms)
-                                    );
-                                }
-
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} / {}",
-                                        format_time_ms(self.video_position_ms),
-                                        if self.video_duration_ms > 0 {
-                                            format_time_ms(self.video_duration_ms)
-                                        } else {
-                                            "--:--".to_string()
+                                    if ui.add(play_btn).clicked() {
+                                        if is_video_playing {
+                                            self.pause_video_preview();
+                                        } else if let Err(err) =
+                                            self.start_video_preview(&file_path, ctx)
+                                        {
+                                            self.video_status = err;
                                         }
-                                    ))
-                                    .size(12.0)
-                                    .color(muted),
-                                );
-                            });
+                                    }
+
+                                    let stop_btn = egui::Button::new(
+                                        egui::RichText::new("Стоп")
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(48, 56, 70))
+                                    .rounding(8.0)
+                                    .min_size(egui::vec2(66.0, 30.0));
+
+                                    if ui.add(stop_btn).clicked() {
+                                        self.stop_video_preview();
+                                    }
+
+                                    let mut position = self
+                                        .video_position_ms
+                                        .clamp(0, self.video_duration_ms.max(0));
+                                    let slider_enabled = self.video_duration_ms > 0;
+                                    let slider_width = (ui.available_width() - 96.0).max(120.0);
+                                    let slider = egui::Slider::new(
+                                        &mut position,
+                                        0..=self.video_duration_ms.max(1),
+                                    )
+                                    .show_value(false);
+
+                                    let slider_response = ui.add_sized(
+                                        egui::vec2(slider_width, 28.0),
+                                        slider.text("Позиция воспроизведения"),
+                                    );
+                                    if slider_enabled && slider_response.changed() {
+                                        self.video_position_ms = position;
+                                        if is_video_playing {
+                                            self.pause_video_preview();
+                                        }
+                                        self.video_status = format!(
+                                            "Позиция: {}.",
+                                            format_time_ms(self.video_position_ms)
+                                        );
+                                    }
+
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} / {}",
+                                            format_time_ms(self.video_position_ms),
+                                            if self.video_duration_ms > 0 {
+                                                format_time_ms(self.video_duration_ms)
+                                            } else {
+                                                "--:--".to_string()
+                                            }
+                                        ))
+                                        .size(12.0)
+                                        .color(muted),
+                                    );
+                                });
+                                },
+                            );
                         });
                     });
                     ui.add_space(page_margin);
