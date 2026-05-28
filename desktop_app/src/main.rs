@@ -274,7 +274,13 @@ fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Resu
 
 /// Путь к папке экспорта видео
 fn exports_dir() -> PathBuf {
-    let exports = app_data_dir().join("exports");
+    let base = app_base_dir();
+    let portable_exports = base.join("exports");
+    let exports = if base.join("worker").exists() && base.join("bin").exists() {
+        portable_exports
+    } else {
+        app_data_dir().join("exports")
+    };
     let _ = std::fs::create_dir_all(&exports);
     exports
 }

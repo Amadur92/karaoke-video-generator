@@ -87,8 +87,9 @@ Then open the app again.
 4. Paste or edit lyrics.
 5. Set artist, title, colors, font, and quality.
 6. Click generate.
-7. Preview the MP4 inside the app.
-8. Save a copy where you want it.
+7. The MP4 is saved to the `exports` folder next to the app in portable builds.
+8. Preview the MP4 inside the app.
+9. Save a copy somewhere else if needed.
 
 ## Development
 
