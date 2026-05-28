@@ -134,75 +134,8 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: packaging/dist/${{ matrix.artifact_name }}.tar.gz
 
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: KaraokeGenerator-macOS-Intel-x64
-            binary_name: desktop_app
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: KaraokeGenerator-macOS-AppleSilicon-arm64
-            binary_name: desktop_app
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: KaraokeGenerator-Windows-x64-binary
-            binary_name: desktop_app.exe
-
-    runs-on: ${{ matrix.os }}
-    
-    defaults:
-      run:
-        working-directory: desktop_app
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry & build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            desktop_app/target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('desktop_app/Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Create distribution archive (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/
-          cd dist
-          chmod +x ${{ matrix.binary_name }}
-          tar -czf ../${{ matrix.artifact_name }}.tar.gz ${{ matrix.binary_name }}
-
-      - name: Create distribution archive (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          mkdir dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/
-          cd dist
-          Compress-Archive -Path ${{ matrix.binary_name }} -DestinationPath ../${{ matrix.artifact_name }}.zip
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: desktop_app/${{ matrix.artifact_name }}.*
-
   release:
-    needs: [build, windows-box, macos-box]
+    needs: [windows-box, macos-box]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
