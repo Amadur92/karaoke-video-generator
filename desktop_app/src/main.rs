@@ -13,6 +13,84 @@ use std::time::{Duration, Instant};
 // Шрифты Montserrat вкомпилированы прямо в бинарник — нулевая зависимость от внешних файлов
 const MONTSERRAT_REGULAR: &[u8] = include_bytes!("../assets/Montserrat-Regular.ttf");
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../assets/Montserrat-Bold.ttf");
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn app_icon() -> egui::IconData {
+    let size = 256usize;
+    let mut rgba = vec![0u8; size * size * 4];
+    let center = size as f32 / 2.0;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let idx = (y * size + x) * 4;
+
+            if distance <= 116.0 {
+                let t = (y as f32 / size as f32).clamp(0.0, 1.0);
+                rgba[idx] = (24.0 + 18.0 * t) as u8;
+                rgba[idx + 1] = (116.0 + 95.0 * (1.0 - t)) as u8;
+                rgba[idx + 2] = (255.0 - 74.0 * t) as u8;
+                rgba[idx + 3] = 255;
+            }
+
+            if distance > 100.0 && distance <= 116.0 {
+                rgba[idx] = 54;
+                rgba[idx + 1] = 211;
+                rgba[idx + 2] = 153;
+                rgba[idx + 3] = 255;
+            }
+        }
+    }
+
+    fn fill_rect(
+        rgba: &mut [u8],
+        size: usize,
+        left: usize,
+        top: usize,
+        width: usize,
+        height: usize,
+        color: [u8; 4],
+    ) {
+        for y in top..(top + height).min(size) {
+            for x in left..(left + width).min(size) {
+                let idx = (y * size + x) * 4;
+                rgba[idx..idx + 4].copy_from_slice(&color);
+            }
+        }
+    }
+
+    fill_rect(&mut rgba, size, 79, 98, 24, 66, [255, 255, 255, 255]);
+    fill_rect(&mut rgba, size, 112, 76, 24, 88, [255, 255, 255, 255]);
+    fill_rect(&mut rgba, size, 145, 116, 24, 48, [255, 255, 255, 255]);
+    fill_rect(&mut rgba, size, 73, 174, 102, 12, [255, 255, 255, 255]);
+
+    let play = [(112.0, 100.0), (112.0, 156.0), (160.0, 128.0)];
+    for y in 92..164 {
+        for x in 104..170 {
+            let px = x as f32;
+            let py = y as f32;
+            let area = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+                ((a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1)).abs()) / 2.0
+            };
+            let whole = area(play[0], play[1], play[2]);
+            let a = area((px, py), play[1], play[2]);
+            let b = area(play[0], (px, py), play[2]);
+            let c = area(play[0], play[1], (px, py));
+            if (a + b + c - whole).abs() < 0.6 {
+                let idx = (y * size + x) * 4;
+                rgba[idx..idx + 4].copy_from_slice(&[12, 14, 18, 255]);
+            }
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: size as u32,
+        height: size as u32,
+    }
+}
 
 /// Вычисляет путь к файлу настроек в домашней директории пользователя
 fn settings_path() -> PathBuf {
@@ -1399,7 +1477,7 @@ impl eframe::App for KaraokeApp {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Караоке-Видео Генератор")
+                        egui::RichText::new(format!("Караоке-Видео Генератор v{}", APP_VERSION))
                             .strong()
                             .size(27.0)
                             .color(text)
@@ -1428,7 +1506,7 @@ impl eframe::App for KaraokeApp {
                         "Ожидание"
                     };
                     ui.label(
-                        egui::RichText::new(status)
+                        egui::RichText::new(format!("v{} · {}", APP_VERSION, status))
                             .strong()
                             .size(13.0)
                             .color(status_color)
@@ -2129,14 +2207,18 @@ impl eframe::App for KaraokeApp {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Караоке-Видео Генератор (Word-Level)")
+            .with_title(format!(
+                "Караоке-Видео Генератор v{} (Word-Level)",
+                APP_VERSION
+            ))
+            .with_icon(app_icon())
             .with_inner_size([1100.0, 750.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Караоке-Видео Генератор",
+        &format!("Караоке-Видео Генератор v{}", APP_VERSION),
         options,
         Box::new(|cc| Ok(Box::new(KaraokeApp::new(cc)))),
     )
