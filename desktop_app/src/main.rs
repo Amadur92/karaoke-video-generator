@@ -106,6 +106,28 @@ fn tool_path(base_name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+#[cfg(target_os = "macos")]
+fn clear_quarantine(path: &Path) {
+    if path.exists() {
+        let _ = std::process::Command::new("xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(path)
+            .status();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_quarantine(_path: &Path) {}
+
+fn clear_bundled_runtime_quarantine() {
+    if let Some(bin_dir) = bundled_bin_dir() {
+        clear_quarantine(&bin_dir);
+    }
+
+    let base = app_base_dir();
+    clear_quarantine(&base.join("worker"));
+}
+
 fn format_time_ms(ms: i64) -> String {
     let total_seconds = (ms.max(0) as f32 / 1000.0).round() as i64;
     let minutes = total_seconds / 60;
@@ -1004,6 +1026,7 @@ impl KaraokeApp {
             None => return,
         };
         self.stop_video_preview();
+        clear_bundled_runtime_quarantine();
 
         let worker_path = match find_worker() {
             Some(p) => p,

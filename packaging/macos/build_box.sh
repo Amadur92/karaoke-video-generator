@@ -27,11 +27,26 @@ cp "$FFPROBE_BIN" "$BOX_DIR/bin/ffprobe"
 
 chmod +x "$BOX_DIR/Karaoke Generator" "$BOX_DIR/worker/karaoke_worker" "$BOX_DIR/bin/ffmpeg" "$BOX_DIR/bin/ffprobe"
 
+if command -v codesign >/dev/null 2>&1; then
+  find "$BOX_DIR" \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) -print0 |
+    while IFS= read -r -d '' item; do
+      codesign --force --sign - "$item" >/dev/null 2>&1 || true
+    done
+
+  codesign --force --deep --sign - "$BOX_DIR/worker/karaoke_worker" >/dev/null 2>&1 || true
+  codesign --force --deep --sign - "$BOX_DIR/Karaoke Generator" >/dev/null 2>&1 || true
+  codesign --force --sign - "$BOX_DIR/bin/ffmpeg" >/dev/null 2>&1 || true
+  codesign --force --sign - "$BOX_DIR/bin/ffprobe" >/dev/null 2>&1 || true
+fi
+
 cat > "$BOX_DIR/README.txt" <<'EOF'
 Karaoke Generator
 
 Run:
   ./Karaoke Generator
+
+If macOS says a bundled Python.framework is damaged, run:
+  xattr -dr com.apple.quarantine .
 
 The first generation can take longer because the selected Whisper model is
 downloaded into your user cache.
