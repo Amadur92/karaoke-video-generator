@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 import math
+import bisect
 import threading
 import subprocess
 import traceback
@@ -65,6 +66,9 @@ def replace_special_spaces(text):
 
 def clean_word(w):
     return re.sub(r'[^\w\s]', '', replace_special_spaces(w).strip().lower())
+
+def infer_lyrics_language(text):
+    return 'ru' if re.search(r'[А-Яа-яЁё]', text or '') else 'en'
 
 def get_system_font(font_name='montserrat', bold=False):
     font_name = font_name.lower().strip()
@@ -167,8 +171,138 @@ def get_word_widths(words, font):
 # Глобальный кэш загруженных ИИ-моделей Whisper в оперативной памяти
 loaded_models = {}
 
+def get_whisper_model(model_name, status_callback=None):
+    import stable_whisper
+    if model_name not in loaded_models:
+        if status_callback:
+            status_callback(f"Загрузка ИИ-модели Whisper '{model_name}' в память...")
+        loaded_models[model_name] = stable_whisper.load_model(model_name)
+    elif status_callback:
+        status_callback(f"Использование готовой модели Whisper '{model_name}'...")
+    return loaded_models[model_name]
+
+def audio_duration_seconds(audio_path):
+    try:
+        res = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return max(0.0, float(res.stdout.strip()))
+    except Exception:
+        return 0.0
+
+def extract_audio_window(input_path, output_path, start=0.0, duration=None):
+    cmd = ['ffmpeg', '-y', '-ss', f'{max(0.0, start):.3f}']
+    if duration is not None:
+        cmd.extend(['-t', f'{max(0.1, duration):.3f}'])
+    cmd.extend([
+        '-i', input_path,
+        '-vn',
+        '-acodec', 'pcm_s16le',
+        '-ar', '16000',
+        '-ac', '1',
+        output_path
+    ])
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+def detect_vocal_start(audio_path, model_name='base', window_seconds=45.0, chunk_seconds=12.0, hop_seconds=8.0, status_callback=None, language='ru', lyrics_text=''):
+    import tempfile
+
+    duration = audio_duration_seconds(audio_path)
+    scan_duration = min(max(window_seconds, chunk_seconds), duration or window_seconds)
+    chunk_seconds = max(4.0, min(chunk_seconds, scan_duration))
+    hop_seconds = max(2.0, min(hop_seconds, chunk_seconds))
+    model = get_whisper_model(model_name)
+    expected_words = {
+        clean_word(word)
+        for word in re.split(r'\s+', lyrics_text or '')
+        if len(clean_word(word)) >= 3
+    }
+
+    def format_time(seconds):
+        seconds = max(0, int(round(seconds)))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    offset = 0.0
+    all_candidates = []
+    while offset < scan_duration:
+        current_duration = min(chunk_seconds, scan_duration - offset)
+        if current_duration < 1.0:
+            break
+        if status_callback:
+            status_callback(
+                f"Предобработка: ищем вокал {format_time(offset)}-{format_time(offset + current_duration)}..."
+            )
+
+        with tempfile.NamedTemporaryFile(prefix='karaoke_vocal_scan_', suffix='.wav', delete=False) as tmp:
+            scan_path = tmp.name
+
+        try:
+            extract_audio_window(audio_path, scan_path, offset, current_duration)
+            result = model.transcribe(scan_path, language=language)
+
+            candidates = []
+            for segment in getattr(result, 'segments', []) or []:
+                text = (getattr(segment, 'text', '') or '').strip()
+                clean = re.sub(r'[^A-Za-zА-Яа-яЁё0-9]+', '', text)
+                if len(clean) < 2:
+                    continue
+                recognized_words = {
+                    clean_word(word)
+                    for word in re.split(r'\s+', text)
+                    if len(clean_word(word)) >= 3
+                }
+                no_speech_prob = getattr(segment, 'no_speech_prob', 0.0) or 0.0
+                avg_logprob = getattr(segment, 'avg_logprob', 0.0) or 0.0
+                local_start = float(getattr(segment, 'start', 0.0) or 0.0)
+                start = offset + local_start
+                if no_speech_prob > 0.75:
+                    continue
+                if avg_logprob < -1.4 and len(clean) < 8:
+                    continue
+                if expected_words and not (expected_words & recognized_words):
+                    if no_speech_prob > 0.35 or avg_logprob < -0.65:
+                        continue
+                candidates.append({
+                    'start': round(max(0.0, start), 3),
+                    'end': round(max(start, offset + float(getattr(segment, 'end', local_start) or local_start)), 3),
+                    'text': text[:80],
+                    'no_speech_prob': round(float(no_speech_prob), 3),
+                    'avg_logprob': round(float(avg_logprob), 3),
+                })
+
+            all_candidates.extend(candidates)
+            if candidates:
+                first = candidates[0]
+                start = max(0.0, first['start'] - 0.35)
+                confidence = 'high' if first['start'] > 3.0 else 'medium'
+                return {
+                    'vocal_start': round(start, 3),
+                    'confidence': confidence,
+                    'segments': candidates[:5],
+                    'scanned_until': round(offset + current_duration, 3),
+                }
+        finally:
+            try:
+                os.remove(scan_path)
+            except OSError:
+                pass
+
+        offset += hop_seconds
+
+    return {
+        'vocal_start': 0.0,
+        'confidence': 'low',
+        'segments': all_candidates[:5],
+        'scanned_until': round(scan_duration, 3),
+    }
+
 # ----------------- РЕНДЕРИНГ (ФОНОВЫЙ ПОТОК) -----------------
-def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0):
+def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False):
+    cleanup_align_audio_path = None
     try:
         from PIL import Image, ImageDraw, ImageFont
         
@@ -186,22 +320,40 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         lyrics = replace_special_spaces(lyrics)
         artist = replace_special_spaces(artist)
         title = replace_special_spaces(title)
+        lyrics_language = infer_lyrics_language(lyrics)
         
         # 1. ЗАПУСК ИИ-ВЫРАВНИВАНИЯ
-        import stable_whisper
-        if model_name not in loaded_models:
-            jobs[job_id]["status"] = f"Загрузка ИИ-модели Whisper '{model_name}' в память (выполняется ОДИН раз)..."
-            jobs[job_id]["progress"] = 0.1
-            loaded_models[model_name] = stable_whisper.load_model(model_name)
-            jobs[job_id]["status"] = f"Модель Whisper '{model_name}' успешно загружена и кэширована!"
-        else:
-            jobs[job_id]["status"] = f"Использование готовой модели Whisper '{model_name}' из кэша памяти..."
-            
+        def update_model_status(message):
+            jobs[job_id]["status"] = message
+
+        jobs[job_id]["progress"] = 0.1
+        model = get_whisper_model(model_name, update_model_status)
+        vocal_start = max(0.0, float(vocal_start or 0.0))
+        if auto_vocal_start and vocal_start < 0.5:
+            jobs[job_id]["progress"] = 0.16
+            try:
+                detected = detect_vocal_start(
+                    audio_path,
+                    model_name,
+                    status_callback=lambda message: jobs[job_id].update({"status": message}),
+                    language=lyrics_language,
+                    lyrics_text=lyrics,
+                )
+                vocal_start = max(0.0, float(detected.get('vocal_start') or 0.0))
+                if vocal_start >= 0.5:
+                    jobs[job_id]["status"] = f"Первый вокал найден: {vocal_start:.1f} сек. Используем как ориентир для таймингов."
+                else:
+                    jobs[job_id]["status"] = "Длинное интро не найдено, распознавание начнется с 00:00."
+            except Exception as e:
+                vocal_start = 0.0
+                jobs[job_id]["status"] = f"Предобработка не удалась, продолжаем с 00:00: {str(e)}"
+        align_audio_path = audio_path
+
         model = loaded_models[model_name]
         jobs[job_id]["progress"] = 0.2
 
         jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
-        result = model.align(audio_path, lyrics, language='ru', original_split=True)
+        result = model.align(align_audio_path, lyrics, language=lyrics_language, original_split=True)
         jobs[job_id]["progress"] = 0.4
 
         # Очищаем паузы и тишину: если между словами пауза, сжимаем границы слов, чтобы они не горели заранее
@@ -243,14 +395,32 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         except Exception:
             pass
 
-        # ИНТЕРПОЛЯЦИЯ БИТЫХ СЛОВ (start == end или длительность < 0.02с)
+        # ИНТЕРПОЛЯЦИЯ БИТЫХ СЛОВ (перевернутые, нулевые или слишком длинные тайминги)
         # Whisper иногда сжимает целые припевы в одну точку времени.
         # Находим группы битых слов и равномерно распределяем их между валидными якорями.
         jobs[job_id]["status"] = "Интерполяция таймингов для сбойных сегментов ИИ..."
         
         n_total = len(whisper_words)
-        is_valid = [(hasattr(w, 'start') and hasattr(w, 'end') 
-                      and (w.end - w.start) > 0.02 and w.start >= 0) for w in whisper_words]
+        def word_duration_limit(word):
+            clean = clean_word(getattr(word, 'word', '') or '')
+            # Певческие хвосты бывают длинными, но одно слово на полкуплета почти всегда сбой.
+            return min(2.8, max(0.85, 0.34 * max(len(clean), 1)))
+
+        def valid_word_time(word):
+            if not (hasattr(word, 'start') and hasattr(word, 'end')):
+                return False
+            try:
+                start = float(word.start)
+                end = float(word.end)
+            except Exception:
+                return False
+            if start < 0 or end <= start + 0.02:
+                return False
+            if end - start > word_duration_limit(word):
+                return False
+            return True
+
+        is_valid = [valid_word_time(w) for w in whisper_words]
         
         # Получаем длительность аудио для крайнего случая
         audio_duration = 120.0
@@ -276,20 +446,33 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             group_end = i  # не включительно
             num_broken = group_end - group_start
             
-            # Левый якорь: конец последнего валидного слова перед группой
-            left_time = whisper_words[group_start - 1].end if group_start > 0 else 0.0
-            
+            # Левый якорь: конец последнего валидного слова перед группой.
+            # Для группы в самом начале нельзя слепо брать auto vocal_start:
+            # если детектор промахнулся поздно, он сдвинет первую строку поверх второй.
+            left_time = 0.0
+            for j in range(group_start - 1, -1, -1):
+                if is_valid[j]:
+                    left_time = whisper_words[j].end
+                    break
+
             # Правый якорь: начало первого валидного слова после группы
             right_time = None
             for j in range(group_end, n_total):
                 if is_valid[j]:
                     right_time = whisper_words[j].start
                     break
+            if group_start == 0 and right_time is not None:
+                total_chars_before = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
+                estimated_span = min(8.0, max(0.45 * num_broken, total_chars_before * 0.16))
+                left_time = max(0.0, right_time - estimated_span)
             if right_time is None:
-                right_time = audio_duration
+                # Если справа нет надежного якоря, не растягиваем хвост до конца трека.
+                total_chars = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
+                right_time = left_time + min(8.0, max(0.45 * num_broken, total_chars * 0.16))
             
             # Пропорциональное распределение времени по длине слов
-            span = max(right_time - left_time, 0.2)
+            max_span = max(0.45 * num_broken, min(8.0, num_broken * 0.9))
+            span = min(max(right_time - left_time, 0.2), max_span)
             
             # Считаем суммарную длину всех битых слов в группе
             total_chars = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
@@ -323,8 +506,11 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         for i in range(1, n_total):
             if whisper_words[i].start < whisper_words[i-1].end:
                 whisper_words[i].start = round(whisper_words[i-1].end + 0.01, 3)
-                if whisper_words[i].end <= whisper_words[i].start:
-                    whisper_words[i].end = round(whisper_words[i].start + 0.15, 3)
+            max_end = whisper_words[i].start + word_duration_limit(whisper_words[i])
+            if whisper_words[i].end <= whisper_words[i].start:
+                whisper_words[i].end = round(whisper_words[i].start + 0.15, 3)
+            elif whisper_words[i].end > max_end:
+                whisper_words[i].end = round(max_end, 3)
         
         num_whisper_words = len(whisper_words)
         jobs[job_id]["status"] = f"Обработано {num_whisper_words} слов (интерполировано: {interpolated_count})"
@@ -620,38 +806,76 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     font_cache[key] = ImageFont.load_default()
             return font_cache[key]
 
+        try:
+            resampling_filter = Image.Resampling.BILINEAR
+        except AttributeError:
+            resampling_filter = Image.BILINEAR
+
+        font_max = get_font_at_size(bold=True, size=font_size_max)
+        word_pad = int(20 * size_scale)
+        word_active_offset = int(10 * size_scale)
+        line_pad_x = int(40 * size_scale)
+        line_text_x = int(20 * size_scale)
+
+        jobs[job_id]["status"] = "Подготовка кеша строк для быстрого рендера..."
+        line_render_cache = []
+        for line_data in lyrics_karaoke:
+            words = line_data["words"]
+            widths, space_w = get_word_widths(words, font_max)
+            total_w = sum(widths) + space_w * max(0, len(words) - 1)
+            line_img_w = max(1, total_w + line_pad_x)
+            inactive_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
+            inactive_draw = ImageDraw.Draw(inactive_img)
+
+            x_draw = line_text_x
+            word_layers = []
+            for w_idx, w_data in enumerate(words):
+                word = w_data["word"]
+                word_w = widths[w_idx]
+                inactive_draw.text((x_draw, y_draw), word, fill=rgba_inactive, font=font_max)
+
+                active_word_img = Image.new("RGBA", (word_w + word_pad, line_img_h), (0, 0, 0, 0))
+                active_word_draw = ImageDraw.Draw(active_word_img)
+                active_word_draw.text((word_active_offset, y_draw), word, fill=rgba_active, font=font_max)
+                word_layers.append({
+                    "start": w_data["start"],
+                    "end": w_data["end"],
+                    "paste_x": x_draw - word_active_offset,
+                    "image": active_word_img,
+                    "width": active_word_img.width,
+                })
+                x_draw += word_w + space_w
+
+            line_render_cache.append({
+                "inactive": inactive_img,
+                "word_layers": word_layers,
+                "width": line_img_w,
+                "height": line_img_h,
+            })
+
+        # Моменты, когда скролл переключается на следующую строку.
+        # В паузах берем ту же 40% точку, что и прежний покадровый алгоритм.
+        transition_times = []
+        for idx, line_data in enumerate(lyrics_karaoke):
+            if idx == 0:
+                transition_times.append(float("-inf"))
+            else:
+                prev_line = lyrics_karaoke[idx - 1]
+                if line_data["start"] > prev_line["end"]:
+                    transition_times.append(prev_line["end"] + (line_data["start"] - prev_line["end"]) * 0.4)
+                else:
+                    transition_times.append(line_data["start"])
+
         for frame_idx in range(total_frames):
             t = frame_idx / fps - audio_delay
             
             # Задний фон пользователя
             image = Image.new('RGBA', (width, height), rgba_bg)
-            draw = ImageDraw.Draw(image)
             
             # Интеллектуальный алгоритм превентивного скроллинга (Anticipatory Scrolling)
             active_line_idx = 0
-            for idx, line_data in enumerate(lyrics_karaoke):
-                if line_data["start"] <= t <= line_data["end"]:
-                    active_line_idx = idx
-                    break
-                elif t < line_data["start"]:
-                    if idx == 0:
-                        active_line_idx = 0
-                        break
-                    else:
-                        prev_line = lyrics_karaoke[idx - 1]
-                        if t > prev_line["end"]:
-                            # Вычисляем 40% от времени паузы для мягкого сдвига
-                            pause_midpoint = prev_line["end"] + (line_data["start"] - prev_line["end"]) * 0.4
-                            if t >= pause_midpoint:
-                                active_line_idx = idx
-                            else:
-                                active_line_idx = idx - 1
-                        else:
-                            active_line_idx = idx - 1
-                        break
-            else:
-                if lyrics_karaoke:
-                    active_line_idx = len(lyrics_karaoke) - 1
+            if transition_times:
+                active_line_idx = max(0, min(len(lyrics_karaoke) - 1, bisect.bisect_right(transition_times, t) - 1))
 
             target_scroll_y = active_line_idx * line_spacing
             current_scroll_y += (target_scroll_y - current_scroll_y) * 0.15
@@ -666,68 +890,31 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 weight = max(0.0, min(1.0, 1.0 - (dist_from_center / line_spacing)))
                 
                 is_active = (idx == active_line_idx)
-                text_str = line_data["text"]
-                
-                # Загружаем шрифт выбранного семейства максимального размера
-                font_max = get_font_at_size(bold=True, size=font_size_max)
-                
-                # Рисуем строку в высоком разрешении на прозрачном холсте
+                cached_line = line_render_cache[idx]
+
                 if is_active:
-                    words = line_data["words"]
-                    widths, space_w = get_word_widths(words, font_max)
-                    total_w = sum(widths) + space_w * (len(words) - 1)
-                    
-                    line_img_w = total_w + int(40 * size_scale)
-                    line_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
-                    line_draw = ImageDraw.Draw(line_img)
-                    
-                    x_draw = int(20 * size_scale)
-                    
-                    for w_idx, w_data in enumerate(words):
-                        word = w_data["word"]
-                        word_w = widths[w_idx]
-                        w_start = w_data["start"]
-                        w_end = w_data["end"]
-                        
+                    line_img = cached_line["inactive"].copy()
+                    for layer in cached_line["word_layers"]:
+                        w_start = layer["start"]
+                        w_end = layer["end"]
                         if t < w_start:
-                            line_draw.text((x_draw, y_draw), word, fill=rgba_inactive, font=font_max)
+                            continue
                         elif t > w_end:
-                            line_draw.text((x_draw, y_draw), word, fill=rgba_active, font=font_max)
+                            line_img.paste(layer["image"], (layer["paste_x"], 0), layer["image"])
                         else:
-                            # Серая основа
-                            line_draw.text((x_draw, y_draw), word, fill=rgba_inactive, font=font_max)
-                            
                             # Плавный цветной накат
-                            progress = max(0.0, min(1.0, (t - w_start) / (w_end - w_start)))
-                            word_img = Image.new("RGBA", (word_w + int(20 * size_scale), line_img_h), (0, 0, 0, 0))
-                            w_draw = ImageDraw.Draw(word_img)
-                            w_draw.text((int(10 * size_scale), y_draw), word, fill=rgba_active, font=font_max)
-                            
-                            fill_w = int((word_w + int(20 * size_scale)) * progress)
+                            progress = max(0.0, min(1.0, (t - w_start) / max(0.001, w_end - w_start)))
+                            fill_w = int(layer["width"] * progress)
                             if fill_w > 0:
-                                filled_part = word_img.crop((0, 0, fill_w, line_img_h))
-                                line_img.paste(filled_part, (x_draw - int(10 * size_scale), 0), filled_part)
-                        
-                        x_draw += word_w + space_w
+                                filled_part = layer["image"].crop((0, 0, fill_w, line_img_h))
+                                line_img.paste(filled_part, (layer["paste_x"], 0), filled_part)
                 else:
-                    bbox = font_max.getbbox(text_str)
-                    total_w = bbox[2] - bbox[0]
-                    
-                    line_img_w = total_w + int(40 * size_scale)
-                    line_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
-                    line_draw = ImageDraw.Draw(line_img)
-                    
-                    line_draw.text((int(20 * size_scale), y_draw), text_str, fill=rgba_inactive, font=font_max)
+                    line_img = cached_line["inactive"]
                 
                 # Масштабируем холст строки методом субпиксельной интерполяции BILINEAR
                 scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max
-                new_w = max(1, int(line_img_w * scale))
-                new_h = max(1, int(line_img_h * scale))
-                
-                try:
-                    resampling_filter = Image.Resampling.BILINEAR
-                except AttributeError:
-                    resampling_filter = Image.BILINEAR
+                new_w = max(1, int(cached_line["width"] * scale))
+                new_h = max(1, int(cached_line["height"] * scale))
                     
                 resized_img = line_img.resize((new_w, new_h), resampling_filter)
                 
@@ -769,6 +956,12 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         jobs[job_id]["error"] = str(e)
         jobs[job_id]["status"] = f"❌ Ошибка: {str(e)}"
         traceback.print_exc()
+    finally:
+        if cleanup_align_audio_path:
+            try:
+                os.remove(cleanup_align_audio_path)
+            except OSError:
+                pass
 
 # ----------------- FLASK МАРШРУТЫ И API -----------------
 
@@ -1457,6 +1650,8 @@ def generate():
         color_inactive = data.get('color_inactive', '#B4B9C3')
         color_bg = data.get('color_bg', '#FFFFFF')
         audio_delay = float(data.get('audio_delay', 0.0))
+        vocal_start = float(data.get('vocal_start', 0.0))
+        auto_vocal_start = bool(data.get('auto_vocal_start', True))
 
         if not audio_path or not os.path.exists(audio_path):
             return jsonify({"error": "Аудиофайл не найден на сервере!"}), 400
@@ -1475,7 +1670,7 @@ def generate():
         # Запускаем фоновый поток генерации с параметрами оформления и качества
         thread = threading.Thread(
             target=generate_karaoke_thread,
-            args=(job_id, audio_path, artist, title, lyrics, model_name, quality, font_family, color_active, color_inactive, color_bg, audio_delay)
+            args=(job_id, audio_path, artist, title, lyrics, model_name, quality, font_family, color_active, color_inactive, color_bg, audio_delay, vocal_start, auto_vocal_start)
         )
         thread.daemon = True
         thread.start()
@@ -1518,7 +1713,7 @@ if __name__ == '__main__':
         parser.add_argument('--audio', required=True)
         parser.add_argument('--artist', default='Исполнитель')
         parser.add_argument('--title', default='Песня')
-        parser.add_argument('--lyrics-file', required=True)
+        parser.add_argument('--lyrics-file')
         parser.add_argument('--model', default='base')
         parser.add_argument('--quality', default='medium')
         parser.add_argument('--font', default='montserrat')
@@ -1526,6 +1721,10 @@ if __name__ == '__main__':
         parser.add_argument('--color-inactive', default='#B4B9C3')
         parser.add_argument('--color-bg', default='#FFFFFF')
         parser.add_argument('--audio-delay', type=float, default=0.0)
+        parser.add_argument('--vocal-start', type=float, default=0.0)
+        parser.add_argument('--auto-vocal-start', action='store_true')
+        parser.add_argument('--detect-vocal-start', action='store_true')
+        parser.add_argument('--detect-window', type=float, default=45.0)
         parser.print_help()
         sys.exit(0)
 
@@ -1536,7 +1735,7 @@ if __name__ == '__main__':
         parser.add_argument('--audio', required=True)
         parser.add_argument('--artist', default='Исполнитель')
         parser.add_argument('--title', default='Песня')
-        parser.add_argument('--lyrics-file', required=True)
+        parser.add_argument('--lyrics-file')
         parser.add_argument('--model', default='base')
         parser.add_argument('--quality', default='medium')
         parser.add_argument('--font', default='montserrat')
@@ -1544,8 +1743,46 @@ if __name__ == '__main__':
         parser.add_argument('--color-inactive', default='#B4B9C3')
         parser.add_argument('--color-bg', default='#FFFFFF')
         parser.add_argument('--audio-delay', type=float, default=0.0)
+        parser.add_argument('--vocal-start', type=float, default=0.0)
+        parser.add_argument('--auto-vocal-start', action='store_true')
+        parser.add_argument('--detect-vocal-start', action='store_true')
+        parser.add_argument('--detect-window', type=float, default=45.0)
         
         args = parser.parse_args()
+
+        if args.detect_vocal_start:
+            try:
+                print(json.dumps({"progress": 0.05, "status": "Предобработка: поиск первого вокала...", "done": False}), flush=True)
+                lyrics_for_detect = ''
+                if args.lyrics_file:
+                    try:
+                        with open(args.lyrics_file, 'r', encoding='utf-8') as f:
+                            lyrics_for_detect = f.read()
+                    except Exception:
+                        lyrics_for_detect = ''
+                detected = detect_vocal_start(
+                    args.audio,
+                    args.model,
+                    args.detect_window,
+                    language=infer_lyrics_language(lyrics_for_detect),
+                    lyrics_text=lyrics_for_detect,
+                )
+                print(json.dumps({
+                    "progress": 1.0,
+                    "status": f"Первый вокал найден: {detected['vocal_start']:.1f} сек.",
+                    "done": True,
+                    "vocal_start": detected["vocal_start"],
+                    "confidence": detected["confidence"],
+                    "segments": detected["segments"],
+                }), flush=True)
+                sys.exit(0)
+            except Exception as e:
+                print(json.dumps({"progress": 1.0, "status": f"Предобработка не удалась: {str(e)}", "done": True, "error": str(e), "vocal_start": 0.0}), flush=True)
+                sys.exit(1)
+
+        if not args.lyrics_file:
+            print(json.dumps({"progress": 1.0, "status": "❌ Ошибка: не указан файл текста", "done": True, "error": "lyrics-file is required"}), flush=True)
+            sys.exit(1)
         
         # Читаем текст песни из файла
         with open(args.lyrics_file, 'r', encoding='utf-8') as f:
@@ -1598,7 +1835,9 @@ if __name__ == '__main__':
                 color_active=args.color_active,
                 color_inactive=args.color_inactive,
                 color_bg=args.color_bg,
-                audio_delay=args.audio_delay
+                audio_delay=args.audio_delay,
+                vocal_start=args.vocal_start,
+                auto_vocal_start=args.auto_vocal_start
             )
         except Exception as e:
             print(json.dumps({"progress": 1.0, "status": f"❌ Ошибка: {str(e)}", "done": True, "error": str(e)}), flush=True)
