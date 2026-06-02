@@ -52,6 +52,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $BoxDir "worker") | Out-Nul
 New-Item -ItemType Directory -Force -Path (Join-Path $BoxDir "bin") | Out-Null
 
 Copy-Item (Join-Path $TargetDir "release\desktop_app.exe") (Join-Path $BoxDir "Karaoke Generator.exe")
+Copy-Item (Join-Path $TargetDir "release\karaoke_render.exe") (Join-Path $BoxDir "worker\karaoke_render.exe")
 Copy-Item (Join-Path $BuildDir "dist\karaoke_worker\*") (Join-Path $BoxDir "worker") -Recurse
 
 if ($FfmpegDir -eq "") {

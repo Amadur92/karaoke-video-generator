@@ -20,15 +20,18 @@ mkdir -p \
   "$APP_PATH/Contents/MacOS" \
   "$APP_PATH/Contents/Resources/worker" \
   "$APP_PATH/Contents/Resources/bin" \
+  "$APP_PATH/Contents/Resources/assets" \
   "$DMG_ROOT"
 
 cp "$BOX_DIR/Karaoke Generator" "$APP_PATH/Contents/MacOS/Karaoke Generator"
 cp -R "$BOX_DIR/worker/"* "$APP_PATH/Contents/Resources/worker/"
 cp -R "$BOX_DIR/bin/"* "$APP_PATH/Contents/Resources/bin/"
+cp -R "$BOX_DIR/assets/"* "$APP_PATH/Contents/Resources/assets/"
 cp "$BOX_DIR/README.txt" "$APP_PATH/Contents/Resources/README.txt"
 
 chmod +x "$APP_PATH/Contents/MacOS/Karaoke Generator"
 chmod +x "$APP_PATH/Contents/Resources/worker/karaoke_worker"
+chmod +x "$APP_PATH/Contents/Resources/worker/karaoke_render"
 chmod +x "$APP_PATH/Contents/Resources/bin/ffmpeg"
 chmod +x "$APP_PATH/Contents/Resources/bin/ffprobe"
 
@@ -83,6 +86,7 @@ done < <(find "$APP_PATH/Contents/Resources" -type f -perm -111 -print0)
 sign_file "$APP_PATH/Contents/Resources/bin/ffmpeg"
 sign_file "$APP_PATH/Contents/Resources/bin/ffprobe"
 sign_file "$APP_PATH/Contents/Resources/worker/karaoke_worker"
+sign_file "$APP_PATH/Contents/Resources/worker/karaoke_render"
 codesign --force --deep --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP_PATH"
 
 codesign --verify --deep --strict --verbose=4 "$APP_PATH"

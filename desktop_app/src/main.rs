@@ -3,7 +3,7 @@
 use eframe::egui;
 use rodio::Source;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -111,6 +111,17 @@ fn app_data_dir() -> PathBuf {
     p
 }
 
+fn debug_log(message: impl AsRef<str>) {
+    let path = app_data_dir().join("karaoke_debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", message.as_ref());
+    }
+}
+
 /// Вычисляет рабочую директорию рядом с исполняемым файлом
 fn app_base_dir() -> PathBuf {
     std::env::current_exe()
@@ -132,13 +143,36 @@ fn find_worker() -> Option<PathBuf> {
     let base = app_base_dir();
     let worker_exe = executable_name("karaoke_worker");
     let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker/karaoke_worker.py"),
         base.join(&worker_exe),
         base.join("worker").join(&worker_exe),
         base.join("../Resources/worker").join(&worker_exe),
         base.join("karaoke_worker.py"),
         base.join("worker/karaoke_worker.py"),
         base.join("../../../worker/karaoke_worker.py"),
+        base.join("../../../../worker/karaoke_worker.py"),
         PathBuf::from("/Users/mihailsokolenko/wow_quiz/worker/karaoke_worker.py"),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
+    None
+}
+
+fn find_rust_renderer() -> Option<PathBuf> {
+    let base = app_base_dir();
+    let renderer_exe = executable_name("karaoke_render");
+    let candidates = [
+        base.join(&renderer_exe),
+        base.join("worker").join(&renderer_exe),
+        base.join("../Resources/worker").join(&renderer_exe),
+        base.join("../release").join(&renderer_exe),
+        base.join("../../../target/release").join(&renderer_exe),
+        base.join("../../../desktop_app/target/release")
+            .join(&renderer_exe),
     ];
 
     for candidate in candidates {
@@ -212,6 +246,52 @@ fn format_time_ms(ms: i64) -> String {
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
     format!("{:02}:{:02}", minutes, seconds)
+}
+
+fn parse_ffmpeg_hms_ms(value: &str) -> Option<i64> {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours = parts[0].parse::<f64>().ok()?;
+    let minutes = parts[1].parse::<f64>().ok()?;
+    let seconds = parts[2].parse::<f64>().ok()?;
+    Some(((hours * 3600.0 + minutes * 60.0 + seconds) * 1000.0).round() as i64)
+}
+
+fn parse_ffmpeg_time_ms(line: &str) -> Option<i64> {
+    if let Some(value) = line.strip_prefix("out_time_us=") {
+        return value.trim().parse::<i64>().ok().map(|v| v / 1000);
+    }
+
+    if let Some(value) = line.strip_prefix("out_time_ms=") {
+        return value.trim().parse::<i64>().ok().map(|v| v / 1000);
+    }
+
+    if let Some(value) = line.strip_prefix("out_time=") {
+        return parse_ffmpeg_hms_ms(value.trim());
+    }
+
+    let start = line.find("time=")? + "time=".len();
+    let value = line[start..].split_whitespace().next()?;
+    parse_ffmpeg_hms_ms(value)
+}
+
+fn is_ffmpeg_progress_key(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    matches!(
+        key,
+        "frame"
+            | "fps"
+            | "bitrate"
+            | "total_size"
+            | "dup_frames"
+            | "drop_frames"
+            | "speed"
+            | "progress"
+    ) || key.starts_with("stream_")
 }
 
 fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
@@ -1339,6 +1419,7 @@ impl KaraokeApp {
                 return;
             }
         };
+        let rust_renderer_path = find_rust_renderer();
 
         self.is_generating = true;
         self.progress = 0.0;
@@ -1363,6 +1444,10 @@ impl KaraokeApp {
         let exports = exports_dir();
         let uploads = upload_dir();
         let worker_path_for_log = worker_path.to_string_lossy().to_string();
+        let use_rust_renderer = rust_renderer_path.is_some();
+        let renderer_path_for_log = rust_renderer_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
 
         let (tx, rx) = channel::<ProgressUpdate>();
         self.rx = Some(rx);
@@ -1387,11 +1472,34 @@ impl KaraokeApp {
                 inactive_color[0], inactive_color[1], inactive_color[2]
             );
             let bg_hex = format!("#{:02X}{:02X}{:02X}", bg_color[0], bg_color[1], bg_color[2]);
+            let output_artist = if artist.is_empty() {
+                "Исполнитель".to_string()
+            } else {
+                artist.clone()
+            };
+            let output_title = if title.is_empty() {
+                "Песня".to_string()
+            } else {
+                title.clone()
+            };
+            let clean_filename = format!("{} - {} (karaoke).mp4", output_artist, output_title)
+                .replace("/", "_")
+                .replace("\\", "_");
+            let output_mp4_path = exports.join(&clean_filename);
+            let timings_output_path = temp.join("karaoke_timings_final.json");
 
+            let render_mode = renderer_path_for_log
+                .as_ref()
+                .map(|path| format!("Rust renderer: {}", path))
+                .unwrap_or_else(|| "Python renderer: Rust-бинарник не найден".to_string());
             let _ = tx.send(ProgressUpdate::RawLog(format!(
-                "📝 Временные файлы подготовлены. Запуск worker: {}",
-                worker_path_for_log
+                "📝 Временные файлы подготовлены. Запуск worker: {}\n{}",
+                worker_path_for_log, render_mode
             )));
+            debug_log(format!(
+                "[karaoke-ui] worker={} renderer={:?}",
+                worker_path_for_log, renderer_path_for_log
+            ));
             ctx.request_repaint();
 
             let worker_audio_path = if let Some((start, end)) = trim_bounds {
@@ -1459,17 +1567,9 @@ impl KaraokeApp {
                 .arg("--audio")
                 .arg(&worker_audio_path)
                 .arg("--artist")
-                .arg(if artist.is_empty() {
-                    "Исполнитель"
-                } else {
-                    &artist
-                })
+                .arg(&output_artist)
                 .arg("--title")
-                .arg(if title.is_empty() {
-                    "Песня"
-                } else {
-                    &title
-                })
+                .arg(&output_title)
                 .arg("--lyrics-file")
                 .arg(temp_lyrics_path.to_string_lossy().as_ref())
                 .arg("--model")
@@ -1490,9 +1590,16 @@ impl KaraokeApp {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
+            if use_rust_renderer {
+                cmd.arg("--timings-only")
+                    .arg("--timings-output")
+                    .arg(timings_output_path.to_string_lossy().as_ref());
+            }
+
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
+                    debug_log(format!("[karaoke-ui] worker spawn failed: {e}"));
                     let _ = tx.send(ProgressUpdate::Error(format!(
                         "Ошибка запуска worker: {}",
                         e
@@ -1532,10 +1639,17 @@ impl KaraokeApp {
                         let trimmed = line_str.trim();
                         if trimmed.starts_with('{') && trimmed.ends_with('}') {
                             if let Ok(mut update) = serde_json::from_str::<CLIProgress>(trimmed) {
+                                if use_rust_renderer {
+                                    update.progress = (update.progress * 0.55).clamp(0.0, 0.55);
+                                }
                                 // Конвертируем относительное имя файла в полный путь
                                 if let Some(ref filename) = update.file {
-                                    let full = format!("{}/{}", exports_str, filename);
-                                    update.file = Some(full);
+                                    if Path::new(filename).is_absolute() {
+                                        update.file = Some(filename.clone());
+                                    } else {
+                                        let full = format!("{}/{}", exports_str, filename);
+                                        update.file = Some(full);
+                                    }
                                 }
                                 let _ = tx.send(ProgressUpdate::Progress(update));
                                 ctx.request_repaint();
@@ -1555,7 +1669,155 @@ impl KaraokeApp {
             }
 
             let status = child.wait();
-            let success = status.map(|s| s.success()).unwrap_or(false);
+            let mut success = status.map(|s| s.success()).unwrap_or(false);
+            debug_log(format!("[karaoke-ui] worker finished success={success}"));
+
+            if success {
+                if let Some(renderer_path) = rust_renderer_path {
+                    let _ = tx.send(ProgressUpdate::Progress(CLIProgress {
+                        progress: 0.55,
+                        status: "Rust-рендер: сборка видео...".to_string(),
+                        done: false,
+                        error: None,
+                        file: None,
+                    }));
+                    let _ = tx.send(ProgressUpdate::RawLog(format!(
+                        "🎬 Rust-рендер: {}",
+                        output_mp4_path.to_string_lossy()
+                    )));
+                    let render_duration_ms = probe_audio_duration_ms(&worker_audio_path)
+                        .unwrap_or(0)
+                        .max(1);
+                    debug_log(format!(
+                        "[karaoke-ui] render start renderer={} output={}",
+                        renderer_path.to_string_lossy(),
+                        output_mp4_path.to_string_lossy()
+                    ));
+                    ctx.request_repaint();
+
+                    let mut render_cmd = std::process::Command::new(&renderer_path);
+                    if let Some(bin_dir) = bundled_bin_dir() {
+                        let old_path = std::env::var_os("PATH").unwrap_or_default();
+                        let mut paths = vec![bin_dir];
+                        paths.extend(std::env::split_paths(&old_path));
+                        if let Ok(joined) = std::env::join_paths(paths) {
+                            render_cmd.env("PATH", joined);
+                        }
+                    }
+
+                    render_cmd
+                        .arg("--timings")
+                        .arg(&timings_output_path)
+                        .arg("--audio")
+                        .arg(&worker_audio_path)
+                        .arg("--output")
+                        .arg(&output_mp4_path)
+                        .arg("--quality")
+                        .arg(&quality)
+                        .arg("--color-active")
+                        .arg(&active_hex)
+                        .arg("--color-inactive")
+                        .arg(&inactive_hex)
+                        .arg("--color-bg")
+                        .arg(&bg_hex)
+                        .arg("--engine")
+                        .arg(
+                            std::env::var("KARAOKE_RENDER_ENGINE")
+                                .unwrap_or_else(|_| "ass".to_string()),
+                        )
+                        .arg("--audio-delay")
+                        .arg(audio_delay_seconds.to_string())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped());
+
+                    match render_cmd.spawn() {
+                        Ok(mut render_child) => {
+                            if let Some(stderr) = render_child.stderr.take() {
+                                use std::io::{BufRead, BufReader};
+                                let reader = BufReader::new(stderr);
+                                for line in reader.lines().map_while(Result::ok) {
+                                    let trimmed = line.trim();
+                                    if let Some(time_ms) = parse_ffmpeg_time_ms(trimmed) {
+                                        let value = (time_ms as f32 / render_duration_ms as f32)
+                                            .clamp(0.0, 1.0);
+                                        let mapped = 0.55 + value * 0.43;
+                                        let _ = tx.send(ProgressUpdate::Progress(CLIProgress {
+                                            progress: mapped.clamp(0.55, 0.98),
+                                            status: format!(
+                                                "Rust-рендер: {}%",
+                                                (value * 100.0).round() as i32
+                                            ),
+                                            done: false,
+                                            error: None,
+                                            file: None,
+                                        }));
+                                        ctx.request_repaint();
+                                        continue;
+                                    }
+                                    if let Some(percent) = trimmed.strip_prefix("render ") {
+                                        let number = percent.trim_end_matches('%');
+                                        if let Ok(value) = number.parse::<f32>() {
+                                            let mapped = 0.55 + (value / 100.0) * 0.43;
+                                            let _ =
+                                                tx.send(ProgressUpdate::Progress(CLIProgress {
+                                                    progress: mapped.clamp(0.55, 0.98),
+                                                    status: format!(
+                                                        "Rust-рендер: {:.0}%",
+                                                        value.clamp(0.0, 100.0)
+                                                    ),
+                                                    done: false,
+                                                    error: None,
+                                                    file: None,
+                                                }));
+                                            ctx.request_repaint();
+                                            continue;
+                                        }
+                                    }
+                                    if is_ffmpeg_progress_key(trimmed) {
+                                        continue;
+                                    }
+                                    if !trimmed.is_empty() {
+                                        let _ = tx.send(ProgressUpdate::RawLog(format!(
+                                            "[Rust] {}",
+                                            trimmed
+                                        )));
+                                        ctx.request_repaint();
+                                    }
+                                }
+                            }
+
+                            success = render_child
+                                .wait()
+                                .map(|status| status.success())
+                                .unwrap_or(false);
+                            debug_log(format!("[karaoke-ui] render finished success={success}"));
+                            if success {
+                                let _ = tx.send(ProgressUpdate::Progress(CLIProgress {
+                                    progress: 1.0,
+                                    status: "Видео собрано Rust-рендером.".to_string(),
+                                    done: true,
+                                    error: None,
+                                    file: Some(output_mp4_path.to_string_lossy().to_string()),
+                                }));
+                            } else {
+                                let _ = tx.send(ProgressUpdate::Error(
+                                    "Rust-рендер завершился с ошибкой.".to_string(),
+                                ));
+                            }
+                            ctx.request_repaint();
+                        }
+                        Err(e) => {
+                            success = false;
+                            debug_log(format!("[karaoke-ui] render spawn failed: {e}"));
+                            let _ = tx.send(ProgressUpdate::Error(format!(
+                                "Ошибка запуска Rust-рендера: {}",
+                                e
+                            )));
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
 
             let _ = std::fs::remove_file(temp.join("temp_lyrics.txt"));
 

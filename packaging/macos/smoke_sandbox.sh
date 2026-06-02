@@ -14,6 +14,7 @@ fi
 APP_DIR="$(cd "$APP_DIR" && pwd)"
 APP_BIN="$APP_DIR/Karaoke Generator"
 WORKER_BIN="$APP_DIR/worker/karaoke_worker"
+RENDERER_BIN="$APP_DIR/worker/karaoke_render"
 FFMPEG_BIN="$APP_DIR/bin/ffmpeg"
 FFPROBE_BIN="$APP_DIR/bin/ffprobe"
 SANDBOX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/karaoke-empty-home.XXXXXX")"
@@ -41,6 +42,7 @@ xattr -dr com.apple.quarantine "$APP_DIR" 2>/dev/null || true
 echo "Checking bundled executables..."
 test -x "$APP_BIN"
 test -x "$WORKER_BIN"
+test -x "$RENDERER_BIN"
 test -x "$FFMPEG_BIN"
 test -x "$FFPROBE_BIN"
 
@@ -72,6 +74,12 @@ env -i \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   "$FFMPEG_BIN" -version >/dev/null
 
+echo "Checking bundled ffmpeg ASS/libass support..."
+if ! "$FFMPEG_BIN" -hide_banner -filters 2>/dev/null | grep -E ' ass +V->V| subtitles +V->V' >/dev/null; then
+  echo "ERROR: bundled ffmpeg does not support ASS/subtitles filters." >&2
+  exit 1
+fi
+
 echo "Running bundled worker help..."
 env -i \
   HOME="$SANDBOX_HOME" \
@@ -79,6 +87,13 @@ env -i \
   PATH="$APP_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
   PYTHONUTF8=1 \
   "$WORKER_BIN" --help >/dev/null || true
+
+echo "Running bundled Rust renderer help..."
+env -i \
+  HOME="$SANDBOX_HOME" \
+  XDG_CACHE_HOME="$SANDBOX_CACHE" \
+  PATH="$APP_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  "$RENDERER_BIN" --help >/dev/null || true
 
 if [[ "$MODE" == "--preview-check" ]]; then
   if [[ -z "$VIDEO_PATH" ]]; then

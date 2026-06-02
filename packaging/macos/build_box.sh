@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BOX_DIR="$ROOT_DIR/packaging/dist/KaraokeGenerator-macos"
 WORKER_DIST="$($ROOT_DIR/packaging/macos/build_worker.sh | tail -n 1)"
 
-FFMPEG_BIN="$(command -v ffmpeg || true)"
-FFPROBE_BIN="$(command -v ffprobe || true)"
+FFMPEG_BIN="${FFMPEG_BIN:-$(command -v ffmpeg || true)}"
+FFPROBE_BIN="${FFPROBE_BIN:-$(command -v ffprobe || true)}"
 
 if [[ -z "$FFMPEG_BIN" || -z "$FFPROBE_BIN" ]]; then
   echo "ffmpeg and ffprobe must be available in PATH on the build machine." >&2
@@ -18,14 +18,17 @@ cargo build --release
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 
 rm -rf "$BOX_DIR"
-mkdir -p "$BOX_DIR/worker" "$BOX_DIR/bin/lib"
+mkdir -p "$BOX_DIR/worker" "$BOX_DIR/bin/lib" "$BOX_DIR/assets"
 
 cp "$TARGET_DIR/release/desktop_app" "$BOX_DIR/Karaoke Generator"
+cp "$TARGET_DIR/release/karaoke_render" "$BOX_DIR/worker/karaoke_render"
 cp -R "$WORKER_DIST/"* "$BOX_DIR/worker/"
+cp "$ROOT_DIR/desktop_app/assets/Montserrat-Regular.ttf" "$BOX_DIR/assets/Montserrat-Regular.ttf"
+cp "$ROOT_DIR/desktop_app/assets/Montserrat-Bold.ttf" "$BOX_DIR/assets/Montserrat-Bold.ttf"
 cp "$FFMPEG_BIN" "$BOX_DIR/bin/ffmpeg"
 cp "$FFPROBE_BIN" "$BOX_DIR/bin/ffprobe"
 
-chmod +x "$BOX_DIR/Karaoke Generator" "$BOX_DIR/worker/karaoke_worker" "$BOX_DIR/bin/ffmpeg" "$BOX_DIR/bin/ffprobe"
+chmod +x "$BOX_DIR/Karaoke Generator" "$BOX_DIR/worker/karaoke_worker" "$BOX_DIR/worker/karaoke_render" "$BOX_DIR/bin/ffmpeg" "$BOX_DIR/bin/ffprobe"
 
 is_system_dylib() {
   case "$1" in
@@ -89,6 +92,7 @@ if command -v codesign >/dev/null 2>&1; then
     done
 
   codesign --force --deep --sign - "$BOX_DIR/worker/karaoke_worker" >/dev/null 2>&1 || true
+  codesign --force --deep --sign - "$BOX_DIR/worker/karaoke_render" >/dev/null 2>&1 || true
   codesign --force --deep --sign - "$BOX_DIR/Karaoke Generator" >/dev/null 2>&1 || true
   codesign --force --sign - "$BOX_DIR/bin/ffmpeg" >/dev/null 2>&1 || true
   codesign --force --sign - "$BOX_DIR/bin/ffprobe" >/dev/null 2>&1 || true

@@ -1,0 +1,1109 @@
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use image::{ImageBuffer, Rgba, RgbaImage, imageops};
+use imageproc::drawing::draw_text_mut;
+use serde::Deserialize;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const MONTSERRAT_BOLD: &[u8] = include_bytes!("../../assets/Montserrat-Bold.ttf");
+
+#[derive(Debug, Deserialize)]
+struct KaraokeWord {
+    word: String,
+    start: f64,
+    end: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct KaraokeLine {
+    start: f64,
+    end: f64,
+    words: Vec<KaraokeWord>,
+}
+
+#[derive(Clone)]
+struct WordLayer {
+    start: f64,
+    end: f64,
+    paste_x: i32,
+    width: u32,
+    image: RgbaImage,
+}
+
+struct LineCache {
+    inactive: RgbaImage,
+    words: Vec<WordLayer>,
+    width: u32,
+    height: u32,
+}
+
+struct RenderConfig {
+    timings: PathBuf,
+    audio: PathBuf,
+    output: PathBuf,
+    quality: String,
+    active: Rgba<u8>,
+    inactive: Rgba<u8>,
+    background: Rgba<u8>,
+    audio_delay: f64,
+    engine: String,
+    ffmpeg: Option<PathBuf>,
+    debug_frame_time: Option<f64>,
+    debug_frame_output: Option<PathBuf>,
+}
+
+fn parse_color(value: &str) -> Result<Rgba<u8>, String> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return Err(format!("Цвет должен быть в формате #RRGGBB: {value}"));
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).map_err(|e| e.to_string())?;
+    let g = u8::from_str_radix(&hex[2..4], 16).map_err(|e| e.to_string())?;
+    let b = u8::from_str_radix(&hex[4..6], 16).map_err(|e| e.to_string())?;
+    Ok(Rgba([r, g, b, 255]))
+}
+
+fn ass_color(color: Rgba<u8>, alpha: u8) -> String {
+    format!(
+        "&H{alpha:02X}{:02X}{:02X}{:02X}",
+        color.0[2], color.0[1], color.0[0]
+    )
+}
+
+fn ass_time(seconds: f64) -> String {
+    let centis = (seconds.max(0.0) * 100.0).round() as u64;
+    let cs = centis % 100;
+    let total_seconds = centis / 100;
+    let s = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let m = total_minutes % 60;
+    let h = total_minutes / 60;
+    format!("{h}:{m:02}:{s:02}.{cs:02}")
+}
+
+fn escape_ass_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('{', "\\{")
+        .replace('}', "\\}")
+        .replace('\n', " ")
+}
+
+fn escape_filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--audio-delay 0.0]"
+    );
+    std::process::exit(2);
+}
+
+fn parse_args() -> Result<RenderConfig, String> {
+    let mut args = std::env::args().skip(1);
+    let mut timings = None;
+    let mut audio = None;
+    let mut output = None;
+    let mut quality = "medium".to_string();
+    let mut active = parse_color("#000000")?;
+    let mut inactive = parse_color("#B4B9C3")?;
+    let mut background = parse_color("#FFFFFF")?;
+    let mut audio_delay = 0.0;
+    let mut engine = "frames".to_string();
+    let mut ffmpeg = None;
+    let mut debug_frame_time = None;
+    let mut debug_frame_output = None;
+
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or_else(|| format!("Нет значения для {arg}"));
+        match arg.as_str() {
+            "--timings" => timings = Some(PathBuf::from(value()?)),
+            "--audio" => audio = Some(PathBuf::from(value()?)),
+            "--output" => output = Some(PathBuf::from(value()?)),
+            "--quality" => quality = value()?,
+            "--color-active" => active = parse_color(&value()?)?,
+            "--color-inactive" => inactive = parse_color(&value()?)?,
+            "--color-bg" => background = parse_color(&value()?)?,
+            "--engine" => engine = value()?,
+            "--ffmpeg" => ffmpeg = Some(PathBuf::from(value()?)),
+            "--audio-delay" => {
+                audio_delay = value()?
+                    .parse::<f64>()
+                    .map_err(|e| format!("Некорректный audio-delay: {e}"))?
+            }
+            "--debug-frame-time" => {
+                debug_frame_time = Some(
+                    value()?
+                        .parse::<f64>()
+                        .map_err(|e| format!("Некорректный debug-frame-time: {e}"))?,
+                )
+            }
+            "--debug-frame-output" => debug_frame_output = Some(PathBuf::from(value()?)),
+            "--help" | "-h" => usage(),
+            _ => return Err(format!("Неизвестный аргумент: {arg}")),
+        }
+    }
+
+    Ok(RenderConfig {
+        timings: timings.ok_or_else(|| "Не указан --timings".to_string())?,
+        audio: audio.ok_or_else(|| "Не указан --audio".to_string())?,
+        output: output.ok_or_else(|| "Не указан --output".to_string())?,
+        quality,
+        active,
+        inactive,
+        background,
+        audio_delay,
+        engine,
+        ffmpeg,
+        debug_frame_time,
+        debug_frame_output,
+    })
+}
+
+fn audio_duration_seconds(audio: &PathBuf) -> Result<f64, String> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(audio)
+        .output()
+        .map_err(|e| format!("Не удалось запустить ffprobe: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| format!("ffprobe вернул некорректную длительность: {e}"))
+}
+
+fn text_width(font: &FontArc, size: f32, text: &str) -> f32 {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut width = 0.0;
+    let mut previous = None;
+    for ch in text.chars() {
+        let id = scaled.glyph_id(ch);
+        if let Some(prev) = previous {
+            width += scaled.kern(prev, id);
+        }
+        width += scaled.h_advance(id);
+        previous = Some(id);
+    }
+    width
+}
+
+fn paste_alpha(
+    dst: &mut RgbaImage,
+    src: &RgbaImage,
+    x: i32,
+    y: i32,
+    opacity: f32,
+    crop_w: Option<u32>,
+) {
+    let max_w = crop_w.unwrap_or(src.width()).min(src.width());
+    for sy in 0..src.height() {
+        let dy = y + sy as i32;
+        if dy < 0 || dy >= dst.height() as i32 {
+            continue;
+        }
+        for sx in 0..max_w {
+            let dx = x + sx as i32;
+            if dx < 0 || dx >= dst.width() as i32 {
+                continue;
+            }
+            let s = src.get_pixel(sx, sy).0;
+            let src_alpha = (s[3] as f32 / 255.0) * opacity;
+            if src_alpha <= 0.0 {
+                continue;
+            }
+            let d = dst.get_pixel_mut(dx as u32, dy as u32);
+            let dst_alpha = d.0[3] as f32 / 255.0;
+            let out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha);
+            if out_alpha <= 0.0 {
+                continue;
+            }
+            let blend = |src: u8, dst: u8| {
+                ((src as f32 * src_alpha + dst as f32 * dst_alpha * (1.0 - src_alpha)) / out_alpha)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            d.0[0] = blend(s[0], d.0[0]);
+            d.0[1] = blend(s[1], d.0[1]);
+            d.0[2] = blend(s[2], d.0[2]);
+            d.0[3] = (out_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn paste_alpha_onto_opaque(dst: &mut RgbaImage, src: &RgbaImage, x: i32, y: i32, opacity: f32) {
+    for sy in 0..src.height() {
+        let dy = y + sy as i32;
+        if dy < 0 || dy >= dst.height() as i32 {
+            continue;
+        }
+        for sx in 0..src.width() {
+            let dx = x + sx as i32;
+            if dx < 0 || dx >= dst.width() as i32 {
+                continue;
+            }
+            let s = src.get_pixel(sx, sy).0;
+            let alpha = (s[3] as f32 / 255.0) * opacity;
+            if alpha <= 0.0 {
+                continue;
+            }
+            let d = dst.get_pixel_mut(dx as u32, dy as u32);
+            let inv = 1.0 - alpha;
+            d.0[0] = (s[0] as f32 * alpha + d.0[0] as f32 * inv).round() as u8;
+            d.0[1] = (s[1] as f32 * alpha + d.0[1] as f32 * inv).round() as u8;
+            d.0[2] = (s[2] as f32 * alpha + d.0[2] as f32 * inv).round() as u8;
+            d.0[3] = 255;
+        }
+    }
+}
+
+fn frame_to_rgb24(frame: &RgbaImage, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(frame.width() as usize * frame.height() as usize * 3);
+    for pixel in frame.pixels() {
+        out.extend_from_slice(&pixel.0[0..3]);
+    }
+}
+
+fn build_line_cache(
+    lines: &[KaraokeLine],
+    font: &FontArc,
+    font_size: f32,
+    line_height: u32,
+    y_draw: i32,
+    active: Rgba<u8>,
+    inactive: Rgba<u8>,
+    size_scale: f32,
+    text_supersample: f32,
+) -> Vec<LineCache> {
+    let render_scale = size_scale * text_supersample;
+    let render_font_size = font_size * text_supersample;
+    let render_line_height = (line_height as f32 * text_supersample).round() as u32;
+    let render_y_draw = (y_draw as f32 * text_supersample).round() as i32;
+    let word_pad = (20.0 * render_scale).round() as u32;
+    let word_active_offset = (10.0 * render_scale).round() as i32;
+    let line_pad_x = (40.0 * render_scale).round() as u32;
+    let line_text_x = (20.0 * render_scale).round() as i32;
+    let space_w = text_width(font, render_font_size, " ");
+
+    lines
+        .iter()
+        .map(|line| {
+            let widths: Vec<f32> = line
+                .words
+                .iter()
+                .map(|word| text_width(font, render_font_size, &word.word))
+                .collect();
+            let total_w =
+                widths.iter().sum::<f32>() + space_w * line.words.len().saturating_sub(1) as f32;
+            let line_w = (total_w.ceil() as u32 + line_pad_x).max(1);
+            let base_line_w = (line_w as f32 / text_supersample).round().max(1.0) as u32;
+            let mut inactive_img =
+                ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
+
+            let mut x = line_text_x;
+            let mut layers = Vec::with_capacity(line.words.len());
+            for (idx, word) in line.words.iter().enumerate() {
+                draw_text_mut(
+                    &mut inactive_img,
+                    inactive,
+                    x,
+                    render_y_draw,
+                    PxScale::from(render_font_size),
+                    font,
+                    &word.word,
+                );
+
+                let word_w = widths[idx].ceil() as u32;
+                let mut active_img = ImageBuffer::from_pixel(
+                    word_w + word_pad,
+                    render_line_height,
+                    Rgba([0, 0, 0, 0]),
+                );
+                draw_text_mut(
+                    &mut active_img,
+                    active,
+                    word_active_offset,
+                    render_y_draw,
+                    PxScale::from(render_font_size),
+                    font,
+                    &word.word,
+                );
+
+                let base_active_w = (active_img.width() as f32 / text_supersample)
+                    .round()
+                    .max(1.0) as u32;
+                let base_active_img = imageops::resize(
+                    &active_img,
+                    base_active_w,
+                    line_height,
+                    imageops::FilterType::Lanczos3,
+                );
+                layers.push(WordLayer {
+                    start: word.start,
+                    end: word.end,
+                    paste_x: ((x - word_active_offset) as f32 / text_supersample).round() as i32,
+                    width: base_active_img.width(),
+                    image: base_active_img,
+                });
+                x += (widths[idx] + space_w).round() as i32;
+            }
+
+            let base_inactive_img = imageops::resize(
+                &inactive_img,
+                base_line_w,
+                line_height,
+                imageops::FilterType::Lanczos3,
+            );
+
+            LineCache {
+                inactive: base_inactive_img,
+                words: layers,
+                width: base_line_w,
+                height: line_height,
+            }
+        })
+        .collect()
+}
+
+fn transition_times(lines: &[KaraokeLine]) -> Vec<f64> {
+    let line_lead = line_advance_seconds();
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if idx == 0 {
+                f64::NEG_INFINITY
+            } else {
+                let prev = &lines[idx - 1];
+                if line.start > prev.end {
+                    (line.start - line_lead).max(prev.end)
+                } else {
+                    line.start
+                }
+            }
+        })
+        .collect()
+}
+
+fn visual_lag_seconds() -> f64 {
+    std::env::var("KARAOKE_VISUAL_LAG_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.0, 2.0)
+}
+
+fn line_advance_seconds() -> f64 {
+    std::env::var("KARAOKE_LINE_ADVANCE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.0, 2.0)
+}
+
+fn active_line(transitions: &[f64], t: f64) -> usize {
+    transitions
+        .partition_point(|value| *value <= t)
+        .saturating_sub(1)
+        .min(transitions.len().saturating_sub(1))
+}
+
+fn scroll_positions(
+    transitions: &[f64],
+    total_frames: usize,
+    fps: f64,
+    audio_delay: f64,
+    line_spacing: f32,
+) -> Vec<f32> {
+    let mut positions = Vec::with_capacity(total_frames);
+    let mut scroll_y = 0.0_f32;
+    for frame_idx in 0..total_frames {
+        let t = frame_idx as f64 / fps - audio_delay;
+        let active_idx = if transitions.is_empty() {
+            0
+        } else {
+            active_line(transitions, t)
+        };
+        let target_scroll_y = active_idx as f32 * line_spacing;
+        scroll_y += (target_scroll_y - scroll_y) * 0.15;
+        positions.push(scroll_y);
+    }
+    positions
+}
+
+struct AssWordMetric {
+    start: f64,
+    end: f64,
+    paste_x: f32,
+    width: f32,
+}
+
+struct AssLineMetric {
+    text: String,
+    width: f32,
+    words: Vec<AssWordMetric>,
+}
+
+fn build_ass_metrics(lines: &[KaraokeLine], font: &FontArc, font_size: f32) -> Vec<AssLineMetric> {
+    let space_w = text_width(font, font_size, " ");
+    lines
+        .iter()
+        .map(|line| {
+            let mut text = String::new();
+            let mut words = Vec::with_capacity(line.words.len());
+            let mut x = 0.0_f32;
+            for (idx, word) in line.words.iter().enumerate() {
+                if idx > 0 {
+                    text.push(' ');
+                    x += space_w;
+                }
+                text.push_str(&escape_ass_text(&word.word));
+                let width = text_width(font, font_size, &word.word);
+                words.push(AssWordMetric {
+                    start: word.start,
+                    end: word.end,
+                    paste_x: x,
+                    width,
+                });
+                x += width;
+            }
+            AssLineMetric {
+                text,
+                width: x.max(1.0),
+                words,
+            }
+        })
+        .collect()
+}
+
+fn ass_fill_width(metric: &AssLineMetric, t: f64) -> f32 {
+    let mut fill = 0.0_f32;
+    for word in &metric.words {
+        if t < word.start {
+            break;
+        }
+        if t >= word.end {
+            fill = fill.max(word.paste_x + word.width);
+        } else {
+            let progress =
+                ((t - word.start) / (word.end - word.start).max(0.001)).clamp(0.0, 1.0) as f32;
+            fill = fill.max(word.paste_x + word.width * progress);
+            break;
+        }
+    }
+    fill
+}
+
+fn write_ass_file(
+    path: &Path,
+    lines: &[KaraokeLine],
+    transitions: &[f64],
+    duration: f64,
+    width: u32,
+    height: u32,
+    active: Rgba<u8>,
+    inactive: Rgba<u8>,
+    display_delay: f64,
+    highlight_delay: f64,
+    event_fps: f64,
+    size_scale: f32,
+) -> Result<(), String> {
+    let mut ass = String::new();
+    ass.push_str("[Script Info]\n");
+    ass.push_str("ScriptType: v4.00+\n");
+    ass.push_str(&format!("PlayResX: {width}\nPlayResY: {height}\n"));
+    ass.push_str("ScaledBorderAndShadow: yes\nWrapStyle: 2\n\n");
+    ass.push_str("[V4+ Styles]\n");
+    ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
+    ass.push_str(&format!(
+        "Style: Dynamic,Montserrat,64,{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        ass_color(active, 0),
+        ass_color(active, 0),
+        ass_color(active, 255),
+        ass_color(active, 255)
+    ));
+    ass.push_str("[Events]\n");
+    ass.push_str(
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+    );
+
+    let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
+        .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
+    let base_font_size = 64.0_f32 * size_scale;
+    let min_font_size = base_font_size * (26.0 / 42.0);
+    let line_spacing = 62.0_f32 * size_scale;
+    let y_center = height as f32 / 2.0;
+    let line_y_cutoff = 110.0_f32 * size_scale;
+    let dist_cutoff = 95.0_f32 * size_scale;
+    let metrics = build_ass_metrics(lines, &font, base_font_size);
+    let total_frames = (duration * event_fps).ceil() as usize;
+    let scrolls = scroll_positions(
+        transitions,
+        total_frames,
+        event_fps,
+        display_delay,
+        line_spacing,
+    );
+
+    // ==================== EVENT COALESCING ====================
+    // Instead of emitting one Dialogue per frame per line (~180K events),
+    // we track per-line visual state and only emit a new event when properties
+    // change by more than a sub-pixel threshold. This reduces events by 10-30x
+    // while keeping pixel-identical output.
+
+    // Sub-pixel thresholds — changes below these are invisible
+    const POS_THRESH: f32 = 0.5; // position: ±0.5px
+    const FS_THRESH: f32 = 0.3; // font size: ±0.3px
+    const ALPHA_THRESH: u8 = 1; // alpha: ±1/255
+    const CLIP_THRESH: f32 = 0.8; // clip boundary: ±0.8px
+
+    #[derive(Clone)]
+    struct LineEvent {
+        start_frame: usize,
+        y: f32,
+        fs: f32,
+        alpha: u8,
+        is_active: bool,
+        clip_left: f32,
+        clip_right: f32,
+    }
+
+    let num_lines = metrics.len();
+    let mut open_base: Vec<Option<LineEvent>> = vec![None; num_lines];
+    let mut open_clip: Vec<Option<LineEvent>> = vec![None; num_lines];
+    let x = width as f32 / 2.0;
+
+    let flush_base = |ev: &LineEvent,
+                      end_frame: usize,
+                      ass: &mut String,
+                      metrics: &[AssLineMetric],
+                      idx: usize| {
+        let start = ev.start_frame as f64 / event_fps;
+        let end = (end_frame as f64 / event_fps).min(duration);
+        if end <= start {
+            return;
+        }
+        ass.push_str(&format!(
+            "Dialogue: 0,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
+            ass_time(start), ass_time(end), x, ev.y, ev.fs,
+            ass_color(inactive, 0), ev.alpha, &metrics[idx].text
+        ));
+    };
+
+    let flush_clip = |ev: &LineEvent,
+                      end_frame: usize,
+                      ass: &mut String,
+                      metrics: &[AssLineMetric],
+                      idx: usize,
+                      height: u32| {
+        let start = ev.start_frame as f64 / event_fps;
+        let end = (end_frame as f64 / event_fps).min(duration);
+        if end <= start {
+            return;
+        }
+        ass.push_str(&format!(
+            "Dialogue: 1,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&\\clip({:.0},0,{:.0},{height})}}{}\n",
+            ass_time(start), ass_time(end), x, ev.y, ev.fs,
+            ass_color(active, 0), ev.alpha, ev.clip_left.max(0.0), ev.clip_right,
+            &metrics[idx].text
+        ));
+    };
+
+    for frame_idx in 0..total_frames {
+        let display_t = frame_idx as f64 / event_fps - display_delay;
+        let highlight_t = frame_idx as f64 / event_fps - highlight_delay;
+        let active_idx = if transitions.is_empty() {
+            0
+        } else {
+            active_line(transitions, display_t)
+        };
+        let scroll_y = scrolls[frame_idx];
+
+        for (idx, metric) in metrics.iter().enumerate() {
+            let line_y = y_center + idx as f32 * line_spacing - scroll_y;
+            let visible = line_y >= y_center - line_y_cutoff && line_y <= y_center + line_y_cutoff;
+
+            if !visible {
+                // Flush any open events for this line — it left the screen
+                if let Some(ev) = open_base[idx].take() {
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx);
+                }
+                if let Some(ev) = open_clip[idx].take() {
+                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                }
+                continue;
+            }
+
+            let dist = (line_y - y_center).abs();
+            let weight = (1.0 - dist / line_spacing).clamp(0.0, 1.0);
+            let is_active = idx == active_idx;
+            let font_size = min_font_size + (base_font_size - min_font_size) * weight;
+            let scale = font_size / base_font_size;
+            let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
+            if !is_active {
+                opacity *= 0.5;
+            }
+            if opacity <= 0.01 {
+                if let Some(ev) = open_base[idx].take() {
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx);
+                }
+                if let Some(ev) = open_clip[idx].take() {
+                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                }
+                continue;
+            }
+            let alpha = ((1.0 - opacity) * 255.0).round().clamp(0.0, 255.0) as u8;
+
+            // --- Base event (inactive text) ---
+            let need_new_base = match &open_base[idx] {
+                None => true,
+                Some(prev) => {
+                    (line_y - prev.y).abs() >= POS_THRESH
+                        || (font_size - prev.fs).abs() >= FS_THRESH
+                        || alpha.abs_diff(prev.alpha) >= ALPHA_THRESH
+                        || is_active != prev.is_active
+                }
+            };
+            if need_new_base {
+                if let Some(ev) = open_base[idx].take() {
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx);
+                }
+                open_base[idx] = Some(LineEvent {
+                    start_frame: frame_idx,
+                    y: line_y,
+                    fs: font_size,
+                    alpha,
+                    is_active,
+                    clip_left: 0.0,
+                    clip_right: 0.0,
+                });
+            }
+
+            // --- Clip event (active word fill) ---
+            if is_active {
+                let fill = ass_fill_width(metric, highlight_t) * scale * 0.80;
+                if fill > 0.0 {
+                    let left = x - metric.width * scale * 0.80 / 2.0;
+                    let clip_right = (left + fill).clamp(0.0, width as f32);
+
+                    let need_new_clip = match &open_clip[idx] {
+                        None => true,
+                        Some(prev) => {
+                            (line_y - prev.y).abs() >= POS_THRESH
+                                || (font_size - prev.fs).abs() >= FS_THRESH
+                                || alpha.abs_diff(prev.alpha) >= ALPHA_THRESH
+                                || (clip_right - prev.clip_right).abs() >= CLIP_THRESH
+                                || (left.max(0.0) - prev.clip_left).abs() >= CLIP_THRESH
+                        }
+                    };
+                    if need_new_clip {
+                        if let Some(ev) = open_clip[idx].take() {
+                            flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                        }
+                        open_clip[idx] = Some(LineEvent {
+                            start_frame: frame_idx,
+                            y: line_y,
+                            fs: font_size,
+                            alpha,
+                            is_active: true,
+                            clip_left: left.max(0.0),
+                            clip_right,
+                        });
+                    }
+                } else {
+                    // fill == 0, no clip event needed
+                    if let Some(ev) = open_clip[idx].take() {
+                        flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                    }
+                }
+            } else {
+                // Not active anymore — flush any open clip event
+                if let Some(ev) = open_clip[idx].take() {
+                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                }
+            }
+        }
+    }
+
+    // Flush all remaining open events at end of video
+    for idx in 0..num_lines {
+        if let Some(ev) = open_base[idx].take() {
+            flush_base(&ev, total_frames, &mut ass, &metrics, idx);
+        }
+        if let Some(ev) = open_clip[idx].take() {
+            flush_clip(&ev, total_frames, &mut ass, &metrics, idx, height);
+        }
+    }
+
+    std::fs::write(path, ass).map_err(|e| format!("Не удалось записать ASS: {e}"))
+}
+
+fn render_ass(
+    config: &RenderConfig,
+    lines: &[KaraokeLine],
+    transitions: &[f64],
+    duration: f64,
+    width: u32,
+    height: u32,
+    crf: &str,
+    preset: &str,
+    size_scale: f32,
+    fps: f64,
+) -> Result<(), String> {
+    let ass_path = config.output.with_extension("ass");
+    let event_fps = 100.0_f64;
+    let display_delay = config.audio_delay;
+    let highlight_delay = config.audio_delay + visual_lag_seconds();
+    write_ass_file(
+        &ass_path,
+        lines,
+        transitions,
+        duration,
+        width,
+        height,
+        config.active,
+        config.inactive,
+        display_delay,
+        highlight_delay,
+        event_fps,
+        size_scale,
+    )?;
+
+    let ffmpeg = config
+        .ffmpeg
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let font_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent().and_then(|parent| {
+                [
+                    parent.join("../assets"),
+                    parent.join("assets"),
+                    parent.join("../../assets"),
+                ]
+                .into_iter()
+                .find(|candidate| candidate.exists())
+            })
+        })
+        .or_else(|| {
+            [
+                PathBuf::from("assets"),
+                PathBuf::from("desktop_app/assets"),
+                PathBuf::from("../assets"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists())
+        })
+        .unwrap_or_else(|| PathBuf::from("assets"));
+    let ass_filter = format!(
+        "ass=filename='{}':fontsdir='{}'",
+        escape_filter_path(&ass_path),
+        escape_filter_path(&font_dir)
+    );
+
+    let status = Command::new(ffmpeg)
+        .arg("-y")
+        .arg("-nostats")
+        .arg("-progress")
+        .arg("pipe:2")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg(format!(
+            "color=c=0x{:02X}{:02X}{:02X}:s={}x{}:r={:.0}:d={:.3}",
+            config.background.0[0],
+            config.background.0[1],
+            config.background.0[2],
+            width,
+            height,
+            fps,
+            duration
+        ))
+        .arg("-i")
+        .arg(&config.audio)
+        .arg("-vf")
+        .arg(ass_filter)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-preset")
+        .arg(preset)
+        .arg("-crf")
+        .arg(crf)
+        .arg("-bf")
+        .arg("0")
+        .arg("-vsync")
+        .arg("cfr")
+        .arg("-avoid_negative_ts")
+        .arg("make_zero")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("192k")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-t")
+        .arg(format!("{duration:.3}"))
+        .arg(&config.output)
+        .stdout(Stdio::null())
+        .status()
+        .map_err(|e| format!("Не удалось запустить ffmpeg ASS-render: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("ffmpeg ASS-render завершился с ошибкой".to_string())
+    }
+}
+
+fn render(config: RenderConfig) -> Result<(), String> {
+    let timings = std::fs::read_to_string(&config.timings)
+        .map_err(|e| format!("Не удалось прочитать timings: {e}"))?;
+    let lines: Vec<KaraokeLine> =
+        serde_json::from_str(&timings).map_err(|e| format!("Некорректный JSON timings: {e}"))?;
+    let duration = audio_duration_seconds(&config.audio)?;
+
+    let (size_scale, crf, preset) = match config.quality.as_str() {
+        "high" => (1.0_f32, "17", "medium"),
+        "ultra" => (2.0_f32, "12", "slow"),
+        _ => (1.0_f32, "23", "fast"),
+    };
+
+    let width = (1352.0 * size_scale).round() as u32;
+    let height = (224.0 * size_scale).round() as u32;
+    let line_spacing = 62.0 * size_scale;
+    let font_size_max = 42.0 * size_scale;
+    let font_size_min = 26.0 * size_scale;
+    let y_center = height as f32 / 2.0;
+    let y_text_center = 31.0 * size_scale;
+    let line_y_cutoff = 110.0 * size_scale;
+    let dist_cutoff = 95.0 * size_scale;
+    let line_h = (75.0 * size_scale).round() as u32;
+    let y_draw = (8.0 * size_scale).round() as i32;
+    let fps = if config.engine == "ass" {
+        60.0_f64
+    } else {
+        30.0_f64
+    };
+    let total_frames = (duration * fps).floor() as usize;
+    let transitions = transition_times(&lines);
+    let display_delay = config.audio_delay;
+    let highlight_delay = config.audio_delay + visual_lag_seconds();
+
+    if config.engine == "ass" {
+        return render_ass(
+            &config,
+            &lines,
+            &transitions,
+            duration,
+            width,
+            height,
+            crf,
+            preset,
+            size_scale,
+            fps,
+        );
+    }
+
+    let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
+        .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
+    let text_supersample = 3.0_f32;
+    // Pillow/FreeType and ab_glyph expose slightly different perceived pixel sizes.
+    // This compensation keeps Montserrat visually aligned with the legacy renderer.
+    let render_font_size_max = font_size_max * 1.18;
+    let cache = build_line_cache(
+        &lines,
+        &font,
+        render_font_size_max,
+        line_h,
+        y_draw,
+        config.active,
+        config.inactive,
+        size_scale,
+        text_supersample,
+    );
+    let scrolls = scroll_positions(
+        &transitions,
+        total_frames.max(
+            config
+                .debug_frame_time
+                .map(|time| (time * fps).round().max(0.0) as usize + 1)
+                .unwrap_or(0),
+        ),
+        fps,
+        display_delay,
+        line_spacing,
+    );
+
+    let render_frame = |frame_idx: usize, scroll_y: f32| -> RgbaImage {
+        let display_t = frame_idx as f64 / fps - display_delay;
+        let highlight_t = frame_idx as f64 / fps - highlight_delay;
+        let mut frame = ImageBuffer::from_pixel(width, height, config.background);
+        let active_idx = if transitions.is_empty() {
+            0
+        } else {
+            active_line(&transitions, display_t)
+        };
+
+        for (idx, line_cache) in cache.iter().enumerate() {
+            let line_y = y_center + idx as f32 * line_spacing - scroll_y;
+            if line_y < y_center - line_y_cutoff || line_y > y_center + line_y_cutoff {
+                continue;
+            }
+            let dist = (line_y - y_center).abs();
+            let weight = (1.0 - dist / line_spacing).clamp(0.0, 1.0);
+            let is_active = idx == active_idx;
+
+            let mut line_img = if is_active {
+                let mut img = line_cache.inactive.clone();
+                for layer in &line_cache.words {
+                    if highlight_t < layer.start {
+                        continue;
+                    }
+                    if highlight_t > layer.end {
+                        paste_alpha(&mut img, &layer.image, layer.paste_x, 0, 1.0, None);
+                    } else {
+                        let progress = ((highlight_t - layer.start) / (layer.end - layer.start).max(0.001))
+                            .clamp(0.0, 1.0);
+                        let fill = (layer.width as f64 * progress).floor() as u32;
+                        paste_alpha(&mut img, &layer.image, layer.paste_x, 0, 1.0, Some(fill));
+                    }
+                }
+                img
+            } else {
+                line_cache.inactive.clone()
+            };
+
+            let scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max;
+            let new_w = ((line_cache.width as f32 * scale).round() as u32).max(1);
+            let new_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
+            line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
+
+            let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
+            if !is_active {
+                opacity *= 0.5;
+            }
+
+            let x = width as i32 / 2 - new_w as i32 / 2;
+            let y_center_resized = y_text_center * scale;
+            let y = (line_y - y_center_resized).floor() as i32;
+            paste_alpha_onto_opaque(&mut frame, &line_img, x, y, opacity);
+        }
+
+        frame
+    };
+
+    if let Some(debug_time) = config.debug_frame_time {
+        let output = config.debug_frame_output.ok_or_else(|| {
+            "--debug-frame-output обязателен вместе с --debug-frame-time".to_string()
+        })?;
+        let frame_idx = (debug_time * fps).round().max(0.0) as usize;
+        let frame = render_frame(frame_idx, scrolls[frame_idx]);
+        frame
+            .save(&output)
+            .map_err(|e| format!("Не удалось записать PNG: {e}"))?;
+        return Ok(());
+    }
+
+    let mut child = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("rgb24")
+        .arg("-s")
+        .arg(format!("{width}x{height}"))
+        .arg("-r")
+        .arg("30")
+        .arg("-i")
+        .arg("-")
+        .arg("-i")
+        .arg(&config.audio)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-preset")
+        .arg(preset)
+        .arg("-crf")
+        .arg(crf)
+        .arg("-bf")
+        .arg("0")
+        .arg("-vsync")
+        .arg("cfr")
+        .arg("-avoid_negative_ts")
+        .arg("make_zero")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("192k")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-t")
+        .arg(format!("{duration:.3}"))
+        .arg(&config.output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить ffmpeg: {e}"))?;
+
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "Не удалось открыть stdin ffmpeg".to_string())?;
+    let mut rgb_frame = Vec::with_capacity(width as usize * height as usize * 3);
+    for frame_idx in 0..total_frames {
+        let frame = render_frame(frame_idx, scrolls[frame_idx]);
+        frame_to_rgb24(&frame, &mut rgb_frame);
+        stdin
+            .write_all(&rgb_frame)
+            .map_err(|e| format!("ffmpeg pipe write failed: {e}"))?;
+
+        if frame_idx % 30 == 0 {
+            eprintln!(
+                "render {:.1}%",
+                frame_idx as f64 / total_frames.max(1) as f64 * 100.0
+            );
+        }
+    }
+
+    drop(child.stdin.take());
+    let status = child
+        .wait()
+        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if !status.success() {
+        return Err("ffmpeg не смог собрать mp4".to_string());
+    }
+    Ok(())
+}
+
+fn main() {
+    let result = parse_args().and_then(render);
+    if let Err(err) = result {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
