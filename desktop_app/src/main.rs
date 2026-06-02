@@ -11,10 +11,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 // Шрифты Montserrat вкомпилированы прямо в бинарник — нулевая зависимость от внешних файлов
 const MONTSERRAT_REGULAR: &[u8] = include_bytes!("../assets/Montserrat-Regular.ttf");
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../assets/Montserrat-Bold.ttf");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn hide_subprocess_window(cmd: &mut std::process::Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_subprocess_window(_cmd: &mut std::process::Command) {
+}
 
 fn app_icon() -> egui::IconData {
     let size = 256usize;
@@ -295,7 +309,9 @@ fn is_ffmpeg_progress_key(line: &str) -> bool {
 }
 
 fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
-    let output = std::process::Command::new(tool_path("ffprobe"))
+    let mut cmd = std::process::Command::new(tool_path("ffprobe"));
+    hide_subprocess_window(&mut cmd);
+    let output = cmd
         .args([
             "-v",
             "error",
@@ -355,6 +371,7 @@ fn render_trimmed_audio(
     }
 
     let mut cmd = std::process::Command::new(tool_path("ffmpeg"));
+    hide_subprocess_window(&mut cmd);
     cmd.arg("-y")
         .arg("-ss")
         .arg(format!("{:.3}", start_ms as f64 / 1000.0))
@@ -387,7 +404,9 @@ fn render_trimmed_audio(
 }
 
 fn probe_video_size(path: &str) -> Result<(usize, usize), String> {
-    let output = std::process::Command::new(tool_path("ffprobe"))
+    let mut cmd = std::process::Command::new(tool_path("ffprobe"));
+    hide_subprocess_window(&mut cmd);
+    let output = cmd
         .args([
             "-v",
             "error",
@@ -435,7 +454,9 @@ fn preview_video_size(path: &str) -> Result<(usize, usize), String> {
 }
 
 fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Result<(), String> {
-    let status = std::process::Command::new(tool_path("ffmpeg"))
+    let mut cmd = std::process::Command::new(tool_path("ffmpeg"));
+    hide_subprocess_window(&mut cmd);
+    let status = cmd
         .arg("-y")
         .arg("-ss")
         .arg(format!("{:.3}", start_ms.max(0) as f64 / 1000.0))
@@ -849,7 +870,9 @@ impl KaraokeApp {
         let path = path.to_string();
 
         std::thread::spawn(move || {
-            let mut child = match std::process::Command::new(tool_path("ffmpeg"))
+            let mut cmd = std::process::Command::new(tool_path("ffmpeg"));
+            hide_subprocess_window(&mut cmd);
+            let mut child = match cmd
                 .arg("-v")
                 .arg("error")
                 .arg("-ss")
@@ -1551,6 +1574,8 @@ impl KaraokeApp {
                 std::process::Command::new(&worker_path)
             };
 
+            hide_subprocess_window(&mut cmd);
+
             if let Some(bin_dir) = bundled_bin_dir() {
                 let old_path = std::env::var_os("PATH").unwrap_or_default();
                 let mut paths = vec![bin_dir];
@@ -1696,6 +1721,7 @@ impl KaraokeApp {
                     ctx.request_repaint();
 
                     let mut render_cmd = std::process::Command::new(&renderer_path);
+                    hide_subprocess_window(&mut render_cmd);
                     if let Some(bin_dir) = bundled_bin_dir() {
                         let old_path = std::env::var_os("PATH").unwrap_or_default();
                         let mut paths = vec![bin_dir];

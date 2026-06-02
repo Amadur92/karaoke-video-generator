@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{ImageBuffer, Rgba, RgbaImage, imageops};
 use imageproc::drawing::draw_text_mut;
@@ -6,7 +8,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../../assets/Montserrat-Bold.ttf");
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn hide_subprocess_window(cmd: &mut Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_subprocess_window(_cmd: &mut Command) {
+}
 
 #[derive(Debug, Deserialize)]
 struct KaraokeWord {
@@ -165,7 +181,9 @@ fn parse_args() -> Result<RenderConfig, String> {
 }
 
 fn audio_duration_seconds(audio: &PathBuf) -> Result<f64, String> {
-    let output = Command::new("ffprobe")
+    let mut cmd = Command::new("ffprobe");
+    hide_subprocess_window(&mut cmd);
+    let output = cmd
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -693,10 +711,12 @@ fn write_ass_file(
 
             // --- Clip event (active word fill) ---
             if is_active {
-                let fill = ass_fill_width(metric, highlight_t) * scale * 0.80;
+                let fill = ass_fill_width(metric, highlight_t) * scale;
                 if fill > 0.0 {
-                    let left = x - metric.width * scale * 0.80 / 2.0;
-                    let clip_right = (left + fill).clamp(0.0, width as f32);
+                    let left = x - metric.width * scale / 2.0;
+                    let clip_pad = 16.0_f32 * size_scale;
+                    let clip_left = (left - clip_pad).max(0.0);
+                    let clip_right = (left + fill + clip_pad).clamp(0.0, width as f32);
 
                     let need_new_clip = match &open_clip[idx] {
                         None => true,
@@ -705,7 +725,7 @@ fn write_ass_file(
                                 || (font_size - prev.fs).abs() >= FS_THRESH
                                 || alpha.abs_diff(prev.alpha) >= ALPHA_THRESH
                                 || (clip_right - prev.clip_right).abs() >= CLIP_THRESH
-                                || (left.max(0.0) - prev.clip_left).abs() >= CLIP_THRESH
+                                || (clip_left - prev.clip_left).abs() >= CLIP_THRESH
                         }
                     };
                     if need_new_clip {
@@ -718,7 +738,7 @@ fn write_ass_file(
                             fs: font_size,
                             alpha,
                             is_active: true,
-                            clip_left: left.max(0.0),
+                            clip_left,
                             clip_right,
                         });
                     }
@@ -814,7 +834,9 @@ fn render_ass(
         escape_filter_path(&font_dir)
     );
 
-    let status = Command::new(ffmpeg)
+    let mut cmd = Command::new(ffmpeg);
+    hide_subprocess_window(&mut cmd);
+    let status = cmd
         .arg("-y")
         .arg("-nostats")
         .arg("-progress")
@@ -1023,7 +1045,9 @@ fn render(config: RenderConfig) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut child = Command::new("ffmpeg")
+    let mut ffmpeg_cmd = Command::new("ffmpeg");
+    hide_subprocess_window(&mut ffmpeg_cmd);
+    let mut child = ffmpeg_cmd
         .arg("-y")
         .arg("-f")
         .arg("rawvideo")

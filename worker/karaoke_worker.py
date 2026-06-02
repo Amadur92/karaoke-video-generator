@@ -48,6 +48,11 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 # Формат: { job_id: { "progress": float, "status": str, "done": bool, "error": str, "file": str } }
 jobs = {}
 
+def subprocess_no_window_kwargs():
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def replace_special_spaces(text):
     if not isinstance(text, str):
@@ -591,7 +596,8 @@ def audio_duration_seconds(audio_path):
              '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            **subprocess_no_window_kwargs()
         )
         return max(0.0, float(res.stdout.strip()))
     except Exception:
@@ -609,7 +615,13 @@ def extract_audio_window(input_path, output_path, start=0.0, duration=None):
         '-ac', '1',
         output_path
     ])
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        **subprocess_no_window_kwargs()
+    )
 
 def detect_vocal_start(audio_path, model_name='base', window_seconds=45.0, chunk_seconds=12.0, hop_seconds=8.0, status_callback=None, language='ru', lyrics_text=''):
     import tempfile
@@ -857,7 +869,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         try:
             cmd_dur = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                        '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
-            res_dur = subprocess.run(cmd_dur, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            res_dur = subprocess.run(
+                cmd_dur,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                **subprocess_no_window_kwargs()
+            )
             audio_duration = float(res_dur.stdout.strip())
         except Exception:
             pass
@@ -1233,7 +1251,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1', audio_path
             ]
-            res_dur = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            res_dur = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                **subprocess_no_window_kwargs()
+            )
             duration = float(res_dur.stdout.strip())
         except Exception:
             pass
@@ -1270,7 +1295,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             output_mp4_path
         ]
         
-        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **subprocess_no_window_kwargs()
+        )
 
         current_scroll_y = 0.0
 
