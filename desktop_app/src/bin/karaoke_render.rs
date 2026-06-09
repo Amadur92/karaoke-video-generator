@@ -896,6 +896,29 @@ fn render_ass(
     }
 }
 
+fn ffmpeg_supports_ass_filter(ffmpeg: &Path) -> bool {
+    let output = Command::new(ffmpeg)
+        .arg("-hide_banner")
+        .arg("-filters")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let filters = String::from_utf8_lossy(&output.stdout);
+    filters.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        let _flags = parts.next();
+        matches!(parts.next(), Some("ass" | "subtitles"))
+    })
+}
+
 fn render(config: RenderConfig) -> Result<(), String> {
     let timings = std::fs::read_to_string(&config.timings)
         .map_err(|e| format!("Не удалось прочитать timings: {e}"))?;
@@ -930,7 +953,12 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let display_delay = config.audio_delay;
     let highlight_delay = config.audio_delay + visual_lag_seconds();
 
-    if config.engine == "ass" {
+    let ffmpeg = config
+        .ffmpeg
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+
+    if config.engine == "ass" && ffmpeg_supports_ass_filter(&ffmpeg) {
         return render_ass(
             &config,
             &lines,
@@ -942,6 +970,10 @@ fn render(config: RenderConfig) -> Result<(), String> {
             preset,
             size_scale,
             fps,
+        );
+    } else if config.engine == "ass" {
+        eprintln!(
+            "[Rust] ffmpeg ASS/subtitles filter not found; falling back to frame renderer"
         );
     }
 
@@ -1045,7 +1077,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut ffmpeg_cmd = Command::new("ffmpeg");
+    let mut ffmpeg_cmd = Command::new(ffmpeg);
     hide_subprocess_window(&mut ffmpeg_cmd);
     let mut child = ffmpeg_cmd
         .arg("-y")
