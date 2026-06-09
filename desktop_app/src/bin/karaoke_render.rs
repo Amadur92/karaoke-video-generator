@@ -54,6 +54,30 @@ struct LineCache {
     height: u32,
 }
 
+fn line_highlight_is_live(words: &[WordLayer], t: f64) -> bool {
+    words
+        .first()
+        .zip(words.last())
+        .map(|(first, last)| t >= first.start && t <= last.end)
+        .unwrap_or(false)
+}
+
+fn paint_line_highlight(img: &mut RgbaImage, words: &[WordLayer], t: f64) {
+    for layer in words {
+        if t < layer.start {
+            continue;
+        }
+        if t > layer.end {
+            paste_alpha(img, &layer.image, layer.paste_x, 0, 1.0, None);
+        } else {
+            let progress = ((t - layer.start) / (layer.end - layer.start).max(0.001))
+                .clamp(0.0, 1.0);
+            let fill = (layer.width as f64 * progress).floor() as u32;
+            paste_alpha(img, &layer.image, layer.paste_x, 0, 1.0, Some(fill));
+        }
+    }
+}
+
 struct RenderConfig {
     timings: PathBuf,
     audio: PathBuf,
@@ -524,6 +548,15 @@ fn ass_fill_width(metric: &AssLineMetric, t: f64) -> f32 {
     fill
 }
 
+fn ass_line_highlight_is_live(metric: &AssLineMetric, t: f64) -> bool {
+    metric
+        .words
+        .first()
+        .zip(metric.words.last())
+        .map(|(first, last)| t >= first.start && t <= last.end)
+        .unwrap_or(false)
+}
+
 fn write_ass_file(
     path: &Path,
     lines: &[KaraokeLine],
@@ -666,11 +699,13 @@ fn write_ass_file(
 
             let dist = (line_y - y_center).abs();
             let weight = (1.0 - dist / line_spacing).clamp(0.0, 1.0);
-            let is_active = idx == active_idx;
+            let is_display_active = idx == active_idx;
+            let is_highlight_live =
+                is_display_active || ass_line_highlight_is_live(metric, highlight_t);
             let font_size = min_font_size + (base_font_size - min_font_size) * weight;
             let scale = font_size / base_font_size;
             let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
-            if !is_active {
+            if !is_highlight_live {
                 opacity *= 0.5;
             }
             if opacity <= 0.01 {
@@ -691,7 +726,7 @@ fn write_ass_file(
                     (line_y - prev.y).abs() >= POS_THRESH
                         || (font_size - prev.fs).abs() >= FS_THRESH
                         || alpha.abs_diff(prev.alpha) >= ALPHA_THRESH
-                        || is_active != prev.is_active
+                        || is_highlight_live != prev.is_active
                 }
             };
             if need_new_base {
@@ -703,14 +738,14 @@ fn write_ass_file(
                     y: line_y,
                     fs: font_size,
                     alpha,
-                    is_active,
+                    is_active: is_highlight_live,
                     clip_left: 0.0,
                     clip_right: 0.0,
                 });
             }
 
             // --- Clip event (active word fill) ---
-            if is_active {
+            if is_highlight_live {
                 let fill = ass_fill_width(metric, highlight_t) * scale;
                 if fill > 0.0 {
                     let left = x - metric.width * scale / 2.0;
@@ -1032,23 +1067,13 @@ fn render(config: RenderConfig) -> Result<(), String> {
             }
             let dist = (line_y - y_center).abs();
             let weight = (1.0 - dist / line_spacing).clamp(0.0, 1.0);
-            let is_active = idx == active_idx;
+            let is_display_active = idx == active_idx;
+            let is_highlight_live =
+                is_display_active || line_highlight_is_live(&line_cache.words, highlight_t);
 
-            let mut line_img = if is_active {
+            let mut line_img = if is_highlight_live {
                 let mut img = line_cache.inactive.clone();
-                for layer in &line_cache.words {
-                    if highlight_t < layer.start {
-                        continue;
-                    }
-                    if highlight_t > layer.end {
-                        paste_alpha(&mut img, &layer.image, layer.paste_x, 0, 1.0, None);
-                    } else {
-                        let progress = ((highlight_t - layer.start) / (layer.end - layer.start).max(0.001))
-                            .clamp(0.0, 1.0);
-                        let fill = (layer.width as f64 * progress).floor() as u32;
-                        paste_alpha(&mut img, &layer.image, layer.paste_x, 0, 1.0, Some(fill));
-                    }
-                }
+                paint_line_highlight(&mut img, &line_cache.words, highlight_t);
                 img
             } else {
                 line_cache.inactive.clone()
@@ -1060,7 +1085,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
             line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
 
             let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
-            if !is_active {
+            if !is_highlight_live {
                 opacity *= 0.5;
             }
 
