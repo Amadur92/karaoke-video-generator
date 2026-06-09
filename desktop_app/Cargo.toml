@@ -1,6 +1,6 @@
 [package]
 name = "desktop_app"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
@@ -19,4 +19,3 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-
