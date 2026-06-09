@@ -1269,6 +1269,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         width = int(1352 * size_scale)
         height = int(224 * size_scale)
         line_spacing = int(62 * size_scale)
+        safe_line_w = max(width * 0.72, width - int(128 * size_scale))
         
         # Размеры шрифтов
         font_size_max = int(42 * size_scale)
@@ -1474,7 +1475,9 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     line_img = cached_line["inactive"]
                 
                 # Масштабируем холст строки методом субпиксельной интерполяции BILINEAR
-                scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max
+                target_scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max
+                fit_scale = min(1.0, safe_line_w / max(1, cached_line["width"]))
+                scale = min(target_scale, fit_scale)
                 new_w = max(1, int(cached_line["width"] * scale))
                 new_h = max(1, int(cached_line["height"] * scale))
                     

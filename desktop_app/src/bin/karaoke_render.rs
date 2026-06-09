@@ -21,8 +21,7 @@ fn hide_subprocess_window(cmd: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn hide_subprocess_window(_cmd: &mut Command) {
-}
+fn hide_subprocess_window(_cmd: &mut Command) {}
 
 #[derive(Debug, Deserialize)]
 struct KaraokeWord {
@@ -70,8 +69,8 @@ fn paint_line_highlight(img: &mut RgbaImage, words: &[WordLayer], t: f64) {
         if t > layer.end {
             paste_alpha(img, &layer.image, layer.paste_x, 0, 1.0, None);
         } else {
-            let progress = ((t - layer.start) / (layer.end - layer.start).max(0.001))
-                .clamp(0.0, 1.0);
+            let progress =
+                ((t - layer.start) / (layer.end - layer.start).max(0.001)).clamp(0.0, 1.0);
             let fill = (layer.width as f64 * progress).floor() as u32;
             paste_alpha(img, &layer.image, layer.paste_x, 0, 1.0, Some(fill));
         }
@@ -239,6 +238,11 @@ fn text_width(font: &FontArc, size: f32, text: &str) -> f32 {
         previous = Some(id);
     }
     width
+}
+
+fn safe_text_width(frame_width: u32, size_scale: f32) -> f32 {
+    let side_margin = 64.0_f32 * size_scale;
+    (frame_width as f32 - side_margin * 2.0).max(frame_width as f32 * 0.72)
 }
 
 fn paste_alpha(
@@ -598,6 +602,7 @@ fn write_ass_file(
     let y_center = height as f32 / 2.0;
     let line_y_cutoff = 110.0_f32 * size_scale;
     let dist_cutoff = 95.0_f32 * size_scale;
+    let safe_line_w = safe_text_width(width, size_scale);
     let metrics = build_ass_metrics(lines, &font, base_font_size);
     let total_frames = (duration * event_fps).ceil() as usize;
     let scrolls = scroll_positions(
@@ -702,7 +707,9 @@ fn write_ass_file(
             let is_display_active = idx == active_idx;
             let is_highlight_live =
                 is_display_active || ass_line_highlight_is_live(metric, highlight_t);
-            let font_size = min_font_size + (base_font_size - min_font_size) * weight;
+            let target_font_size = min_font_size + (base_font_size - min_font_size) * weight;
+            let fit_font_size = base_font_size * (safe_line_w / metric.width).min(1.0);
+            let font_size = target_font_size.min(fit_font_size);
             let scale = font_size / base_font_size;
             let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
             if !is_highlight_live {
@@ -988,6 +995,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let y_text_center = 31.0 * size_scale;
     let line_y_cutoff = 110.0 * size_scale;
     let dist_cutoff = 95.0 * size_scale;
+    let safe_line_w = safe_text_width(width, size_scale);
     let line_h = (75.0 * size_scale).round() as u32;
     let y_draw = (8.0 * size_scale).round() as i32;
     let ffmpeg = config
@@ -1015,9 +1023,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
             fps,
         );
     } else if config.engine == "ass" {
-        eprintln!(
-            "[Rust] ffmpeg ASS/subtitles filter not found; falling back to frame renderer"
-        );
+        eprintln!("[Rust] ffmpeg ASS/subtitles filter not found; falling back to frame renderer");
     }
 
     let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
@@ -1079,7 +1085,10 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 line_cache.inactive.clone()
             };
 
-            let scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max;
+            let target_scale =
+                (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max;
+            let fit_scale = (safe_line_w / line_cache.width as f32).min(1.0);
+            let scale = target_scale.min(fit_scale);
             let new_w = ((line_cache.width as f32 * scale).round() as u32).max(1);
             let new_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
             line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
@@ -1182,9 +1191,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
             let stderr_text = stderr_handle.join().unwrap_or_default();
             let late_in_render = frame_idx + 5 >= total_frames;
             if late_in_render && output_file_was_written(&config.output) {
-                eprintln!(
-                    "[Rust] ffmpeg closed pipe at the end, keeping written output: {err}"
-                );
+                eprintln!("[Rust] ffmpeg closed pipe at the end, keeping written output: {err}");
                 return Ok(());
             }
             let stderr_tail = tail_text(&stderr_text, 1600);
