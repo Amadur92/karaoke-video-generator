@@ -298,6 +298,50 @@ def redistribute_repeated_tail_lines(lyrics_karaoke):
         idx = end
     return result
 
+def repair_short_lines_with_large_internal_gaps(lyrics_karaoke):
+    repaired = []
+    for line in lyrics_karaoke:
+        words = line.get("words") or []
+        if len(words) < 2 or len(words) > 5:
+            repaired.append(line)
+            continue
+
+        try:
+            line_start = float(line["start"])
+            line_end = float(line["end"])
+        except Exception:
+            repaired.append(line)
+            continue
+
+        duration = line_end - line_start
+        expected = estimate_line_duration([w.get("word", "") for w in words], None)
+        max_gap = line_internal_max_gap(line)
+        if max_gap < 2.5 or duration < max(4.0, expected * 2.1):
+            repaired.append(line)
+            continue
+
+        text_words = [w.get("word", "") for w in words]
+        total_chars = sum(max(len(clean_word(word)), 1) for word in text_words) or len(text_words)
+        line_duration = min(max(expected, 1.1), max(1.0, duration - 0.25))
+        cursor = line_start
+        new_words = []
+        for word in text_words:
+            slot = max(0.16, line_duration * max(len(clean_word(word)), 1) / total_chars)
+            new_words.append({
+                "word": word,
+                "start": round(cursor, 3),
+                "end": round(min(line_start + line_duration, cursor + slot * 0.9), 3),
+            })
+            cursor += slot
+
+        repaired_line = dict(line)
+        repaired_line["words"] = new_words
+        repaired_line["start"] = new_words[0]["start"]
+        repaired_line["end"] = new_words[-1]["end"]
+        repaired.append(repaired_line)
+
+    return repaired
+
 def find_suspicious_tail_start(lyrics_karaoke):
     for idx, line in enumerate(lyrics_karaoke):
         words = line.get("words") or []
@@ -1182,6 +1226,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 lyrics_karaoke[i]["end"] = max(lyrics_karaoke[i]["end"], lyrics_karaoke[i]["words"][-1]["end"])
 
         lyrics_karaoke = redistribute_repeated_tail_lines(lyrics_karaoke)
+        lyrics_karaoke = repair_short_lines_with_large_internal_gaps(lyrics_karaoke)
 
         # ДАМП ФИНАЛЬНЫХ ТАЙМИНГОВ для отладки и будущего Rust-рендера.
         # Важно писать его после всех smoothing/overlap фильтров: renderer должен получать
