@@ -4,7 +4,7 @@ use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{ImageBuffer, Rgba, RgbaImage, imageops};
 use imageproc::drawing::draw_text_mut;
 use serde::Deserialize;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -919,6 +919,18 @@ fn ffmpeg_supports_ass_filter(ffmpeg: &Path) -> bool {
     })
 }
 
+fn tail_text(value: &str, max_chars: usize) -> String {
+    let mut chars: Vec<char> = value.chars().rev().take(max_chars).collect();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+fn output_file_was_written(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() > 1024)
+        .unwrap_or(false)
+}
+
 fn render(config: RenderConfig) -> Result<(), String> {
     let timings = std::fs::read_to_string(&config.timings)
         .map_err(|e| format!("Не удалось прочитать timings: {e}"))?;
@@ -943,22 +955,18 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let dist_cutoff = 95.0 * size_scale;
     let line_h = (75.0 * size_scale).round() as u32;
     let y_draw = (8.0 * size_scale).round() as i32;
-    let fps = if config.engine == "ass" {
-        60.0_f64
-    } else {
-        30.0_f64
-    };
-    let total_frames = (duration * fps).floor() as usize;
-    let transitions = transition_times(&lines);
-    let display_delay = config.audio_delay;
-    let highlight_delay = config.audio_delay + visual_lag_seconds();
-
     let ffmpeg = config
         .ffmpeg
         .clone()
         .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let use_ass_renderer = config.engine == "ass" && ffmpeg_supports_ass_filter(&ffmpeg);
+    let fps = if use_ass_renderer { 60.0_f64 } else { 30.0_f64 };
+    let total_frames = ((duration * fps).ceil() as usize).max(1);
+    let transitions = transition_times(&lines);
+    let display_delay = config.audio_delay;
+    let highlight_delay = config.audio_delay + visual_lag_seconds();
 
-    if config.engine == "ass" && ffmpeg_supports_ass_filter(&ffmpeg) {
+    if use_ass_renderer {
         return render_ass(
             &config,
             &lines,
@@ -1122,21 +1130,44 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .arg(&config.output)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Не удалось запустить ffmpeg: {e}"))?;
 
-    let stdin = child
+    let mut stderr = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut stderr) = stderr.take() {
+            let _ = stderr.read_to_end(&mut buffer);
+        }
+        String::from_utf8_lossy(&buffer).to_string()
+    });
+
+    let mut stdin = child
         .stdin
-        .as_mut()
+        .take()
         .ok_or_else(|| "Не удалось открыть stdin ffmpeg".to_string())?;
     let mut rgb_frame = Vec::with_capacity(width as usize * height as usize * 3);
     for frame_idx in 0..total_frames {
         let frame = render_frame(frame_idx, scrolls[frame_idx]);
         frame_to_rgb24(&frame, &mut rgb_frame);
-        stdin
-            .write_all(&rgb_frame)
-            .map_err(|e| format!("ffmpeg pipe write failed: {e}"))?;
+        if let Err(err) = stdin.write_all(&rgb_frame) {
+            drop(stdin);
+            let _ = child.wait();
+            let stderr_text = stderr_handle.join().unwrap_or_default();
+            let late_in_render = frame_idx + 5 >= total_frames;
+            if late_in_render && output_file_was_written(&config.output) {
+                eprintln!(
+                    "[Rust] ffmpeg closed pipe at the end, keeping written output: {err}"
+                );
+                return Ok(());
+            }
+            let stderr_tail = tail_text(&stderr_text, 1600);
+            return Err(format!(
+                "ffmpeg pipe write failed: {err}. ffmpeg stderr: {}",
+                stderr_tail.trim()
+            ));
+        }
 
         if frame_idx % 30 == 0 {
             eprintln!(
@@ -1146,12 +1177,23 @@ fn render(config: RenderConfig) -> Result<(), String> {
         }
     }
 
-    drop(child.stdin.take());
+    drop(stdin);
     let status = child
         .wait()
         .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    let stderr_text = stderr_handle.join().unwrap_or_default();
     if !status.success() {
-        return Err("ffmpeg не смог собрать mp4".to_string());
+        if output_file_was_written(&config.output) {
+            eprintln!(
+                "[Rust] ffmpeg exited with a non-zero status after writing output; keeping file"
+            );
+            return Ok(());
+        }
+        let stderr_tail = tail_text(&stderr_text, 1600);
+        return Err(format!(
+            "ffmpeg не смог собрать mp4: {}",
+            stderr_tail.trim()
+        ));
     }
     Ok(())
 }
