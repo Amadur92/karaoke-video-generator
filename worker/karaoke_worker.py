@@ -1380,7 +1380,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     else:
                         transition_times.append(line_data["start"])
 
-        visual_lag = float(os.environ.get("KARAOKE_VISUAL_LAG_SECONDS", "0.5") or 0.5)
+        visual_lag = float(os.environ.get("KARAOKE_VISUAL_LAG_SECONDS", "0.25") or 0.25)
         visual_lag = max(0.0, min(2.0, visual_lag))
         for frame_idx in range(total_frames):
             display_t = frame_idx / fps - audio_delay

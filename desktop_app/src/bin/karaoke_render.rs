@@ -443,7 +443,7 @@ fn visual_lag_seconds() -> f64 {
     std::env::var("KARAOKE_VISUAL_LAG_SECONDS")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.5)
+        .unwrap_or(0.25)
         .clamp(0.0, 2.0)
 }
 
