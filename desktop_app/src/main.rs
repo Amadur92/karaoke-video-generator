@@ -27,8 +27,7 @@ fn hide_subprocess_window(cmd: &mut std::process::Command) {
 }
 
 #[cfg(not(windows))]
-fn hide_subprocess_window(_cmd: &mut std::process::Command) {
-}
+fn hide_subprocess_window(_cmd: &mut std::process::Command) {}
 
 fn app_icon() -> egui::IconData {
     let size = 256usize;
@@ -521,6 +520,7 @@ struct AppSettings {
     artist: String,
     title: String,
     lyrics: String,
+    plain_lines: bool,
 }
 
 impl Default for AppSettings {
@@ -538,6 +538,7 @@ impl Default for AppSettings {
             artist: String::new(),
             title: String::new(),
             lyrics: String::new(),
+            plain_lines: false,
         }
     }
 }
@@ -621,6 +622,7 @@ struct KaraokeApp {
     video_position_ms: i64,
     video_started_at: Option<Instant>,
     video_started_ms: i64,
+    plain_lines: bool,
 }
 
 impl KaraokeApp {
@@ -717,6 +719,7 @@ impl KaraokeApp {
             video_position_ms: 0,
             video_started_at: None,
             video_started_ms: 0,
+            plain_lines: settings.plain_lines,
         }
     }
 
@@ -1462,6 +1465,7 @@ impl KaraokeApp {
         let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
         let fade_in_ms = self.fade_in_ms;
         let fade_out_ms = self.fade_out_ms;
+        let plain_lines = self.plain_lines;
         let trim_bounds = self.clamped_trim_bounds();
         let temp = temp_dir();
         let exports = exports_dir();
@@ -1615,6 +1619,10 @@ impl KaraokeApp {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
+            if plain_lines {
+                cmd.arg("--plain-lines");
+            }
+
             if use_rust_renderer {
                 cmd.arg("--timings-only")
                     .arg("--timings-output")
@@ -1756,6 +1764,10 @@ impl KaraokeApp {
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::piped());
 
+                    if plain_lines {
+                        render_cmd.arg("--plain-lines");
+                    }
+
                     match render_cmd.spawn() {
                         Ok(mut render_child) => {
                             if let Some(stderr) = render_child.stderr.take() {
@@ -1871,6 +1883,7 @@ impl eframe::App for KaraokeApp {
             artist: self.artist.clone(),
             title: self.title.clone(),
             lyrics: self.lyrics.clone(),
+            plain_lines: self.plain_lines,
         };
 
         // Единая современная темная тема для всех стандартных виджетов egui.
@@ -2328,6 +2341,11 @@ impl eframe::App for KaraokeApp {
                                             self.audio_delay_ms = 0;
                                         }
                                     });
+                                    ui.add_space(12.0);
+                                    ui.checkbox(
+                                        &mut self.plain_lines,
+                                        "Только строки без подсветки слов",
+                                    );
                                 });
                             });
                     }
@@ -2734,6 +2752,7 @@ impl eframe::App for KaraokeApp {
             artist: self.artist.clone(),
             title: self.title.clone(),
             lyrics: self.lyrics.clone(),
+            plain_lines: self.plain_lines,
         };
 
         if old_settings != new_settings {

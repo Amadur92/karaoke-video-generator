@@ -905,7 +905,7 @@ def detect_vocal_start(audio_path, model_name='base', window_seconds=45.0, chunk
     }
 
 # ----------------- РЕНДЕРИНГ (ФОНОВЫЙ ПОТОК) -----------------
-def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None):
+def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False):
     cleanup_align_audio_path = None
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -1542,7 +1542,9 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             total_w = sum(widths) + space_w * max(0, len(words) - 1)
             line_img_w = max(1, total_w + line_pad_x)
             inactive_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
+            active_plain_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
             inactive_draw = ImageDraw.Draw(inactive_img)
+            active_plain_draw = ImageDraw.Draw(active_plain_img)
 
             x_draw = line_text_x
             word_layers = []
@@ -1550,6 +1552,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 word = w_data["word"]
                 word_w = widths[w_idx]
                 inactive_draw.text((x_draw, y_draw), word, fill=rgba_inactive, font=font_max)
+                active_plain_draw.text((x_draw, y_draw), word, fill=rgba_active, font=font_max)
 
                 active_word_img = Image.new("RGBA", (word_w + word_pad, line_img_h), (0, 0, 0, 0))
                 active_word_draw = ImageDraw.Draw(active_word_img)
@@ -1565,6 +1568,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
 
             line_render_cache.append({
                 "inactive": inactive_img,
+                "active_plain": active_plain_img,
                 "word_layers": word_layers,
                 "width": line_img_w,
                 "height": line_img_h,
@@ -1602,18 +1606,22 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             current_scroll_y += (target_scroll_y - current_scroll_y) * 0.15
             
             for idx, line_data in enumerate(lyrics_karaoke):
-                line_y = y_center + (idx * line_spacing) - current_scroll_y
-                
-                if line_y < y_center - line_y_cutoff or line_y > y_center + line_y_cutoff:
-                    continue
+                if plain_lines:
+                    if idx != active_line_idx:
+                        continue
+                    line_y = y_center
+                else:
+                    line_y = y_center + (idx * line_spacing) - current_scroll_y
+                    if line_y < y_center - line_y_cutoff or line_y > y_center + line_y_cutoff:
+                        continue
                     
                 dist_from_center = abs(line_y - y_center)
-                weight = max(0.0, min(1.0, 1.0 - (dist_from_center / line_spacing)))
+                weight = 1.0 if plain_lines else max(0.0, min(1.0, 1.0 - (dist_from_center / line_spacing)))
                 
                 is_active = (idx == active_line_idx)
                 cached_line = line_render_cache[idx]
 
-                if is_active:
+                if is_active and not plain_lines:
                     line_img = cached_line["inactive"].copy()
                     for layer in cached_line["word_layers"]:
                         w_start = layer["start"]
@@ -1630,7 +1638,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                                 filled_part = layer["image"].crop((0, 0, fill_w, line_img_h))
                                 line_img.paste(filled_part, (layer["paste_x"], 0), filled_part)
                 else:
-                    line_img = cached_line["inactive"]
+                    line_img = cached_line["active_plain"] if plain_lines and is_active else cached_line["inactive"]
                 
                 # Масштабируем холст строки методом субпиксельной интерполяции BILINEAR
                 target_scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max
@@ -2066,6 +2074,14 @@ def index():
                     </div>
                 </div>
 
+                <div class="form-group">
+                    <label>8. Режим отображения текста:</label>
+                    <div style="display: flex; align-items: center; gap: 12px; background: rgba(15, 23, 42, 0.4); padding: 12px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); cursor: pointer;" onclick="document.getElementById('plain-lines').click()">
+                        <input type="checkbox" id="plain-lines" style="width: 20px; height: 20px; cursor: pointer; accent-color: #22d3ee;" onclick="event.stopPropagation()">
+                        <span style="font-weight: 600; color: #cbd5e1;">Только строки без подсветки слов</span>
+                    </div>
+                </div>
+
                 <!-- Запуск -->
                 <button id="btn-generate" class="btn-generate" disabled>СГЕНЕРИРОВАТЬ ВИДЕО</button>
 
@@ -2227,7 +2243,8 @@ def index():
                 color_active: document.getElementById('color-active').value,
                 color_inactive: document.getElementById('color-inactive').value,
                 color_bg: document.getElementById('color-bg').value,
-                audio_delay: parseFloat(document.getElementById('audio-delay').value) / 1000.0
+                audio_delay: parseFloat(document.getElementById('audio-delay').value) / 1000.0,
+                plain_lines: document.getElementById('plain-lines').checked
             };
 
             fetch('/generate', {
@@ -2375,6 +2392,7 @@ def generate():
         audio_delay = float(data.get('audio_delay', 0.0))
         vocal_start = float(data.get('vocal_start', 0.0))
         auto_vocal_start = bool(data.get('auto_vocal_start', True))
+        plain_lines = bool(data.get('plain_lines', False))
 
         if not audio_path or not os.path.exists(audio_path):
             return jsonify({"error": "Аудиофайл не найден на сервере!"}), 400
@@ -2393,7 +2411,7 @@ def generate():
         # Запускаем фоновый поток генерации с параметрами оформления и качества
         thread = threading.Thread(
             target=generate_karaoke_thread,
-            args=(job_id, audio_path, artist, title, lyrics, model_name, quality, font_family, color_active, color_inactive, color_bg, audio_delay, vocal_start, auto_vocal_start)
+            args=(job_id, audio_path, artist, title, lyrics, model_name, quality, font_family, color_active, color_inactive, color_bg, audio_delay, vocal_start, auto_vocal_start, False, None, plain_lines)
         )
         thread.daemon = True
         thread.start()
@@ -2450,6 +2468,8 @@ if __name__ == '__main__':
         parser.add_argument('--detect-window', type=float, default=45.0)
         parser.add_argument('--timings-only', action='store_true')
         parser.add_argument('--timings-output')
+        parser.add_argument('--plain-lines', action='store_true', default=False)
+        parser.add_argument('--no-scrolling', action='store_true', dest='plain_lines')
         parser.print_help()
         sys.exit(0)
 
@@ -2474,6 +2494,8 @@ if __name__ == '__main__':
         parser.add_argument('--detect-window', type=float, default=45.0)
         parser.add_argument('--timings-only', action='store_true')
         parser.add_argument('--timings-output')
+        parser.add_argument('--plain-lines', action='store_true', default=False)
+        parser.add_argument('--no-scrolling', action='store_true', dest='plain_lines')
         
         args = parser.parse_args()
 
@@ -2566,7 +2588,8 @@ if __name__ == '__main__':
                 vocal_start=args.vocal_start,
                 auto_vocal_start=args.auto_vocal_start,
                 timings_only=args.timings_only,
-                timings_output=args.timings_output
+                timings_output=args.timings_output,
+                plain_lines=args.plain_lines
             )
         except Exception as e:
             print(json.dumps({"progress": 1.0, "status": f"❌ Ошибка: {str(e)}", "done": True, "error": str(e)}), flush=True)

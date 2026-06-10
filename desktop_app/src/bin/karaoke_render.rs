@@ -48,6 +48,7 @@ struct WordLayer {
 
 struct LineCache {
     inactive: RgbaImage,
+    active_plain: RgbaImage,
     words: Vec<WordLayer>,
     width: u32,
     height: u32,
@@ -87,6 +88,8 @@ struct RenderConfig {
     background: Rgba<u8>,
     audio_delay: f64,
     engine: String,
+    scrolling: bool,
+    plain_lines: bool,
     ffmpeg: Option<PathBuf>,
     debug_frame_time: Option<f64>,
     debug_frame_output: Option<PathBuf>,
@@ -137,7 +140,7 @@ fn escape_filter_path(path: &Path) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--audio-delay 0.0]"
+        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--audio-delay 0.0] [--plain-lines] [--no-scrolling]"
     );
     std::process::exit(2);
 }
@@ -153,6 +156,8 @@ fn parse_args() -> Result<RenderConfig, String> {
     let mut background = parse_color("#FFFFFF")?;
     let mut audio_delay = 0.0;
     let mut engine = "frames".to_string();
+    let mut scrolling = true;
+    let mut plain_lines = false;
     let mut ffmpeg = None;
     let mut debug_frame_time = None;
     let mut debug_frame_output = None;
@@ -168,6 +173,8 @@ fn parse_args() -> Result<RenderConfig, String> {
             "--color-inactive" => inactive = parse_color(&value()?)?,
             "--color-bg" => background = parse_color(&value()?)?,
             "--engine" => engine = value()?,
+            "--plain-lines" => plain_lines = true,
+            "--no-scrolling" => scrolling = false,
             "--ffmpeg" => ffmpeg = Some(PathBuf::from(value()?)),
             "--audio-delay" => {
                 audio_delay = value()?
@@ -197,6 +204,8 @@ fn parse_args() -> Result<RenderConfig, String> {
         background,
         audio_delay,
         engine,
+        scrolling,
+        plain_lines,
         ffmpeg,
         debug_frame_time,
         debug_frame_output,
@@ -357,6 +366,8 @@ fn build_line_cache(
             let base_line_w = (line_w as f32 / text_supersample).round().max(1.0) as u32;
             let mut inactive_img =
                 ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
+            let mut active_plain_img =
+                ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
 
             let mut x = line_text_x;
             let mut layers = Vec::with_capacity(line.words.len());
@@ -364,6 +375,15 @@ fn build_line_cache(
                 draw_text_mut(
                     &mut inactive_img,
                     inactive,
+                    x,
+                    render_y_draw,
+                    PxScale::from(render_font_size),
+                    font,
+                    &word.word,
+                );
+                draw_text_mut(
+                    &mut active_plain_img,
+                    active,
                     x,
                     render_y_draw,
                     PxScale::from(render_font_size),
@@ -412,9 +432,16 @@ fn build_line_cache(
                 line_height,
                 imageops::FilterType::Lanczos3,
             );
+            let base_active_plain_img = imageops::resize(
+                &active_plain_img,
+                base_line_w,
+                line_height,
+                imageops::FilterType::Lanczos3,
+            );
 
             LineCache {
                 inactive: base_inactive_img,
+                active_plain: base_active_plain_img,
                 words: layers,
                 width: base_line_w,
                 height: line_height,
@@ -574,6 +601,8 @@ fn write_ass_file(
     highlight_delay: f64,
     event_fps: f64,
     size_scale: f32,
+    scrolling: bool,
+    plain_lines: bool,
 ) -> Result<(), String> {
     let mut ass = String::new();
     ass.push_str("[Script Info]\n");
@@ -645,7 +674,8 @@ fn write_ass_file(
                       end_frame: usize,
                       ass: &mut String,
                       metrics: &[AssLineMetric],
-                      idx: usize| {
+                      idx: usize,
+                      color: Rgba<u8>| {
         let start = ev.start_frame as f64 / event_fps;
         let end = (end_frame as f64 / event_fps).min(duration);
         if end <= start {
@@ -654,7 +684,7 @@ fn write_ass_file(
         ass.push_str(&format!(
             "Dialogue: 0,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
             ass_time(start), ass_time(end), x, ev.y, ev.fs,
-            ass_color(inactive, 0), ev.alpha, &metrics[idx].text
+            ass_color(color, 0), ev.alpha, &metrics[idx].text
         ));
     };
 
@@ -688,13 +718,31 @@ fn write_ass_file(
         let scroll_y = scrolls[frame_idx];
 
         for (idx, metric) in metrics.iter().enumerate() {
-            let line_y = y_center + idx as f32 * line_spacing - scroll_y;
-            let visible = line_y >= y_center - line_y_cutoff && line_y <= y_center + line_y_cutoff;
+            if (plain_lines || !scrolling) && idx != active_idx {
+                if let Some(ev) = open_base[idx].take() {
+                    let color = if plain_lines { active } else { inactive };
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
+                }
+                if let Some(ev) = open_clip[idx].take() {
+                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                }
+                continue;
+            }
+
+            let line_y = if scrolling && !plain_lines {
+                y_center + idx as f32 * line_spacing - scroll_y
+            } else {
+                y_center
+            };
+            let visible = plain_lines
+                || !scrolling
+                || (line_y >= y_center - line_y_cutoff && line_y <= y_center + line_y_cutoff);
 
             if !visible {
                 // Flush any open events for this line — it left the screen
                 if let Some(ev) = open_base[idx].take() {
-                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx);
+                    let color = if plain_lines { active } else { inactive };
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
                     flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
@@ -703,21 +751,30 @@ fn write_ass_file(
             }
 
             let dist = (line_y - y_center).abs();
-            let weight = (1.0 - dist / line_spacing).clamp(0.0, 1.0);
+            let weight = if scrolling && !plain_lines {
+                (1.0 - dist / line_spacing).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
             let is_display_active = idx == active_idx;
-            let is_highlight_live =
-                is_display_active || ass_line_highlight_is_live(metric, highlight_t);
+            let is_highlight_live = !plain_lines
+                && (is_display_active || ass_line_highlight_is_live(metric, highlight_t));
             let target_font_size = min_font_size + (base_font_size - min_font_size) * weight;
             let fit_font_size = base_font_size * (safe_line_w / metric.width).min(1.0);
             let font_size = target_font_size.min(fit_font_size);
             let scale = font_size / base_font_size;
-            let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
-            if !is_highlight_live {
+            let mut opacity = if scrolling && !plain_lines {
+                (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if !plain_lines && !is_highlight_live {
                 opacity *= 0.5;
             }
             if opacity <= 0.01 {
                 if let Some(ev) = open_base[idx].take() {
-                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx);
+                    let color = if plain_lines { active } else { inactive };
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
                     flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
@@ -738,7 +795,8 @@ fn write_ass_file(
             };
             if need_new_base {
                 if let Some(ev) = open_base[idx].take() {
-                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx);
+                    let color = if plain_lines { active } else { inactive };
+                    flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 open_base[idx] = Some(LineEvent {
                     start_frame: frame_idx,
@@ -802,7 +860,8 @@ fn write_ass_file(
     // Flush all remaining open events at end of video
     for idx in 0..num_lines {
         if let Some(ev) = open_base[idx].take() {
-            flush_base(&ev, total_frames, &mut ass, &metrics, idx);
+            let color = if plain_lines { active } else { inactive };
+            flush_base(&ev, total_frames, &mut ass, &metrics, idx, color);
         }
         if let Some(ev) = open_clip[idx].take() {
             flush_clip(&ev, total_frames, &mut ass, &metrics, idx, height);
@@ -823,6 +882,8 @@ fn render_ass(
     preset: &str,
     size_scale: f32,
     fps: f64,
+    scrolling: bool,
+    plain_lines: bool,
 ) -> Result<(), String> {
     let ass_path = config.output.with_extension("ass");
     let event_fps = 100.0_f64;
@@ -841,6 +902,8 @@ fn render_ass(
         highlight_delay,
         event_fps,
         size_scale,
+        scrolling,
+        plain_lines,
     )?;
 
     let ffmpeg = config
@@ -1021,6 +1084,8 @@ fn render(config: RenderConfig) -> Result<(), String> {
             preset,
             size_scale,
             fps,
+            config.scrolling,
+            config.plain_lines,
         );
     } else if config.engine == "ass" {
         eprintln!("[Rust] ffmpeg ASS/subtitles filter not found; falling back to frame renderer");
@@ -1067,17 +1132,33 @@ fn render(config: RenderConfig) -> Result<(), String> {
         };
 
         for (idx, line_cache) in cache.iter().enumerate() {
-            let line_y = y_center + idx as f32 * line_spacing - scroll_y;
-            if line_y < y_center - line_y_cutoff || line_y > y_center + line_y_cutoff {
+            if (config.plain_lines || !config.scrolling) && idx != active_idx {
+                continue;
+            }
+            let line_y = if config.scrolling && !config.plain_lines {
+                y_center + idx as f32 * line_spacing - scroll_y
+            } else {
+                y_center
+            };
+            if config.scrolling
+                && !config.plain_lines
+                && (line_y < y_center - line_y_cutoff || line_y > y_center + line_y_cutoff)
+            {
                 continue;
             }
             let dist = (line_y - y_center).abs();
-            let weight = (1.0 - dist / line_spacing).clamp(0.0, 1.0);
+            let weight = if config.scrolling && !config.plain_lines {
+                (1.0 - dist / line_spacing).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
             let is_display_active = idx == active_idx;
-            let is_highlight_live =
-                is_display_active || line_highlight_is_live(&line_cache.words, highlight_t);
+            let is_highlight_live = !config.plain_lines
+                && (is_display_active || line_highlight_is_live(&line_cache.words, highlight_t));
 
-            let mut line_img = if is_highlight_live {
+            let mut line_img = if config.plain_lines && is_display_active {
+                line_cache.active_plain.clone()
+            } else if is_highlight_live {
                 let mut img = line_cache.inactive.clone();
                 paint_line_highlight(&mut img, &line_cache.words, highlight_t);
                 img
@@ -1093,8 +1174,12 @@ fn render(config: RenderConfig) -> Result<(), String> {
             let new_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
             line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
 
-            let mut opacity = (1.0 - dist / dist_cutoff).clamp(0.0, 1.0);
-            if !is_highlight_live {
+            let mut opacity = if config.scrolling && !config.plain_lines {
+                (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if !config.plain_lines && !is_highlight_live {
                 opacity *= 0.5;
             }
 
