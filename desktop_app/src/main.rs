@@ -1031,6 +1031,31 @@ impl KaraokeApp {
             self.artist = String::new();
         }
 
+        // Автопоиск файла с текстом рядом с аудиофайлом (.txt или .lrc)
+        let mut found_lyrics = None;
+        if let Some(parent) = path.parent() {
+            let txt_path = parent.join(format!("{}.txt", file_name));
+            let lrc_path = parent.join(format!("{}.lrc", file_name));
+            let txt_upper = parent.join(format!("{}.TXT", file_name));
+            let lrc_upper = parent.join(format!("{}.LRC", file_name));
+
+            if lrc_path.exists() {
+                found_lyrics = std::fs::read_to_string(lrc_path).ok();
+            } else if lrc_upper.exists() {
+                found_lyrics = std::fs::read_to_string(lrc_upper).ok();
+            } else if txt_path.exists() {
+                found_lyrics = std::fs::read_to_string(txt_path).ok();
+            } else if txt_upper.exists() {
+                found_lyrics = std::fs::read_to_string(txt_upper).ok();
+            }
+        }
+
+        if let Some(lyrics_content) = found_lyrics {
+            self.lyrics = lyrics_content;
+        } else {
+            self.lyrics = String::new();
+        }
+
         let (tx, rx) = channel::<AudioLoadUpdate>();
         self.audio_rx = Some(rx);
         let ctx = ctx.clone();
