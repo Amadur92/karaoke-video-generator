@@ -526,7 +526,7 @@ struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            model: "small".to_string(),
+            model: "base".to_string(),
             quality: "medium".to_string(),
             font: "montserrat".to_string(),
             color_active: [0, 0, 0],
@@ -1052,8 +1052,6 @@ impl KaraokeApp {
 
         if let Some(lyrics_content) = found_lyrics {
             self.lyrics = lyrics_content;
-        } else {
-            self.lyrics = String::new();
         }
 
         let (tx, rx) = channel::<AudioLoadUpdate>();
@@ -1539,6 +1537,7 @@ impl KaraokeApp {
                 .replace("\\", "_");
             let output_mp4_path = exports.join(&clean_filename);
             let timings_output_path = temp.join("karaoke_timings_final.json");
+            let _ = std::fs::remove_file(&timings_output_path);
 
             let render_mode = renderer_path_for_log
                 .as_ref()
@@ -1549,8 +1548,8 @@ impl KaraokeApp {
                 worker_path_for_log, render_mode
             )));
             debug_log(format!(
-                "[karaoke-ui] worker={} renderer={:?}",
-                worker_path_for_log, renderer_path_for_log
+                "[karaoke-ui] worker={} renderer={:?} model={} plain_lines={}",
+                worker_path_for_log, renderer_path_for_log, model, plain_lines
             ));
             ctx.request_repaint();
 
@@ -1640,7 +1639,6 @@ impl KaraokeApp {
                 .arg(&bg_hex)
                 .arg("--audio-delay")
                 .arg(audio_delay_seconds.to_string())
-                .arg("--auto-vocal-start")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
@@ -1747,9 +1745,10 @@ impl KaraokeApp {
                         .unwrap_or(0)
                         .max(1);
                     debug_log(format!(
-                        "[karaoke-ui] render start renderer={} output={}",
+                        "[karaoke-ui] render start renderer={} output={} plain_lines={}",
                         renderer_path.to_string_lossy(),
-                        output_mp4_path.to_string_lossy()
+                        output_mp4_path.to_string_lossy(),
+                        plain_lines
                     ));
                     ctx.request_repaint();
 
@@ -1980,7 +1979,8 @@ impl eframe::App for KaraokeApp {
                 ProgressUpdate::Progress(prog) => {
                     self.progress = prog.progress;
                     self.status_text = prog.status;
-                    if let Some(err) = prog.error {
+                    if let Some(err) = &prog.error {
+                        debug_log(format!("[karaoke-ui] Progress error: {}", err));
                         self.log_output
                             .push_str(&format!("❌ Ошибка ИИ: {}\n", err));
                     }
@@ -1996,9 +1996,11 @@ impl eframe::App for KaraokeApp {
                     }
                 }
                 ProgressUpdate::RawLog(log) => {
+                    debug_log(format!("[worker-raw] {}", log));
                     self.log_output.push_str(&format!("{}\n", log));
                 }
                 ProgressUpdate::Error(err) => {
+                    debug_log(format!("[worker-error] {}", err));
                     self.is_generating = false;
                     self.status_text = "Ошибка".to_string();
                     self.log_output.push_str(&format!("❌ Ошибка: {}\n", err));

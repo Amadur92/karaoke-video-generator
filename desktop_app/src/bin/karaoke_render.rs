@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../../assets/Montserrat-Bold.ttf");
+const ASS_BASE_FONT_SIZE: f32 = 52.0;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -42,7 +43,7 @@ struct WordLayer {
     start: f64,
     end: f64,
     paste_x: i32,
-    width: u32,
+    fill_width: u32,
     image: RgbaImage,
 }
 
@@ -72,7 +73,7 @@ fn paint_line_highlight(img: &mut RgbaImage, words: &[WordLayer], t: f64) {
         } else {
             let progress =
                 ((t - layer.start) / (layer.end - layer.start).max(0.001)).clamp(0.0, 1.0);
-            let fill = (layer.width as f64 * progress).floor() as u32;
+            let fill = (layer.fill_width as f64 * progress).floor() as u32;
             paste_alpha(img, &layer.image, layer.paste_x, 0, 1.0, Some(fill));
         }
     }
@@ -420,7 +421,10 @@ fn build_line_cache(
                     start: word.start,
                     end: word.end,
                     paste_x: ((x - word_active_offset) as f32 / text_supersample).round() as i32,
-                    width: base_active_img.width(),
+                    fill_width: ((word_active_offset.max(0) as f32 + word_w as f32)
+                        / text_supersample)
+                        .round()
+                        .max(1.0) as u32,
                     image: base_active_img,
                 });
                 x += (widths[idx] + space_w).round() as i32;
@@ -451,7 +455,6 @@ fn build_line_cache(
 }
 
 fn transition_times(lines: &[KaraokeLine]) -> Vec<f64> {
-    let line_lead = line_advance_seconds();
     lines
         .iter()
         .enumerate()
@@ -461,7 +464,7 @@ fn transition_times(lines: &[KaraokeLine]) -> Vec<f64> {
             } else {
                 let prev = &lines[idx - 1];
                 if line.start > prev.end {
-                    (line.start - line_lead).max(prev.end)
+                    prev.end
                 } else {
                     line.start
                 }
@@ -474,16 +477,16 @@ fn visual_lag_seconds() -> f64 {
     std::env::var("KARAOKE_VISUAL_LAG_SECONDS")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.25)
+        .unwrap_or(0.0)
         .clamp(0.0, 2.0)
 }
 
-fn line_advance_seconds() -> f64 {
-    std::env::var("KARAOKE_LINE_ADVANCE_SECONDS")
+fn visual_lead_seconds() -> f64 {
+    std::env::var("KARAOKE_VISUAL_LEAD_SECONDS")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.5)
-        .clamp(0.0, 2.0)
+        .unwrap_or(0.35)
+        .clamp(0.0, 1.0)
 }
 
 fn active_line(transitions: &[f64], t: f64) -> usize {
@@ -612,7 +615,8 @@ fn write_ass_file(
     ass.push_str("[V4+ Styles]\n");
     ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
     ass.push_str(&format!(
-        "Style: Dynamic,Montserrat,64,{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        "Style: Dynamic,Montserrat,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        ASS_BASE_FONT_SIZE * size_scale,
         ass_color(active, 0),
         ass_color(active, 0),
         ass_color(active, 255),
@@ -625,7 +629,7 @@ fn write_ass_file(
 
     let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
         .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
-    let base_font_size = 64.0_f32 * size_scale;
+    let base_font_size = ASS_BASE_FONT_SIZE * size_scale;
     let min_font_size = base_font_size * (26.0 / 42.0);
     let line_spacing = 62.0_f32 * size_scale;
     let y_center = height as f32 / 2.0;
@@ -766,7 +770,11 @@ fn write_ass_file(
             let is_display_active = idx == active_idx;
             let is_highlight_live = !plain_lines
                 && (is_display_active || ass_line_highlight_is_live(metric, highlight_t));
-            let is_active_for_event = if plain_lines { is_display_active } else { is_highlight_live };
+            let is_active_for_event = if plain_lines {
+                is_display_active
+            } else {
+                is_highlight_live
+            };
 
             let target_font_size = min_font_size + (base_font_size - min_font_size) * weight;
             let fit_font_size = base_font_size * (safe_line_w / metric.width).min(1.0);
@@ -831,9 +839,8 @@ fn write_ass_file(
                 let fill = ass_fill_width(metric, highlight_t) * scale;
                 if fill > 0.0 {
                     let left = x - metric.width * scale / 2.0;
-                    let clip_pad = 16.0_f32 * size_scale;
-                    let clip_left = (left - clip_pad).max(0.0);
-                    let clip_right = (left + fill + clip_pad).clamp(0.0, width as f32);
+                    let clip_left = (left - 1.0 * size_scale).max(0.0);
+                    let clip_right = (left + fill).clamp(0.0, width as f32);
 
                     let need_new_clip = match &open_clip[idx] {
                         None => true,
@@ -904,7 +911,7 @@ fn render_ass(
 ) -> Result<(), String> {
     let ass_path = config.output.with_extension("ass");
     let event_fps = 100.0_f64;
-    let display_delay = config.audio_delay;
+    let display_delay = config.audio_delay - visual_lead_seconds();
     let highlight_delay = config.audio_delay + visual_lag_seconds();
     write_ass_file(
         &ass_path,
@@ -1086,7 +1093,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let fps = if use_ass_renderer { 60.0_f64 } else { 30.0_f64 };
     let total_frames = ((duration * fps).ceil() as usize).max(1);
     let transitions = transition_times(&lines);
-    let display_delay = config.audio_delay;
+    let display_delay = config.audio_delay - visual_lead_seconds();
     let highlight_delay = config.audio_delay + visual_lag_seconds();
 
     if use_ass_renderer {
@@ -1295,16 +1302,17 @@ fn render(config: RenderConfig) -> Result<(), String> {
         };
 
         let can_use_cache = config.plain_lines && !config.scrolling;
-        let frame = if can_use_cache && last_active_idx == Some(active_idx) && cached_frame.is_some() {
-            cached_frame.as_ref().unwrap().clone()
-        } else {
-            let rendered = render_frame(frame_idx, scrolls[frame_idx]);
-            if can_use_cache {
-                cached_frame = Some(rendered.clone());
-                last_active_idx = Some(active_idx);
-            }
-            rendered
-        };
+        let frame =
+            if can_use_cache && last_active_idx == Some(active_idx) && cached_frame.is_some() {
+                cached_frame.as_ref().unwrap().clone()
+            } else {
+                let rendered = render_frame(frame_idx, scrolls[frame_idx]);
+                if can_use_cache {
+                    cached_frame = Some(rendered.clone());
+                    last_active_idx = Some(active_idx);
+                }
+                rendered
+            };
 
         frame_to_rgb24(&frame, &mut rgb_frame);
         if let Err(err) = stdin.write_all(&rgb_frame) {
