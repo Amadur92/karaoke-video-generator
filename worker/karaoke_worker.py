@@ -1381,7 +1381,10 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 lyrics_karaoke[i]["end"] = max(lyrics_karaoke[i]["end"], lyrics_karaoke[i]["words"][-1]["end"])
 
         lyrics_karaoke = redistribute_repeated_tail_lines(lyrics_karaoke)
-        lyrics_karaoke = repair_short_lines_with_large_internal_gaps(lyrics_karaoke)
+        # repair_short_lines_with_large_internal_gaps отключена: она переоценивала паузы
+        # (max_gap 2.5s срабатывал на реальных нотах) и сжимала слова к началу строки,
+        # из-за чего подсветка «убегала вперёд». Реальные сбои Whisper ловит valid_word_time.
+        # lyrics_karaoke = repair_short_lines_with_large_internal_gaps(lyrics_karaoke)
 
         # ДАМП ФИНАЛЬНЫХ ТАЙМИНГОВ для отладки и будущего Rust-рендера.
         # Важно писать его после всех smoothing/overlap фильтров: renderer должен получать
