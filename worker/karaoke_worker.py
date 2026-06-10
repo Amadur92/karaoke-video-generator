@@ -976,9 +976,21 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         model = loaded_models[model_name]
         jobs[job_id]["progress"] = 0.2
 
-        # Пре-считаем строки для оценки нужны ли чанки
+        # Пре-считаем строки и длительность — нужны для решения о чанках
         _align_raw_lines = lyrics.split('\n')
         _align_non_empty = [l.strip() for l in _align_raw_lines if l.strip()]
+        # Получаем длительность аудио заранее (нужна и для чанков, и для интерполяции)
+        audio_duration = 120.0
+        try:
+            _dur_res = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                **subprocess_no_window_kwargs()
+            )
+            audio_duration = float(_dur_res.stdout.strip())
+        except Exception:
+            pass
         _use_chunked = audio_duration > 150.0 and len(_align_non_empty) > 12
 
         whisper_words = None
@@ -1065,22 +1077,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
 
         is_valid = [valid_word_time(w) for w in whisper_words]
         
-        # Получаем длительность аудио для крайнего случая
-        audio_duration = 120.0
-        try:
-            cmd_dur = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                       '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
-            res_dur = subprocess.run(
-                cmd_dur,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                **subprocess_no_window_kwargs()
-            )
-            audio_duration = float(res_dur.stdout.strip())
-        except Exception:
-            pass
-        
+        # audio_duration уже вычислен выше (перед чанковым выравниванием)
+
         interpolated_count = 0
         i = 0
         while i < n_total:
