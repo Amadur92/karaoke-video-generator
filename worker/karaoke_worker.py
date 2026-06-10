@@ -667,6 +667,151 @@ def extract_audio_window(input_path, output_path, start=0.0, duration=None):
         **subprocess_no_window_kwargs()
     )
 
+def align_in_chunks(model, audio_path, lyrics_lines, language,
+                    audio_duration=None, vocal_start=0.0,
+                    target_chunk_secs=80.0, overlap_secs=5.0,
+                    status_callback=None):
+    """
+    Выравнивает длинный трек по независимым кускам (~80 сек каждый).
+    Предотвращает drift Whisper: на треках >2-3 мин модель теряет ориентацию
+    и начинает галлюцинировать. Разбивая на окна, мы гарантируем что каждый
+    вызов model.align() видит не более 30-40 Whisper-чанков.
+
+    Возвращает плоский список SimpleNamespace(word, start, end)
+    с абсолютными таймингами, либо None если деление не нужно.
+    """
+    import tempfile
+    from types import SimpleNamespace
+
+    non_empty_lines = [l.strip() for l in lyrics_lines if l.strip()]
+    total_lines = len(non_empty_lines)
+
+    if audio_duration is None or audio_duration <= 0:
+        audio_duration = 300.0
+
+    effective_duration = max(10.0, audio_duration - max(0.0, vocal_start))
+
+    # Динамически вычисляем размер чанка в строках на основе темпа песни
+    secs_per_line = effective_duration / max(1, total_lines)
+    chunk_lines = max(5, min(22, int(target_chunk_secs / max(1.5, secs_per_line))))
+
+    # Если весь текст умещается в один чанк — нет смысла делить
+    if total_lines <= chunk_lines + 3:
+        return None
+
+    # Разбиваем на чанки
+    chunks = []
+    i = 0
+    while i < total_lines:
+        end = min(i + chunk_lines, total_lines)
+        chunks.append(non_empty_lines[i:end])
+        i = end
+
+    n_chunks = len(chunks)
+    total_words = sum(len(l.split()) for l in non_empty_lines)
+
+    # Рассчитываем оценочные временны́е зоны пропорционально кол-ву слов
+    cumulative_words = 0
+    chunk_audio_starts_est = []
+    chunk_audio_ends_est = []
+    for chunk in chunks:
+        cw = sum(len(l.split()) for l in chunk)
+        start_frac = cumulative_words / max(1, total_words)
+        end_frac = (cumulative_words + cw) / max(1, total_words)
+        chunk_audio_starts_est.append(vocal_start + start_frac * effective_duration)
+        chunk_audio_ends_est.append(vocal_start + end_frac * effective_duration)
+        cumulative_words += cw
+
+    all_words = []
+    prev_actual_end = max(0.0, vocal_start)
+
+    for idx, chunk_lines_data in enumerate(chunks):
+        is_last = (idx == n_chunks - 1)
+
+        # Начало окна: реальный конец предыдущего чанка минус overlap (для стыковки)
+        if idx == 0:
+            window_start = max(0.0, vocal_start - 0.5)
+        else:
+            window_start = max(0.0, prev_actual_end - overlap_secs)
+
+        # Конец окна: оценочный конец чанка + запас, либо конец аудио
+        if is_last:
+            window_end = audio_duration
+        else:
+            window_end = min(audio_duration, chunk_audio_ends_est[idx] + overlap_secs * 1.5)
+
+        window_duration = max(8.0, window_end - window_start)
+        chunk_text = "\n".join(chunk_lines_data)
+
+        if status_callback:
+            status_callback(
+                f"Выравнивание фрагмента {idx + 1}/{n_chunks} "
+                f"({window_start:.0f}–{window_end:.0f} сек, {len(chunk_lines_data)} строк)..."
+            )
+
+        with tempfile.NamedTemporaryFile(
+            prefix=f'karaoke_chunk{idx}_', suffix='.wav', delete=False
+        ) as tmp:
+            chunk_audio_path = tmp.name
+
+        try:
+            extract_audio_window(audio_path, chunk_audio_path, window_start, window_duration)
+            chunk_result = model.align(
+                chunk_audio_path,
+                chunk_text,
+                language=language,
+                original_split=True,
+                max_word_dur=2.0,
+                nonspeech_skip=3.0,
+            )
+
+            chunk_words = []
+            last_valid_abs_end = window_start
+
+            for segment in getattr(chunk_result, 'segments', []) or []:
+                for w in getattr(segment, 'words', []) or []:
+                    word_str = getattr(w, 'word', '') or ''
+                    try:
+                        rel_start = float(w.start)
+                        rel_end = float(w.end)
+                    except Exception:
+                        continue
+                    if rel_end <= rel_start:
+                        continue
+                    abs_start = round(rel_start + window_start, 3)
+                    abs_end = round(rel_end + window_start, 3)
+                    word_obj = SimpleNamespace(word=word_str, start=abs_start, end=abs_end)
+                    chunk_words.append(word_obj)
+                    last_valid_abs_end = max(last_valid_abs_end, abs_end)
+
+            if chunk_words:
+                # Монотонность: чанк не должен сильно перекрываться с предыдущим
+                if all_words and chunk_words[0].start < all_words[-1].end - 0.5:
+                    shift = (all_words[-1].end + 0.05) - chunk_words[0].start
+                    for wobj in chunk_words:
+                        wobj.start = round(wobj.start + shift, 3)
+                        wobj.end = round(wobj.end + shift, 3)
+                    last_valid_abs_end = round(last_valid_abs_end + shift, 3)
+
+                all_words.extend(chunk_words)
+                prev_actual_end = last_valid_abs_end
+            else:
+                # Пустой чанк — двигаем курсор по оценке
+                prev_actual_end = chunk_audio_ends_est[idx]
+
+        except Exception as exc:
+            if status_callback:
+                status_callback(f"Ошибка в фрагменте {idx + 1}/{n_chunks}: {exc}. Продолжаем...")
+            prev_actual_end = chunk_audio_ends_est[idx]
+
+        finally:
+            try:
+                os.remove(chunk_audio_path)
+            except OSError:
+                pass
+
+    return all_words if all_words else None
+
 def detect_vocal_start(audio_path, model_name='base', window_seconds=45.0, chunk_seconds=12.0, hop_seconds=8.0, status_callback=None, language='ru', lyrics_text=''):
     import tempfile
 
@@ -831,50 +976,62 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         model = loaded_models[model_name]
         jobs[job_id]["progress"] = 0.2
 
-        jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
-        result = model.align(
-            align_audio_path,
-            lyrics,
-            language=lyrics_language,
-            original_split=True,
-            max_word_dur=2.0,
-            nonspeech_skip=3.0
-        )
+        # Пре-считаем строки для оценки нужны ли чанки
+        _align_raw_lines = lyrics.split('\n')
+        _align_non_empty = [l.strip() for l in _align_raw_lines if l.strip()]
+        _use_chunked = audio_duration > 150.0 and len(_align_non_empty) > 12
+
+        whisper_words = None
+
+        if _use_chunked:
+            jobs[job_id]["status"] = "Длинный трек: выравниваем по фрагментам (защита от drift Whisper)..."
+            try:
+                whisper_words = align_in_chunks(
+                    model,
+                    align_audio_path,
+                    _align_raw_lines,
+                    language=lyrics_language,
+                    audio_duration=audio_duration,
+                    vocal_start=vocal_start,
+                    status_callback=lambda msg: jobs[job_id].update({"status": msg}),
+                )
+            except Exception as _chunk_err:
+                jobs[job_id]["status"] = f"Чанковое выравнивание не удалось, переходим к однопроходному: {_chunk_err}"
+                whisper_words = None
+
+        if whisper_words is None:
+            # Однопроходное выравнивание (короткий трек или фолбэк после ошибки)
+            jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
+            result = model.align(
+                align_audio_path,
+                lyrics,
+                language=lyrics_language,
+                original_split=True,
+                max_word_dur=2.0,
+                nonspeech_skip=3.0
+            )
+            try:
+                result.regroup(by_gap=True)
+            except Exception:
+                pass
+            whisper_words = []
+            for segment in result.segments:
+                if hasattr(segment, 'words') and segment.words:
+                    for w in segment.words:
+                        whisper_words.append(w)
+
         jobs[job_id]["progress"] = 0.4
-
-        # Очищаем паузы и тишину: если между словами пауза, сжимаем границы слов, чтобы они не горели заранее
-        jobs[job_id]["status"] = "Постобработка таймингов ИИ (вырезание пауз тишины)..."
-        try:
-            result.regroup(by_gap=True)
-        except Exception:
-            pass
-
-        # Извлечение ВСЕХ слов из Whisper (включая битые с нулевой длительностью)
-        whisper_words = []
-        for segment in result.segments:
-            if hasattr(segment, 'words') and segment.words:
-                for w in segment.words:
-                    whisper_words.append(w)
 
         # ДАМП СЫРЫХ ДАННЫХ WHISPER для отладки
         try:
-            raw_dump = []
-            for seg_idx, segment in enumerate(result.segments):
-                seg_data = {
-                    "segment_idx": seg_idx,
-                    "start": round(segment.start, 3) if hasattr(segment, 'start') else None,
-                    "end": round(segment.end, 3) if hasattr(segment, 'end') else None,
-                    "text": segment.text if hasattr(segment, 'text') else "",
-                    "words": []
+            raw_dump = [
+                {
+                    "word": getattr(w, 'word', '?'),
+                    "start": round(float(w.start), 3) if hasattr(w, 'start') else -1,
+                    "end": round(float(w.end), 3) if hasattr(w, 'end') else -1,
                 }
-                if hasattr(segment, 'words') and segment.words:
-                    for w in segment.words:
-                        seg_data["words"].append({
-                            "word": w.word if hasattr(w, 'word') else "?",
-                            "start": round(w.start, 3) if hasattr(w, 'start') else -1,
-                            "end": round(w.end, 3) if hasattr(w, 'end') else -1,
-                        })
-                raw_dump.append(seg_data)
+                for w in whisper_words
+            ]
             dump_path = os.path.join(EXPORT_FOLDER, f"{job_id}_whisper_raw.json")
             with open(dump_path, 'w', encoding='utf-8') as f:
                 json.dump(raw_dump, f, ensure_ascii=False, indent=2)
