@@ -625,10 +625,25 @@ loaded_models = {}
 
 def get_whisper_model(model_name, status_callback=None):
     import stable_whisper
+    import torch
     if model_name not in loaded_models:
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        
         if status_callback:
-            status_callback(f"Загрузка ИИ-модели Whisper '{model_name}' в память...")
-        loaded_models[model_name] = stable_whisper.load_model(model_name)
+            status_callback(f"Загрузка ИИ-модели Whisper '{model_name}' в память ({device})...")
+        try:
+            loaded_models[model_name] = stable_whisper.load_model(model_name, device=device)
+        except Exception as e:
+            if device != "cpu":
+                if status_callback:
+                    status_callback(f"Откат автоопределения с {device} на cpu: {e}")
+                loaded_models[model_name] = stable_whisper.load_model(model_name, device="cpu")
+            else:
+                raise e
     elif status_callback:
         status_callback(f"Использование готовой модели Whisper '{model_name}'...")
     return loaded_models[model_name]
@@ -936,455 +951,462 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         except Exception:
             timestamped_karaoke = None
 
-        if timestamped_karaoke and timings_only:
-            jobs[job_id]["progress"] = 1.0
-            jobs[job_id]["status"] = "✅ Использована точная разметка из текста. Тайминги подготовлены для Rust-рендера."
-            final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
-            with open(final_dump_path, 'w', encoding='utf-8') as f:
-                json.dump(timestamped_karaoke, f, ensure_ascii=False, indent=2)
-            jobs[job_id]["timings_file"] = final_dump_path
-            jobs[job_id]["done"] = True
-            return
-        
-        # 1. ЗАПУСК ИИ-ВЫРАВНИВАНИЯ
-        def update_model_status(message):
-            jobs[job_id]["status"] = message
-
-        jobs[job_id]["progress"] = 0.1
-        model = get_whisper_model(model_name, update_model_status)
-        vocal_start = max(0.0, float(vocal_start or 0.0))
-        if auto_vocal_start and vocal_start < 0.5:
-            jobs[job_id]["progress"] = 0.16
+        if timestamped_karaoke:
+            lyrics_karaoke = timestamped_karaoke
+            jobs[job_id]["status"] = "✅ Использована точная разметка из текста. Тайминги подготовлены."
             try:
-                detected = detect_vocal_start(
-                    audio_path,
-                    model_name,
-                    status_callback=lambda message: jobs[job_id].update({"status": message}),
-                    language=lyrics_language,
-                    lyrics_text=lyrics,
-                )
-                vocal_start = max(0.0, float(detected.get('vocal_start') or 0.0))
-                if vocal_start >= 0.5:
-                    jobs[job_id]["status"] = f"Первый вокал найден: {vocal_start:.1f} сек. Используем как ориентир для таймингов."
-                else:
-                    jobs[job_id]["status"] = "Длинное интро не найдено, распознавание начнется с 00:00."
-            except Exception as e:
-                vocal_start = 0.0
-                jobs[job_id]["status"] = f"Предобработка не удалась, продолжаем с 00:00: {str(e)}"
-        align_audio_path = audio_path
-
-        model = loaded_models[model_name]
-        jobs[job_id]["progress"] = 0.2
-
-        # Пре-считаем строки и длительность — нужны для решения о чанках
-        _align_raw_lines = lyrics.split('\n')
-        _align_non_empty = [l.strip() for l in _align_raw_lines if l.strip()]
-        # Получаем длительность аудио заранее (нужна и для чанков, и для интерполяции)
-        audio_duration = 120.0
-        try:
-            _dur_res = subprocess.run(
-                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                 '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                **subprocess_no_window_kwargs()
-            )
-            audio_duration = float(_dur_res.stdout.strip())
-        except Exception:
-            pass
-        _use_chunked = audio_duration > 150.0 and len(_align_non_empty) > 12
-
-        whisper_words = None
-
-        if _use_chunked:
-            jobs[job_id]["status"] = "Длинный трек: выравниваем по фрагментам (защита от drift Whisper)..."
-            try:
-                whisper_words = align_in_chunks(
-                    model,
-                    align_audio_path,
-                    _align_raw_lines,
-                    language=lyrics_language,
-                    audio_duration=audio_duration,
-                    vocal_start=vocal_start,
-                    status_callback=lambda msg: jobs[job_id].update({"status": msg}),
-                )
-            except Exception as _chunk_err:
-                jobs[job_id]["status"] = f"Чанковое выравнивание не удалось, переходим к однопроходному: {_chunk_err}"
-                whisper_words = None
-
-        if whisper_words is None:
-            # Однопроходное выравнивание (короткий трек или фолбэк после ошибки)
-            jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
-            result = model.align(
-                align_audio_path,
-                lyrics,
-                language=lyrics_language,
-                original_split=True,
-                max_word_dur=2.0,
-                nonspeech_skip=3.0
-            )
-            try:
-                result.regroup(by_gap=True)
+                final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
+                with open(final_dump_path, 'w', encoding='utf-8') as f:
+                    json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
+                jobs[job_id]["timings_file"] = final_dump_path
             except Exception:
                 pass
-            whisper_words = []
-            for segment in result.segments:
-                if hasattr(segment, 'words') and segment.words:
-                    for w in segment.words:
-                        whisper_words.append(w)
 
-        jobs[job_id]["progress"] = 0.4
+            if timings_only:
+                jobs[job_id]["progress"] = 1.0
+                jobs[job_id]["status"] = "✅ Использована точная разметка из текста. Тайминги подготовлены для Rust-рендера."
+                jobs[job_id]["done"] = True
+                return
+        else:
+            # 1. ЗАПУСК ИИ-ВЫРАВНИВАНИЯ
+            def update_model_status(message):
+                jobs[job_id]["status"] = message
 
-        # ДАМП СЫРЫХ ДАННЫХ WHISPER для отладки
-        try:
-            raw_dump = [
-                {
-                    "word": getattr(w, 'word', '?'),
-                    "start": round(float(w.start), 3) if hasattr(w, 'start') else -1,
-                    "end": round(float(w.end), 3) if hasattr(w, 'end') else -1,
-                }
-                for w in whisper_words
-            ]
-            dump_path = os.path.join(EXPORT_FOLDER, f"{job_id}_whisper_raw.json")
-            with open(dump_path, 'w', encoding='utf-8') as f:
-                json.dump(raw_dump, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            jobs[job_id]["progress"] = 0.1
+            model = get_whisper_model(model_name, update_model_status)
+            vocal_start = max(0.0, float(vocal_start or 0.0))
+            if auto_vocal_start and vocal_start < 0.5:
+                jobs[job_id]["progress"] = 0.16
+                try:
+                    detected = detect_vocal_start(
+                        audio_path,
+                        model_name,
+                        status_callback=lambda message: jobs[job_id].update({"status": message}),
+                        language=lyrics_language,
+                        lyrics_text=lyrics,
+                    )
+                    vocal_start = max(0.0, float(detected.get('vocal_start') or 0.0))
+                    if vocal_start >= 0.5:
+                        jobs[job_id]["status"] = f"Первый вокал найден: {vocal_start:.1f} сек. Используем как ориентир для таймингов."
+                    else:
+                        jobs[job_id]["status"] = "Длинное интро не найдено, распознавание начнется с 00:00."
+                except Exception as e:
+                    vocal_start = 0.0
+                    jobs[job_id]["status"] = f"Предобработка не удалась, продолжаем с 00:00: {str(e)}"
+            align_audio_path = audio_path
 
-        # ИНТЕРПОЛЯЦИЯ БИТЫХ СЛОВ (перевернутые, нулевые или слишком длинные тайминги)
-        # Whisper иногда сжимает целые припевы в одну точку времени.
-        # Находим группы битых слов и равномерно распределяем их между валидными якорями.
-        jobs[job_id]["status"] = "Интерполяция таймингов для сбойных сегментов ИИ..."
-        
-        n_total = len(whisper_words)
-        def word_duration_limit(word):
-            clean = clean_word(getattr(word, 'word', '') or '')
-            # Певческие хвосты бывают длинными, но одно слово на полкуплета почти всегда сбой.
-            return min(2.8, max(0.85, 0.34 * max(len(clean), 1)))
+            model = loaded_models[model_name]
+            jobs[job_id]["progress"] = 0.2
 
-        def valid_word_time(word):
-            if not (hasattr(word, 'start') and hasattr(word, 'end')):
-                return False
+            # Пре-считаем строки и длительность — нужны для решения о чанках
+            _align_raw_lines = lyrics.split('\n')
+            _align_non_empty = [l.strip() for l in _align_raw_lines if l.strip()]
+            # Получаем длительность аудио заранее (нужна и для чанков, и для интерполяции)
+            audio_duration = 120.0
             try:
-                start = float(word.start)
-                end = float(word.end)
+                _dur_res = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                     '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    **subprocess_no_window_kwargs()
+                )
+                audio_duration = float(_dur_res.stdout.strip())
             except Exception:
-                return False
-            if start < 0 or end <= start + 0.02:
-                return False
-            if end - start > word_duration_limit(word):
-                return False
-            return True
+                pass
+            _use_chunked = audio_duration > 150.0 and len(_align_non_empty) > 12
 
-        is_valid = [valid_word_time(w) for w in whisper_words]
+            whisper_words = None
+
+            if _use_chunked:
+                jobs[job_id]["status"] = "Длинный трек: выравниваем по фрагментам (защита от drift Whisper)..."
+                try:
+                    whisper_words = align_in_chunks(
+                        model,
+                        align_audio_path,
+                        _align_raw_lines,
+                        language=lyrics_language,
+                        audio_duration=audio_duration,
+                        vocal_start=vocal_start,
+                        status_callback=lambda msg: jobs[job_id].update({"status": msg}),
+                    )
+                except Exception as _chunk_err:
+                    jobs[job_id]["status"] = f"Чанковое выравнивание не удалось, переходим к однопроходному: {_chunk_err}"
+                    whisper_words = None
+
+            if whisper_words is None:
+                # Однопроходное выравнивание (короткий трек или фолбэк после ошибки)
+                jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
+                result = model.align(
+                    align_audio_path,
+                    lyrics,
+                    language=lyrics_language,
+                    original_split=True,
+                    max_word_dur=2.0,
+                    nonspeech_skip=3.0
+                )
+                try:
+                    result.regroup(by_gap=True)
+                except Exception:
+                    pass
+                whisper_words = []
+                for segment in result.segments:
+                    if hasattr(segment, 'words') and segment.words:
+                        for w in segment.words:
+                            whisper_words.append(w)
+
+            jobs[job_id]["progress"] = 0.4
+
+            # ДАМП СЫРЫХ ДАННЫХ WHISPER для отладки
+            try:
+                raw_dump = [
+                    {
+                        "word": getattr(w, 'word', '?'),
+                        "start": round(float(w.start), 3) if hasattr(w, 'start') else -1,
+                        "end": round(float(w.end), 3) if hasattr(w, 'end') else -1,
+                    }
+                    for w in whisper_words
+                ]
+                dump_path = os.path.join(EXPORT_FOLDER, f"{job_id}_whisper_raw.json")
+                with open(dump_path, 'w', encoding='utf-8') as f:
+                    json.dump(raw_dump, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # ИНТЕРПОЛЯЦИЯ БИТЫХ СЛОВ (перевернутые, нулевые или слишком длинные тайминги)
+            # Whisper иногда сжимает целые припевы в одну точку времени.
+            # Находим группы битых слов и равномерно распределяем их между валидными якорями.
+            jobs[job_id]["status"] = "Интерполяция таймингов для сбойных сегментов ИИ..."
         
-        # audio_duration уже вычислен выше (перед чанковым выравниванием)
+            n_total = len(whisper_words)
+            def word_duration_limit(word):
+                clean = clean_word(getattr(word, 'word', '') or '')
+                # Певческие хвосты бывают длинными, но одно слово на полкуплета почти всегда сбой.
+                return min(2.8, max(0.85, 0.34 * max(len(clean), 1)))
 
-        interpolated_count = 0
-        i = 0
-        while i < n_total:
-            if is_valid[i]:
-                i += 1
-                continue
-            
-            # Нашли начало группы битых слов
-            group_start = i
-            while i < n_total and not is_valid[i]:
-                i += 1
-            group_end = i  # не включительно
-            num_broken = group_end - group_start
-            
-            # Левый якорь: конец последнего валидного слова перед группой.
-            # Для группы в самом начале нельзя слепо брать auto vocal_start:
-            # если детектор промахнулся поздно, он сдвинет первую строку поверх второй.
-            left_time = 0.0
-            for j in range(group_start - 1, -1, -1):
-                if is_valid[j]:
-                    left_time = whisper_words[j].end
-                    break
+            def valid_word_time(word):
+                if not (hasattr(word, 'start') and hasattr(word, 'end')):
+                    return False
+                try:
+                    start = float(word.start)
+                    end = float(word.end)
+                except Exception:
+                    return False
+                if start < 0 or end <= start + 0.02:
+                    return False
+                if end - start > word_duration_limit(word):
+                    return False
+                return True
 
-            # Правый якорь: начало первого валидного слова после группы
-            right_time = None
-            for j in range(group_end, n_total):
-                if is_valid[j]:
-                    right_time = whisper_words[j].start
-                    break
-            if group_start == 0 and right_time is not None:
-                total_chars_before = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
-                estimated_span = min(8.0, max(0.45 * num_broken, total_chars_before * 0.16))
-                left_time = max(0.0, right_time - estimated_span)
-            if right_time is None:
-                # Если справа нет надежного якоря, не растягиваем хвост до конца трека.
-                total_chars = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
-                right_time = left_time + min(8.0, max(0.45 * num_broken, total_chars * 0.16))
-            
-            # Пропорциональное распределение времени по длине слов
-            max_span = max(0.45 * num_broken, min(8.0, num_broken * 0.9))
-            span = min(max(right_time - left_time, 0.2), max_span)
-            
-            # Считаем суммарную длину всех битых слов в группе
-            total_chars = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
-            if total_chars == 0:
-                total_chars = num_broken
-                
-            current_time = left_time
-            for k in range(num_broken):
-                idx = group_start + k
-                word_clean = clean_word(whisper_words[idx].word)
-                char_len = max(len(word_clean), 1) if word_clean else 1
-                
-                # Доля времени для этого слова
-                word_share = char_len / total_chars
-                w_dur = span * word_share
-                
-                # Ограничиваем разумными пределами (от 120мс до 2.0с)
-                w_dur = min(max(w_dur, 0.12), 2.0)
-                
-                new_start = current_time
-                new_end = new_start + w_dur * 0.85  # 15% зазор
-                
-                whisper_words[idx].start = round(new_start, 3)
-                whisper_words[idx].end = round(new_end, 3)
-                
-                current_time += w_dur
-                
-            interpolated_count += num_broken
+            is_valid = [valid_word_time(w) for w in whisper_words]
         
-        # Гарантируем монотонность
-        for i in range(1, n_total):
-            if whisper_words[i].start < whisper_words[i-1].end:
-                whisper_words[i].start = round(whisper_words[i-1].end + 0.01, 3)
-            max_end = whisper_words[i].start + word_duration_limit(whisper_words[i])
-            if whisper_words[i].end <= whisper_words[i].start:
-                whisper_words[i].end = round(whisper_words[i].start + 0.15, 3)
-            elif whisper_words[i].end > max_end:
-                whisper_words[i].end = round(max_end, 3)
-        
-        num_whisper_words = len(whisper_words)
-        jobs[job_id]["status"] = f"Обработано {num_whisper_words} слов (интерполировано: {interpolated_count})"
+            # audio_duration уже вычислен выше (перед чанковым выравниванием)
 
-        # Сопоставляем выровненные ИИ слова со строгой структурой исходного текста lyrics
-        raw_lines = lyrics.split('\n')
-        lyrics_karaoke = []
-        whisper_idx = 0
-        LOOKAHEAD = 5  # Узкое окно — защита от перескока на повторы (припевы)
-
-        for line in raw_lines:
-            line_cleaned = line.strip()
-            if not line_cleaned:
-                continue
-            
-            orig_words = line_cleaned.split()
-            line_words_timing = []
-            
-            for orig_w in orig_words:
-                orig_w_clean = clean_word(orig_w)
-                if not orig_w_clean:
+            interpolated_count = 0
+            i = 0
+            while i < n_total:
+                if is_valid[i]:
+                    i += 1
                     continue
+            
+                # Нашли начало группы битых слов
+                group_start = i
+                while i < n_total and not is_valid[i]:
+                    i += 1
+                group_end = i  # не включительно
+                num_broken = group_end - group_start
+            
+                # Левый якорь: конец последнего валидного слова перед группой.
+                # Для группы в самом начале нельзя слепо брать auto vocal_start:
+                # если детектор промахнулся поздно, он сдвинет первую строку поверх второй.
+                left_time = 0.0
+                for j in range(group_start - 1, -1, -1):
+                    if is_valid[j]:
+                        left_time = whisper_words[j].end
+                        break
+
+                # Правый якорь: начало первого валидного слова после группы
+                right_time = None
+                for j in range(group_end, n_total):
+                    if is_valid[j]:
+                        right_time = whisper_words[j].start
+                        break
+                if group_start == 0 and right_time is not None:
+                    total_chars_before = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
+                    estimated_span = min(8.0, max(0.45 * num_broken, total_chars_before * 0.16))
+                    left_time = max(0.0, right_time - estimated_span)
+                if right_time is None:
+                    # Если справа нет надежного якоря, не растягиваем хвост до конца трека.
+                    total_chars = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
+                    right_time = left_time + min(8.0, max(0.45 * num_broken, total_chars * 0.16))
+            
+                # Пропорциональное распределение времени по длине слов
+                max_span = max(0.45 * num_broken, min(8.0, num_broken * 0.9))
+                span = min(max(right_time - left_time, 0.2), max_span)
+            
+                # Считаем суммарную длину всех битых слов в группе
+                total_chars = sum(max(len(clean_word(whisper_words[group_start + k].word)), 1) for k in range(num_broken))
+                if total_chars == 0:
+                    total_chars = num_broken
+                
+                current_time = left_time
+                for k in range(num_broken):
+                    idx = group_start + k
+                    word_clean = clean_word(whisper_words[idx].word)
+                    char_len = max(len(word_clean), 1) if word_clean else 1
+                
+                    # Доля времени для этого слова
+                    word_share = char_len / total_chars
+                    w_dur = span * word_share
+                
+                    # Ограничиваем разумными пределами (от 120мс до 2.0с)
+                    w_dur = min(max(w_dur, 0.12), 2.0)
+                
+                    new_start = current_time
+                    new_end = new_start + w_dur * 0.85  # 15% зазор
+                
+                    whisper_words[idx].start = round(new_start, 3)
+                    whisper_words[idx].end = round(new_end, 3)
+                
+                    current_time += w_dur
+                
+                interpolated_count += num_broken
+        
+            # Гарантируем монотонность
+            for i in range(1, n_total):
+                if whisper_words[i].start < whisper_words[i-1].end:
+                    whisper_words[i].start = round(whisper_words[i-1].end + 0.01, 3)
+                max_end = whisper_words[i].start + word_duration_limit(whisper_words[i])
+                if whisper_words[i].end <= whisper_words[i].start:
+                    whisper_words[i].end = round(whisper_words[i].start + 0.15, 3)
+                elif whisper_words[i].end > max_end:
+                    whisper_words[i].end = round(max_end, 3)
+        
+            num_whisper_words = len(whisper_words)
+            jobs[job_id]["status"] = f"Обработано {num_whisper_words} слов (интерполировано: {interpolated_count})"
+
+            # Сопоставляем выровненные ИИ слова со строгой структурой исходного текста lyrics
+            raw_lines = lyrics.split('\n')
+            lyrics_karaoke = []
+            whisper_idx = 0
+            LOOKAHEAD = 5  # Узкое окно — защита от перескока на повторы (припевы)
+
+            for line in raw_lines:
+                line_cleaned = line.strip()
+                if not line_cleaned:
+                    continue
+            
+                orig_words = line_cleaned.split()
+                line_words_timing = []
+            
+                for orig_w in orig_words:
+                    orig_w_clean = clean_word(orig_w)
+                    if not orig_w_clean:
+                        continue
                 
 
 
                 
-                # Приоритет 1: точное совпадение на текущей позиции (без поиска)
-                matched = False
-                if whisper_idx < num_whisper_words:
-                    w_word_clean = clean_word(whisper_words[whisper_idx].word)
-                    if orig_w_clean == w_word_clean:
+                    # Приоритет 1: точное совпадение на текущей позиции (без поиска)
+                    matched = False
+                    if whisper_idx < num_whisper_words:
+                        w_word_clean = clean_word(whisper_words[whisper_idx].word)
+                        if orig_w_clean == w_word_clean:
+                            line_words_timing.append({
+                                "word": orig_w,
+                                "start": round(whisper_words[whisper_idx].start, 3),
+                                "end": round(whisper_words[whisper_idx].end, 3)
+                            })
+                            whisper_idx += 1
+                            matched = True
+                
+                    # Приоритет 2: поиск в узком окне (до 5 слов вперёд)
+                    if not matched:
+                        best_k = -1
+                        for k in range(whisper_idx, min(whisper_idx + LOOKAHEAD, num_whisper_words)):
+                            w_word_clean = clean_word(whisper_words[k].word)
+                            if orig_w_clean == w_word_clean or orig_w_clean in w_word_clean or w_word_clean in orig_w_clean:
+                                best_k = k
+                                break
+                    
+                        if best_k >= 0:
+                            line_words_timing.append({
+                                "word": orig_w,
+                                "start": round(whisper_words[best_k].start, 3),
+                                "end": round(whisper_words[best_k].end, 3)
+                            })
+                            whisper_idx = best_k + 1
+                            matched = True
+                
+                    # Фолбэк: берём следующее слово как есть (строго +1)
+                    if not matched and whisper_idx < num_whisper_words:
                         line_words_timing.append({
                             "word": orig_w,
                             "start": round(whisper_words[whisper_idx].start, 3),
                             "end": round(whisper_words[whisper_idx].end, 3)
                         })
                         whisper_idx += 1
-                        matched = True
-                
-                # Приоритет 2: поиск в узком окне (до 5 слов вперёд)
-                if not matched:
-                    best_k = -1
-                    for k in range(whisper_idx, min(whisper_idx + LOOKAHEAD, num_whisper_words)):
-                        w_word_clean = clean_word(whisper_words[k].word)
-                        if orig_w_clean == w_word_clean or orig_w_clean in w_word_clean or w_word_clean in orig_w_clean:
-                            best_k = k
-                            break
-                    
-                    if best_k >= 0:
-                        line_words_timing.append({
-                            "word": orig_w,
-                            "start": round(whisper_words[best_k].start, 3),
-                            "end": round(whisper_words[best_k].end, 3)
-                        })
-                        whisper_idx = best_k + 1
-                        matched = True
-                
-                # Фолбэк: берём следующее слово как есть (строго +1)
-                if not matched and whisper_idx < num_whisper_words:
-                    line_words_timing.append({
-                        "word": orig_w,
-                        "start": round(whisper_words[whisper_idx].start, 3),
-                        "end": round(whisper_words[whisper_idx].end, 3)
+            
+                if line_words_timing:
+                    lyrics_karaoke.append({
+                        "text": line_cleaned,
+                        "start": line_words_timing[0]["start"],
+                        "end": line_words_timing[-1]["end"],
+                        "words": line_words_timing
                     })
-                    whisper_idx += 1
-            
-            if line_words_timing:
-                lyrics_karaoke.append({
-                    "text": line_cleaned,
-                    "start": line_words_timing[0]["start"],
-                    "end": line_words_timing[-1]["end"],
-                    "words": line_words_timing
-                })
 
-        # ЗАЩИТА МОНОТОННОСТИ: каждая строка должна начинаться после предыдущей
-        for i in range(1, len(lyrics_karaoke)):
-            prev_end = lyrics_karaoke[i - 1]["end"]
-            curr_start = lyrics_karaoke[i]["start"]
-            if curr_start < prev_end:
-                shift = prev_end - curr_start + 0.05
-                lyrics_karaoke[i]["start"] += shift
-                lyrics_karaoke[i]["end"] += shift
-                for w in lyrics_karaoke[i]["words"]:
-                    w["start"] += shift
-                    w["end"] += shift
+            # ЗАЩИТА МОНОТОННОСТИ: каждая строка должна начинаться после предыдущей
+            for i in range(1, len(lyrics_karaoke)):
+                prev_end = lyrics_karaoke[i - 1]["end"]
+                curr_start = lyrics_karaoke[i]["start"]
+                if curr_start < prev_end:
+                    shift = prev_end - curr_start + 0.05
+                    lyrics_karaoke[i]["start"] += shift
+                    lyrics_karaoke[i]["end"] += shift
+                    for w in lyrics_karaoke[i]["words"]:
+                        w["start"] += shift
+                        w["end"] += shift
 
-        # Если в середине песни есть длинный инструментальный проигрыш, align иногда
-        # начинает "слышать" следующий куплет на гитаре и сжимает/рвет хвост текста.
-        # Для таких случаев делаем короткий локальный перескан и пере-выравниваем
-        # только подозрительный хвост, не трогая уже надежное начало песни.
-        if not parse_timestamped_lyrics(lyrics):
-            suspect_idx = find_suspicious_tail_start(lyrics_karaoke)
-            if suspect_idx is not None and 0 < suspect_idx < len(lyrics_karaoke) - 2:
-                try:
-                    lyrics_karaoke, suspect_idx = compact_interjection_run_before_tail(
-                        lyrics_karaoke,
-                        suspect_idx,
-                    )
-                    target_text = lyrics_karaoke[suspect_idx]["text"]
-                    prev_end = float(lyrics_karaoke[suspect_idx - 1]["end"])
-                    search_start = max(0.0, prev_end + 3.0)
-                    search_end = min(audio_duration, search_start + 75.0)
-                    jobs[job_id]["status"] = "Найден возможный длинный проигрыш. Проверяем реальный вход следующего куплета..."
-                    real_start = find_phrase_start_in_audio(
-                        model,
-                        audio_path,
-                        target_text,
-                        search_start,
-                        search_end,
-                        language=lyrics_language,
-                        status_callback=lambda message: jobs[job_id].update({"status": message}),
-                    )
-                    if real_start is not None and real_start > lyrics_karaoke[suspect_idx]["start"] + 4.0:
-                        import tempfile
-                        nonempty_raw_lines = [line.strip() for line in raw_lines if line.strip()]
-                        raw_tail_idx = suspect_idx
-                        target_clean = clean_word(target_text)
-                        for raw_idx in range(max(0, suspect_idx - 4), len(nonempty_raw_lines)):
-                            if clean_word(nonempty_raw_lines[raw_idx]) == target_clean:
-                                raw_tail_idx = raw_idx
-                                break
-                        tail_lines = nonempty_raw_lines[raw_tail_idx:]
-                        tail_text = "\n".join(tail_lines)
-                        window_start = max(0.0, real_start - 2.0)
-                        window_duration = max(8.0, min(audio_duration - window_start, audio_duration))
-                        jobs[job_id]["status"] = f"Пере-выравнивание хвоста после проигрыша с {real_start:.1f} сек..."
-                        with tempfile.NamedTemporaryFile(prefix='karaoke_tail_align_', suffix='.wav', delete=False) as tmp:
-                            tail_audio_path = tmp.name
-                        try:
-                            extract_audio_window(audio_path, tail_audio_path, window_start, window_duration)
-                            tail_result = model.align(
-                                tail_audio_path,
-                                tail_text,
-                                language=lyrics_language,
-                                original_split=True,
-                                max_word_dur=2.0,
-                                nonspeech_skip=3.0
-                            )
-                            repaired_tail = build_karaoke_from_aligned_segments(
-                                getattr(tail_result, 'segments', []) or [],
-                                tail_lines,
-                                offset=window_start,
-                            )
-                            if len(repaired_tail) >= 2:
-                                lyrics_karaoke = lyrics_karaoke[:suspect_idx] + repaired_tail
-                                jobs[job_id]["status"] = f"Хвост после проигрыша пере-выравнен с {real_start:.1f} сек."
-                        finally:
+            # Если в середине песни есть длинный инструментальный проигрыш, align иногда
+            # начинает "слышать" следующий куплет на гитаре и сжимает/рвет хвост текста.
+            # Для таких случаев делаем короткий локальный перескан и пере-выравниваем
+            # только подозрительный хвост, не трогая уже надежное начало песни.
+            if not parse_timestamped_lyrics(lyrics):
+                suspect_idx = find_suspicious_tail_start(lyrics_karaoke)
+                if suspect_idx is not None and 0 < suspect_idx < len(lyrics_karaoke) - 2:
+                    try:
+                        lyrics_karaoke, suspect_idx = compact_interjection_run_before_tail(
+                            lyrics_karaoke,
+                            suspect_idx,
+                        )
+                        target_text = lyrics_karaoke[suspect_idx]["text"]
+                        prev_end = float(lyrics_karaoke[suspect_idx - 1]["end"])
+                        search_start = max(0.0, prev_end + 3.0)
+                        search_end = min(audio_duration, search_start + 75.0)
+                        jobs[job_id]["status"] = "Найден возможный длинный проигрыш. Проверяем реальный вход следующего куплета..."
+                        real_start = find_phrase_start_in_audio(
+                            model,
+                            audio_path,
+                            target_text,
+                            search_start,
+                            search_end,
+                            language=lyrics_language,
+                            status_callback=lambda message: jobs[job_id].update({"status": message}),
+                        )
+                        if real_start is not None and real_start > lyrics_karaoke[suspect_idx]["start"] + 4.0:
+                            import tempfile
+                            nonempty_raw_lines = [line.strip() for line in raw_lines if line.strip()]
+                            raw_tail_idx = suspect_idx
+                            target_clean = clean_word(target_text)
+                            for raw_idx in range(max(0, suspect_idx - 4), len(nonempty_raw_lines)):
+                                if clean_word(nonempty_raw_lines[raw_idx]) == target_clean:
+                                    raw_tail_idx = raw_idx
+                                    break
+                            tail_lines = nonempty_raw_lines[raw_tail_idx:]
+                            tail_text = "\n".join(tail_lines)
+                            window_start = max(0.0, real_start - 2.0)
+                            window_duration = max(8.0, min(audio_duration - window_start, audio_duration))
+                            jobs[job_id]["status"] = f"Пере-выравнивание хвоста после проигрыша с {real_start:.1f} сек..."
+                            with tempfile.NamedTemporaryFile(prefix='karaoke_tail_align_', suffix='.wav', delete=False) as tmp:
+                                tail_audio_path = tmp.name
                             try:
-                                os.remove(tail_audio_path)
-                            except OSError:
-                                pass
-                except Exception as e:
-                    jobs[job_id]["status"] = f"Автопроверка проигрыша не удалась, используем базовые тайминги: {str(e)}"
+                                extract_audio_window(audio_path, tail_audio_path, window_start, window_duration)
+                                tail_result = model.align(
+                                    tail_audio_path,
+                                    tail_text,
+                                    language=lyrics_language,
+                                    original_split=True,
+                                    max_word_dur=2.0,
+                                    nonspeech_skip=3.0
+                                )
+                                repaired_tail = build_karaoke_from_aligned_segments(
+                                    getattr(tail_result, 'segments', []) or [],
+                                    tail_lines,
+                                    offset=window_start,
+                                )
+                                if len(repaired_tail) >= 2:
+                                    lyrics_karaoke = lyrics_karaoke[:suspect_idx] + repaired_tail
+                                    jobs[job_id]["status"] = f"Хвост после проигрыша пере-выравнен с {real_start:.1f} сек."
+                            finally:
+                                try:
+                                    os.remove(tail_audio_path)
+                                except OSError:
+                                    pass
+                    except Exception as e:
+                        jobs[job_id]["status"] = f"Автопроверка проигрыша не удалась, используем базовые тайминги: {str(e)}"
 
-        # === ИНТЕЛЛЕКТУАЛЬНЫЙ АЛГОРИТМ СГЛАЖИВАНИЯ ВОКАЛЬНЫХ ХВОСТОВ (VOCAL TAIL SMOOTHING) ===
-        # Этот алгоритм находит паузы после слов и плавно продлевает время их звучания,
-        # чтобы пропеваемые артистом окончания (особенно гласные в конце строк) не обрезались ИИ!
-        jobs[job_id]["status"] = "Сглаживание вокальных окончаний (продление пропеваемых букв)..."
-        num_lines = len(lyrics_karaoke)
-        for line_idx, line_data in enumerate(lyrics_karaoke):
-            words = line_data["words"]
-            num_words = len(words)
+            # === ИНТЕЛЛЕКТУАЛЬНЫЙ АЛГОРИТМ СГЛАЖИВАНИЯ ВОКАЛЬНЫХ ХВОСТОВ (VOCAL TAIL SMOOTHING) ===
+            # Этот алгоритм находит паузы после слов и плавно продлевает время их звучания,
+            # чтобы пропеваемые артистом окончания (особенно гласные в конце строк) не обрезались ИИ!
+            jobs[job_id]["status"] = "Сглаживание вокальных окончаний (продление пропеваемых букв)..."
+            num_lines = len(lyrics_karaoke)
+            for line_idx, line_data in enumerate(lyrics_karaoke):
+                words = line_data["words"]
+                num_words = len(words)
             
-            for w_idx in range(num_words):
-                w_end = words[w_idx]["end"]
-                w_start = words[w_idx]["start"]
+                for w_idx in range(num_words):
+                    w_end = words[w_idx]["end"]
+                    w_start = words[w_idx]["start"]
                 
-                # Продлеваем каждое слово на 12% от его длины или минимум 0.08с для мягкого затухания
-                duration_word = w_end - w_start
-                padding = max(0.08, duration_word * 0.12)
+                    # Продлеваем каждое слово на 12% от его длины или минимум 0.08с для мягкого затухания
+                    duration_word = w_end - w_start
+                    padding = max(0.08, duration_word * 0.12)
                 
-                # 1. Если это НЕ последнее слово в строке
-                if w_idx < num_words - 1:
-                    next_start = words[w_idx + 1]["start"]
-                    # Продлеваем до начала следующего слова, но оставляем зазор (минимум 50% паузы)
-                    gap = next_start - w_end
-                    if gap > 0:
-                        extend = min(padding, gap * 0.5)
-                        words[w_idx]["end"] = round(w_end + extend, 3)
-                
-                # 2. Если это последнее слово в строке
-                else:
-                    # Если есть следующая строка
-                    if line_idx < num_lines - 1:
-                        next_line_start = lyrics_karaoke[line_idx + 1]["start"]
-                        gap = next_line_start - w_end
+                    # 1. Если это НЕ последнее слово в строке
+                    if w_idx < num_words - 1:
+                        next_start = words[w_idx + 1]["start"]
+                        # Продлеваем до начала следующего слова, но оставляем зазор (минимум 50% паузы)
+                        gap = next_start - w_end
                         if gap > 0:
-                            # Для последнего слова в строке даем большее продление (до 0.45с), 
-                            # так как гласные в конце фраз часто пропеваются очень долго!
-                            extend = min(0.45, gap * 0.6)
+                            extend = min(padding, gap * 0.5)
                             words[w_idx]["end"] = round(w_end + extend, 3)
+                
+                    # 2. Если это последнее слово в строке
                     else:
-                        # Если это самое последнее слово всей песни, просто продлим его на 0.5с для красоты
-                        words[w_idx]["end"] = round(w_end + 0.5, 3)
+                        # Если есть следующая строка
+                        if line_idx < num_lines - 1:
+                            next_line_start = lyrics_karaoke[line_idx + 1]["start"]
+                            gap = next_line_start - w_end
+                            if gap > 0:
+                                # Для последнего слова в строке даем большее продление (до 0.45с), 
+                                # так как гласные в конце фраз часто пропеваются очень долго!
+                                extend = min(0.45, gap * 0.6)
+                                words[w_idx]["end"] = round(w_end + extend, 3)
+                        else:
+                            # Если это самое последнее слово всей песни, просто продлим его на 0.5с для красоты
+                            words[w_idx]["end"] = round(w_end + 0.5, 3)
             
-            # Корректируем общие границы строки после изменения слов
-            line_data["start"] = words[0]["start"]
-            line_data["end"] = words[-1]["end"]
+                # Корректируем общие границы строки после изменения слов
+                line_data["start"] = words[0]["start"]
+                line_data["end"] = words[-1]["end"]
 
-        # === АЛГОРИТМ ПРЕДОТВРАЩЕНИЯ ПЕРЕХЛЕСТОВ СТРОК (OVERLAP PREVENTION FILTER) ===
-        # Этот алгоритм жестко устраняет перекрытия между строками, если ИИ Whisper ошибся
-        # и поставил начало новой строки раньше, чем фактически закончилась предыдущая строка!
-        jobs[job_id]["status"] = "Применение фильтра устранения перекрытий строк..."
-        for i in range(1, num_lines):
-            prev_end = lyrics_karaoke[i - 1]["end"]
-            curr_start = lyrics_karaoke[i]["start"]
+            # === АЛГОРИТМ ПРЕДОТВРАЩЕНИЯ ПЕРЕХЛЕСТОВ СТРОК (OVERLAP PREVENTION FILTER) ===
+            # Этот алгоритм жестко устраняет перекрытия между строками, если ИИ Whisper ошибся
+            # и поставил начало новой строки раньше, чем фактически закончилась предыдущая строка!
+            jobs[job_id]["status"] = "Применение фильтра устранения перекрытий строк..."
+            for i in range(1, num_lines):
+                prev_end = lyrics_karaoke[i - 1]["end"]
+                curr_start = lyrics_karaoke[i]["start"]
             
-            # Если следующая строка начинается раньше, чем завершилась предыдущая
-            if curr_start < prev_end + 0.05:
-                corrected_start = prev_end + 0.05
-                lyrics_karaoke[i]["start"] = corrected_start
+                # Если следующая строка начинается раньше, чем завершилась предыдущая
+                if curr_start < prev_end + 0.05:
+                    corrected_start = prev_end + 0.05
+                    lyrics_karaoke[i]["start"] = corrected_start
                 
-                # Корректируем тайминги каждого слова в сползающей строке
-                for w in lyrics_karaoke[i]["words"]:
-                    if w["start"] < corrected_start:
-                        w["start"] = corrected_start
-                    if w["end"] < w["start"]:
-                        w["end"] = w["start"] + 0.1
+                    # Корректируем тайминги каждого слова в сползающей строке
+                    for w in lyrics_karaoke[i]["words"]:
+                        if w["start"] < corrected_start:
+                            w["start"] = corrected_start
+                        if w["end"] < w["start"]:
+                            w["end"] = w["start"] + 0.1
                 
-                # Корректируем общее время окончания текущей строки
-                lyrics_karaoke[i]["end"] = max(lyrics_karaoke[i]["end"], lyrics_karaoke[i]["words"][-1]["end"])
+                    # Корректируем общее время окончания текущей строки
+                    lyrics_karaoke[i]["end"] = max(lyrics_karaoke[i]["end"], lyrics_karaoke[i]["words"][-1]["end"])
 
-        lyrics_karaoke = redistribute_repeated_tail_lines(lyrics_karaoke)
-        # repair_short_lines_with_large_internal_gaps отключена: она переоценивала паузы
-        # (max_gap 2.5s срабатывал на реальных нотах) и сжимала слова к началу строки,
-        # из-за чего подсветка «убегала вперёд». Реальные сбои Whisper ловит valid_word_time.
-        # lyrics_karaoke = repair_short_lines_with_large_internal_gaps(lyrics_karaoke)
+            lyrics_karaoke = redistribute_repeated_tail_lines(lyrics_karaoke)
+            # repair_short_lines_with_large_internal_gaps отключена: она переоценивала паузы
+            # (max_gap 2.5s срабатывал на реальных нотах) и сжимала слова к началу строки,
+            # из-за чего подсветка «убегала вперёд». Реальные сбои Whisper ловит valid_word_time.
+            # lyrics_karaoke = repair_short_lines_with_large_internal_gaps(lyrics_karaoke)
 
         # ДАМП ФИНАЛЬНЫХ ТАЙМИНГОВ для отладки и будущего Rust-рендера.
         # Важно писать его после всех smoothing/overlap фильтров: renderer должен получать
@@ -1606,17 +1628,12 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             current_scroll_y += (target_scroll_y - current_scroll_y) * 0.15
             
             for idx, line_data in enumerate(lyrics_karaoke):
-                if plain_lines:
-                    if idx != active_line_idx:
-                        continue
-                    line_y = y_center
-                else:
-                    line_y = y_center + (idx * line_spacing) - current_scroll_y
-                    if line_y < y_center - line_y_cutoff or line_y > y_center + line_y_cutoff:
-                        continue
+                line_y = y_center + (idx * line_spacing) - current_scroll_y
+                if line_y < y_center - line_y_cutoff or line_y > y_center + line_y_cutoff:
+                    continue
                     
                 dist_from_center = abs(line_y - y_center)
-                weight = 1.0 if plain_lines else max(0.0, min(1.0, 1.0 - (dist_from_center / line_spacing)))
+                weight = max(0.0, min(1.0, 1.0 - (dist_from_center / line_spacing)))
                 
                 is_active = (idx == active_line_idx)
                 cached_line = line_render_cache[idx]
@@ -1638,7 +1655,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                                 filled_part = layer["image"].crop((0, 0, fill_w, line_img_h))
                                 line_img.paste(filled_part, (layer["paste_x"], 0), filled_part)
                 else:
-                    line_img = cached_line["active_plain"] if plain_lines and is_active else cached_line["inactive"]
+                    line_img = cached_line["active_plain"] if is_active else cached_line["inactive"]
                 
                 # Масштабируем холст строки методом субпиксельной интерполяции BILINEAR
                 target_scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max

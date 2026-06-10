@@ -718,9 +718,13 @@ fn write_ass_file(
         let scroll_y = scrolls[frame_idx];
 
         for (idx, metric) in metrics.iter().enumerate() {
-            if (plain_lines || !scrolling) && idx != active_idx {
+            if !scrolling && idx != active_idx {
                 if let Some(ev) = open_base[idx].take() {
-                    let color = if plain_lines { active } else { inactive };
+                    let color = if plain_lines {
+                        if ev.is_active { active } else { inactive }
+                    } else {
+                        inactive
+                    };
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
@@ -729,19 +733,22 @@ fn write_ass_file(
                 continue;
             }
 
-            let line_y = if scrolling && !plain_lines {
+            let line_y = if scrolling {
                 y_center + idx as f32 * line_spacing - scroll_y
             } else {
                 y_center
             };
-            let visible = plain_lines
-                || !scrolling
+            let visible = !scrolling
                 || (line_y >= y_center - line_y_cutoff && line_y <= y_center + line_y_cutoff);
 
             if !visible {
                 // Flush any open events for this line — it left the screen
                 if let Some(ev) = open_base[idx].take() {
-                    let color = if plain_lines { active } else { inactive };
+                    let color = if plain_lines {
+                        if ev.is_active { active } else { inactive }
+                    } else {
+                        inactive
+                    };
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
@@ -751,7 +758,7 @@ fn write_ass_file(
             }
 
             let dist = (line_y - y_center).abs();
-            let weight = if scrolling && !plain_lines {
+            let weight = if scrolling {
                 (1.0 - dist / line_spacing).clamp(0.0, 1.0)
             } else {
                 1.0
@@ -759,21 +766,27 @@ fn write_ass_file(
             let is_display_active = idx == active_idx;
             let is_highlight_live = !plain_lines
                 && (is_display_active || ass_line_highlight_is_live(metric, highlight_t));
+            let is_active_for_event = if plain_lines { is_display_active } else { is_highlight_live };
+
             let target_font_size = min_font_size + (base_font_size - min_font_size) * weight;
             let fit_font_size = base_font_size * (safe_line_w / metric.width).min(1.0);
             let font_size = target_font_size.min(fit_font_size);
             let scale = font_size / base_font_size;
-            let mut opacity = if scrolling && !plain_lines {
+            let mut opacity = if scrolling {
                 (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
             } else {
                 1.0
             };
-            if !plain_lines && !is_highlight_live {
+            if !is_active_for_event {
                 opacity *= 0.5;
             }
             if opacity <= 0.01 {
                 if let Some(ev) = open_base[idx].take() {
-                    let color = if plain_lines { active } else { inactive };
+                    let color = if plain_lines {
+                        if ev.is_active { active } else { inactive }
+                    } else {
+                        inactive
+                    };
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
@@ -790,12 +803,16 @@ fn write_ass_file(
                     (line_y - prev.y).abs() >= POS_THRESH
                         || (font_size - prev.fs).abs() >= FS_THRESH
                         || alpha.abs_diff(prev.alpha) >= ALPHA_THRESH
-                        || is_highlight_live != prev.is_active
+                        || is_active_for_event != prev.is_active
                 }
             };
             if need_new_base {
                 if let Some(ev) = open_base[idx].take() {
-                    let color = if plain_lines { active } else { inactive };
+                    let color = if plain_lines {
+                        if ev.is_active { active } else { inactive }
+                    } else {
+                        inactive
+                    };
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 open_base[idx] = Some(LineEvent {
@@ -803,7 +820,7 @@ fn write_ass_file(
                     y: line_y,
                     fs: font_size,
                     alpha,
-                    is_active: is_highlight_live,
+                    is_active: is_active_for_event,
                     clip_left: 0.0,
                     clip_right: 0.0,
                 });
@@ -1132,22 +1149,21 @@ fn render(config: RenderConfig) -> Result<(), String> {
         };
 
         for (idx, line_cache) in cache.iter().enumerate() {
-            if (config.plain_lines || !config.scrolling) && idx != active_idx {
+            if !config.scrolling && idx != active_idx {
                 continue;
             }
-            let line_y = if config.scrolling && !config.plain_lines {
+            let line_y = if config.scrolling {
                 y_center + idx as f32 * line_spacing - scroll_y
             } else {
                 y_center
             };
             if config.scrolling
-                && !config.plain_lines
                 && (line_y < y_center - line_y_cutoff || line_y > y_center + line_y_cutoff)
             {
                 continue;
             }
             let dist = (line_y - y_center).abs();
-            let weight = if config.scrolling && !config.plain_lines {
+            let weight = if config.scrolling {
                 (1.0 - dist / line_spacing).clamp(0.0, 1.0)
             } else {
                 1.0
@@ -1174,12 +1190,12 @@ fn render(config: RenderConfig) -> Result<(), String> {
             let new_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
             line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
 
-            let mut opacity = if config.scrolling && !config.plain_lines {
+            let mut opacity = if config.scrolling {
                 (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
             } else {
                 1.0
             };
-            if !config.plain_lines && !is_highlight_live {
+            if !is_display_active {
                 opacity *= 0.5;
             }
 
@@ -1267,8 +1283,29 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .take()
         .ok_or_else(|| "Не удалось открыть stdin ffmpeg".to_string())?;
     let mut rgb_frame = Vec::with_capacity(width as usize * height as usize * 3);
+    let mut last_active_idx = None;
+    let mut cached_frame: Option<RgbaImage> = None;
+
     for frame_idx in 0..total_frames {
-        let frame = render_frame(frame_idx, scrolls[frame_idx]);
+        let display_t = frame_idx as f64 / fps - display_delay;
+        let active_idx = if transitions.is_empty() {
+            0
+        } else {
+            active_line(&transitions, display_t)
+        };
+
+        let can_use_cache = config.plain_lines && !config.scrolling;
+        let frame = if can_use_cache && last_active_idx == Some(active_idx) && cached_frame.is_some() {
+            cached_frame.as_ref().unwrap().clone()
+        } else {
+            let rendered = render_frame(frame_idx, scrolls[frame_idx]);
+            if can_use_cache {
+                cached_frame = Some(rendered.clone());
+                last_active_idx = Some(active_idx);
+            }
+            rendered
+        };
+
         frame_to_rgb24(&frame, &mut rgb_frame);
         if let Err(err) = stdin.write_all(&rgb_frame) {
             drop(stdin);

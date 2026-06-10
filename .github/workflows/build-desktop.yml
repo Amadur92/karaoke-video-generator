@@ -116,8 +116,8 @@ jobs:
 
       - name: Install FFmpeg
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-            brew install ffmpeg
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1 || ! ffmpeg -filters | grep -q ' ass '; then
+            brew install ffmpeg || brew link --overwrite ffmpeg
           fi
 
       - name: Build portable macOS folder
