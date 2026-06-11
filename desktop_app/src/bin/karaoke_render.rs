@@ -87,6 +87,7 @@ struct RenderConfig {
     active: Rgba<u8>,
     inactive: Rgba<u8>,
     background: Rgba<u8>,
+    inactive_opacity: f32,
     audio_delay: f64,
     engine: String,
     scrolling: bool,
@@ -141,7 +142,7 @@ fn escape_filter_path(path: &Path) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--audio-delay 0.0] [--plain-lines] [--no-scrolling]"
+        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--inactive-opacity 0.65] [--audio-delay 0.0] [--plain-lines] [--no-scrolling]"
     );
     std::process::exit(2);
 }
@@ -155,6 +156,7 @@ fn parse_args() -> Result<RenderConfig, String> {
     let mut active = parse_color("#000000")?;
     let mut inactive = parse_color("#B4B9C3")?;
     let mut background = parse_color("#FFFFFF")?;
+    let mut inactive_opacity = 0.65_f32;
     let mut audio_delay = 0.0;
     let mut engine = "frames".to_string();
     let mut scrolling = true;
@@ -173,6 +175,12 @@ fn parse_args() -> Result<RenderConfig, String> {
             "--color-active" => active = parse_color(&value()?)?,
             "--color-inactive" => inactive = parse_color(&value()?)?,
             "--color-bg" => background = parse_color(&value()?)?,
+            "--inactive-opacity" => {
+                inactive_opacity = value()?
+                    .parse::<f32>()
+                    .map_err(|e| format!("Некорректный inactive-opacity: {e}"))?
+                    .clamp(0.2, 1.0)
+            }
             "--engine" => engine = value()?,
             "--plain-lines" => plain_lines = true,
             "--no-scrolling" => scrolling = false,
@@ -203,6 +211,7 @@ fn parse_args() -> Result<RenderConfig, String> {
         active,
         inactive,
         background,
+        inactive_opacity,
         audio_delay,
         engine,
         scrolling,
@@ -605,6 +614,7 @@ fn write_ass_file(
     height: u32,
     active: Rgba<u8>,
     inactive: Rgba<u8>,
+    inactive_opacity: f32,
     display_delay: f64,
     highlight_delay: f64,
     event_fps: f64,
@@ -791,7 +801,7 @@ fn write_ass_file(
                 1.0
             };
             if !is_active_for_event {
-                opacity *= 0.5;
+                opacity *= inactive_opacity;
             }
             if opacity <= 0.01 {
                 if let Some(ev) = open_base[idx].take() {
@@ -927,6 +937,7 @@ fn render_ass(
         height,
         config.active,
         config.inactive,
+        config.inactive_opacity,
         display_delay,
         highlight_delay,
         event_fps,
@@ -1208,7 +1219,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 1.0
             };
             if !is_display_active {
-                opacity *= 0.5;
+                opacity *= config.inactive_opacity;
             }
 
             let x = width as i32 / 2 - new_w as i32 / 2;

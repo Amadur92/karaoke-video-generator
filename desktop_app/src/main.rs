@@ -514,6 +514,7 @@ struct AppSettings {
     color_active: [u8; 3],
     color_inactive: [u8; 3],
     color_bg: [u8; 3],
+    inactive_opacity: f32,
     audio_delay_ms: i32,
     fade_in_ms: i32,
     fade_out_ms: i32,
@@ -532,6 +533,7 @@ impl Default for AppSettings {
             color_active: [0, 0, 0],
             color_inactive: [180, 185, 195],
             color_bg: [255, 255, 255],
+            inactive_opacity: 0.65,
             audio_delay_ms: 0,
             fade_in_ms: 0,
             fade_out_ms: 0,
@@ -596,6 +598,7 @@ struct KaraokeApp {
     color_active: [u8; 3],
     color_inactive: [u8; 3],
     color_bg: [u8; 3],
+    inactive_opacity: f32,
 
     // Сдвиг аудио (мс)
     audio_delay_ms: i32,
@@ -701,6 +704,7 @@ impl KaraokeApp {
             color_active: settings.color_active,
             color_inactive: settings.color_inactive,
             color_bg: settings.color_bg,
+            inactive_opacity: settings.inactive_opacity.clamp(0.2, 1.0),
             audio_delay_ms: settings.audio_delay_ms,
             is_generating: false,
             progress: 0.0,
@@ -1485,6 +1489,7 @@ impl KaraokeApp {
         let active_color = self.color_active;
         let inactive_color = self.color_inactive;
         let bg_color = self.color_bg;
+        let inactive_opacity = self.inactive_opacity.clamp(0.2, 1.0);
         let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
         let fade_in_ms = self.fade_in_ms;
         let fade_out_ms = self.fade_out_ms;
@@ -1778,6 +1783,8 @@ impl KaraokeApp {
                         .arg(&inactive_hex)
                         .arg("--color-bg")
                         .arg(&bg_hex)
+                        .arg("--inactive-opacity")
+                        .arg(inactive_opacity.to_string())
                         .arg("--engine")
                         .arg(
                             std::env::var("KARAOKE_RENDER_ENGINE")
@@ -1901,6 +1908,7 @@ impl eframe::App for KaraokeApp {
             color_active: self.color_active,
             color_inactive: self.color_inactive,
             color_bg: self.color_bg,
+            inactive_opacity: self.inactive_opacity,
             audio_delay_ms: self.audio_delay_ms,
             fade_in_ms: self.fade_in_ms,
             fade_out_ms: self.fade_out_ms,
@@ -2356,6 +2364,16 @@ impl eframe::App for KaraokeApp {
                                     });
                                     ui.add_space(14.0);
 
+                                    ui.label(egui::RichText::new("Прозрачность соседних строк").color(muted));
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            egui::vec2(ui.available_width() - 90.0, 20.0),
+                                            egui::Slider::new(&mut self.inactive_opacity, 0.2..=1.0).show_value(false)
+                                        );
+                                        ui.label(egui::RichText::new(format!("{}%", (self.inactive_opacity * 100.0).round() as i32)).strong().color(accent));
+                                    });
+                                    ui.add_space(14.0);
+
                                     ui.label(egui::RichText::new("Сдвиг синхронизации").color(muted));
                                     ui.horizontal(|ui| {
                                         ui.add_sized(
@@ -2773,6 +2791,7 @@ impl eframe::App for KaraokeApp {
             color_active: self.color_active,
             color_inactive: self.color_inactive,
             color_bg: self.color_bg,
+            inactive_opacity: self.inactive_opacity,
             audio_delay_ms: self.audio_delay_ms,
             fade_in_ms: self.fade_in_ms,
             fade_out_ms: self.fade_out_ms,
