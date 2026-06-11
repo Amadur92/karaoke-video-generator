@@ -21,6 +21,7 @@ mkdir -p "$OUT_DIR"
   --distpath "$OUT_DIR/dist" \
   --workpath "$OUT_DIR/build" \
   --specpath "$OUT_DIR" \
+  --collect-all numpy \
   --collect-data whisper \
   --add-data "$ROOT_DIR/desktop_app/assets/Montserrat-Regular.ttf:." \
   --add-data "$ROOT_DIR/desktop_app/assets/Montserrat-Bold.ttf:." \

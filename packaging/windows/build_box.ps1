@@ -34,6 +34,7 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     --distpath (Join-Path $BuildDir "dist") `
     --workpath (Join-Path $BuildDir "build") `
     --specpath $BuildDir `
+    --collect-all numpy `
     --collect-data whisper `
     --add-data "$Root\desktop_app\assets\Montserrat-Regular.ttf;." `
     --add-data "$Root\desktop_app\assets\Montserrat-Bold.ttf;." `
