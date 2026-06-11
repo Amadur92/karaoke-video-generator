@@ -76,6 +76,8 @@ jobs:
     name: Build macOS portable box (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    env:
+      HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
     strategy:
       matrix:
         include:
