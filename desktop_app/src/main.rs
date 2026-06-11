@@ -505,6 +505,42 @@ fn upload_dir() -> PathBuf {
     uploads
 }
 
+fn file_extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    matches!(file_extension_lower(path).as_deref(), Some("mp3"))
+}
+
+fn is_lyrics_file(path: &Path) -> bool {
+    matches!(file_extension_lower(path).as_deref(), Some("txt" | "lrc"))
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
+fn read_lyrics_file(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "Не удалось прочитать файл текста {}: {}",
+            display_file_name(path),
+            err
+        )
+    })?;
+
+    Ok(text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n"))
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 struct AppSettings {
@@ -1069,6 +1105,46 @@ impl KaraokeApp {
             });
             ctx.request_repaint();
         });
+    }
+
+    fn set_lyrics_file(&mut self, path: PathBuf) {
+        match read_lyrics_file(&path) {
+            Ok(lyrics) => {
+                let file_name = display_file_name(&path);
+                let line_count = lyrics
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count();
+                self.lyrics = lyrics;
+                self.status_text = format!("Текст загружен: {}", file_name);
+                self.log_output.push_str(&format!(
+                    "📄 Загружен текст: {} ({} строк)\n",
+                    file_name, line_count
+                ));
+            }
+            Err(err) => {
+                self.status_text = "Не удалось загрузить текст".to_string();
+                self.log_output.push_str(&format!("❌ {}\n", err));
+            }
+        }
+    }
+
+    fn handle_dropped_file(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.is_generating {
+            return;
+        }
+
+        if is_audio_file(&path) {
+            self.set_audio_file(path, ctx);
+        } else if is_lyrics_file(&path) {
+            self.set_lyrics_file(path);
+        } else {
+            self.status_text = "Файл не поддерживается".to_string();
+            self.log_output.push_str(&format!(
+                "⚠️ Файл {} не принят. Можно перетащить .mp3, .txt или .lrc.\n",
+                display_file_name(&path)
+            ));
+        }
     }
 
     fn clamped_trim_bounds(&self) -> Option<(i64, i64)> {
@@ -2028,19 +2104,17 @@ impl eframe::App for KaraokeApp {
             }
         }
 
-        // Поддержка Drag-and-Drop аудиофайла прямо на окно приложения
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(file) = i.raw.dropped_files.first() {
-                    if let Some(path) = &file.path {
-                        let path_str = path.to_string_lossy().to_string();
-                        if path_str.ends_with(".mp3") {
-                            self.set_audio_file(path.clone(), ctx);
-                        }
-                    }
-                }
-            }
+        // Drag-and-drop файлов прямо на окно приложения: аудио и текст песни.
+        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
         });
+        for path in dropped_paths {
+            self.handle_dropped_file(path, ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.max_rect();
@@ -2410,7 +2484,7 @@ impl eframe::App for KaraokeApp {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
                                             ui.label(egui::RichText::new("Текст песни").strong().size(16.0).color(text));
-                                            ui.label(egui::RichText::new("Каждая строка помогает алгоритму точнее собрать фразы").size(12.0).color(muted));
+                                            ui.label(egui::RichText::new("Вставьте текст или перетащите сюда .txt/.lrc файл").size(12.0).color(muted));
                                         });
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             let lines = self.lyrics.lines().filter(|line| !line.trim().is_empty()).count();
@@ -2420,10 +2494,33 @@ impl eframe::App for KaraokeApp {
                                     ui.add_space(8.0);
 
                                     ui.add(egui::TextEdit::multiline(&mut self.lyrics)
-                                        .hint_text("Вставьте текст песни построчно...")
+                                        .hint_text("Вставьте текст песни построчно или перетащите .txt/.lrc файл...")
                                         .desired_width(ui.available_width())
                                         .desired_rows(16)
                                         .font(egui::TextStyle::Monospace));
+
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !self.is_generating,
+                                                egui::Button::new(
+                                                    egui::RichText::new("Загрузить .txt/.lrc")
+                                                        .size(12.0)
+                                                        .strong(),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("Текст песни", &["txt", "lrc"])
+                                                .pick_file()
+                                            {
+                                                self.set_lyrics_file(path);
+                                            }
+                                        }
+                                        ui.label(egui::RichText::new("LRC с таймкодами тоже поддерживается.").size(11.0).color(muted));
+                                    });
                                 });
                                 ui.add_space(12.0);
 
