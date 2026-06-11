@@ -386,15 +386,50 @@ def repair_stretched_short_lines(lyrics_karaoke):
 
     return repaired
 
-def lead_vocalization_lines(lyrics_karaoke, lead_seconds=1.55):
-    vocalization_re = re.compile(r'^(?:на|na|ла|la|да|da|о|oh|а|ah)(?:[-–—]+(?:на|na|ла|la|да|da|о|oh|а|ah))*$', re.IGNORECASE)
+VOCALIZATION_SYLLABLES = (
+    "на", "ла", "ля", "да", "ра",
+    "na", "la", "lya", "da", "ra",
+)
+OPEN_VOCALIZATION_SYLLABLES = ("а", "о", "ah", "oh")
+
+def split_vocalization_syllables(value):
+    text = (value or "").strip().lower()
+    if not text:
+        return []
+
+    text_key = re.sub(r'[^a-zа-яё]+', '', text)
+    if not text_key:
+        return []
+
+    syllables = sorted(
+        VOCALIZATION_SYLLABLES + OPEN_VOCALIZATION_SYLLABLES,
+        key=len,
+        reverse=True,
+    )
+    parts = []
+    pos = 0
+    while pos < len(text_key):
+        match = next((item for item in syllables if text_key.startswith(item, pos)), None)
+        if match is None:
+            return []
+        parts.append(match)
+        pos += len(match)
+    return parts
+
+def is_vocalization_text(value):
+    parts = split_vocalization_syllables(value)
+    if len(parts) < 3:
+        return False
+    if all(part in OPEN_VOCALIZATION_SYLLABLES for part in parts):
+        return True
+    return sum(part in VOCALIZATION_SYLLABLES for part in parts) >= 3
+
+def lead_vocalization_lines(lyrics_karaoke, lead_seconds=1.35):
     repaired = []
     for line in lyrics_karaoke:
         words = line.get("words") or []
-        text_key = re.sub(r'[^a-zа-яё]+', '', (line.get("text", "") or "").lower())
-        has_many_repeats = len(re.findall(r'(?:на|na|ла|la|да|da)', text_key)) >= 3
-        is_vocalization = has_many_repeats or (
-            words and all(vocalization_re.match((w.get("word", "") or "").strip()) for w in words)
+        is_vocalization = is_vocalization_text(line.get("text", "")) or (
+            words and all(is_vocalization_text((w.get("word", "") or "").strip()) for w in words)
         )
 
         if not is_vocalization:
@@ -1768,6 +1803,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
 
         visual_lag = float(os.environ.get("KARAOKE_VISUAL_LAG_SECONDS", "0.25") or 0.25)
         visual_lag = max(0.0, min(2.0, visual_lag))
+        scroll_alpha = float(os.environ.get("KARAOKE_SCROLL_SMOOTHING", "0.065") or 0.065)
+        scroll_alpha = max(0.01, min(0.25, scroll_alpha))
         for frame_idx in range(total_frames):
             display_t = frame_idx / fps - audio_delay
             highlight_t = frame_idx / fps - audio_delay - visual_lag
@@ -1781,7 +1818,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 active_line_idx = max(0, min(len(lyrics_karaoke) - 1, bisect.bisect_right(transition_times, display_t) - 1))
 
             target_scroll_y = active_line_idx * line_spacing
-            current_scroll_y += (target_scroll_y - current_scroll_y) * 0.15
+            current_scroll_y += (target_scroll_y - current_scroll_y) * scroll_alpha
             
             for idx, line_data in enumerate(lyrics_karaoke):
                 line_y = y_center + (idx * line_spacing) - current_scroll_y

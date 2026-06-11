@@ -505,6 +505,11 @@ fn scroll_positions(
 ) -> Vec<f32> {
     let mut positions = Vec::with_capacity(total_frames);
     let mut scroll_y = 0.0_f32;
+    let scroll_alpha = std::env::var("KARAOKE_SCROLL_SMOOTHING")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.065)
+        .clamp(0.01, 0.25);
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / fps - audio_delay;
         let active_idx = if transitions.is_empty() {
@@ -513,7 +518,7 @@ fn scroll_positions(
             active_line(transitions, t)
         };
         let target_scroll_y = active_idx as f32 * line_spacing;
-        scroll_y += (target_scroll_y - scroll_y) * 0.15;
+        scroll_y += (target_scroll_y - scroll_y) * scroll_alpha;
         positions.push(scroll_y);
     }
     positions
