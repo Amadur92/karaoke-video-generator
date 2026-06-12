@@ -1782,7 +1782,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         
         font_path_reg = get_system_font(font_name=font_family, bold=False)
         font_path_bold = get_system_font(font_name=font_family, bold=True)
-        font_path_black = get_system_font(font_name=font_family, bold=True, black=True)
+        font_path_black = font_path_bold
 
         clean_filename = f"{artist} - {title} (karaoke).mp4".replace("/", "_").replace("\\", "_")
         output_mp4_path = os.path.join(EXPORT_FOLDER, clean_filename)
@@ -1848,7 +1848,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             resampling_filter = Image.BILINEAR
 
         font_max_bold = get_font_at_size(style='bold', size=font_size_max)
-        font_max_black = get_font_at_size(style='black', size=font_size_max)
+        font_max_black = font_max_bold
         word_pad = int(20 * size_scale)
         word_active_offset = int(10 * size_scale)
         line_pad_x = int(40 * size_scale)
@@ -1864,10 +1864,9 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             total_w_bold = sum(widths_bold) + space_w_bold * max(0, len(words) - 1)
             line_img_w_bold = max(1, total_w_bold + line_pad_x)
             
-            # Black metrics for active
-            widths_black, space_w_black = get_word_widths(words, font_max_black)
-            total_w_black = sum(widths_black) + space_w_black * max(0, len(words) - 1)
-            line_img_w_black = max(1, total_w_black + line_pad_x)
+            widths_black = widths_bold
+            space_w_black = space_w_bold
+            line_img_w_black = line_img_w_bold
             
             inactive_img = Image.new("RGBA", (line_img_w_bold, line_img_h), (0, 0, 0, 0))
             active_inactive_base_img = Image.new("RGBA", (line_img_w_black, line_img_h), (0, 0, 0, 0))
@@ -1964,7 +1963,12 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 
                 # Масштабируем холст строки методом субпиксельной интерполяции BILINEAR
                 target_scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max
-                fit_scale = min(1.0, safe_line_w / max(1, cached_line["width"]))
+                cached_width = max(
+                    cached_line.get("width_active", 0),
+                    cached_line.get("width_inactive", 0),
+                    cached_line.get("width", 0),
+                )
+                fit_scale = min(1.0, safe_line_w / max(1, cached_width))
                 scale = min(target_scale, fit_scale)
                 
                 # Применяем плавное изменение прозрачности в зависимости от положения на экране

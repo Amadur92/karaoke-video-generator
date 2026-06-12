@@ -12,7 +12,6 @@ use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../../assets/Montserrat-Bold.ttf");
-const MONTSERRAT_BLACK: &[u8] = include_bytes!("../../assets/Montserrat-Black.ttf");
 const ASS_BASE_FONT_SIZE: f32 = 52.0;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -348,7 +347,6 @@ fn frame_to_rgb24(frame: &RgbaImage, out: &mut Vec<u8>) {
 fn build_line_cache(
     lines: &[KaraokeLine],
     font_bold: &FontArc,
-    font_black: &FontArc,
     font_size: f32,
     line_height: u32,
     y_draw: i32,
@@ -366,12 +364,10 @@ fn build_line_cache(
     let line_pad_x = (40.0 * render_scale).round() as u32;
     let line_text_x = (20.0 * render_scale).round() as i32;
     let space_w_bold = text_width(font_bold, render_font_size, " ");
-    let space_w_black = text_width(font_black, render_font_size, " ");
 
     lines
         .iter()
         .map(|line| {
-            // Метрики для Bold
             let widths_bold: Vec<f32> = line
                 .words
                 .iter()
@@ -382,19 +378,6 @@ fn build_line_cache(
             let line_w_bold = (total_w_bold.ceil() as u32 + line_pad_x).max(1);
             let base_line_w_bold = (line_w_bold as f32 / text_supersample).round().max(1.0) as u32;
 
-            // Метрики для Black
-            let widths_black: Vec<f32> = line
-                .words
-                .iter()
-                .map(|word| text_width(font_black, render_font_size, &word.word))
-                .collect();
-            let total_w_black = widths_black.iter().sum::<f32>()
-                + space_w_black * line.words.len().saturating_sub(1) as f32;
-            let line_w_black = (total_w_black.ceil() as u32 + line_pad_x).max(1);
-            let base_line_w_black =
-                (line_w_black as f32 / text_supersample).round().max(1.0) as u32;
-
-            // Рисуем неактивную строку (Bold)
             let mut inactive_img =
                 ImageBuffer::from_pixel(line_w_bold, render_line_height, Rgba([0, 0, 0, 0]));
             let mut x_bold = line_text_x;
@@ -411,34 +394,33 @@ fn build_line_cache(
                 x_bold += (widths_bold[idx] + space_w_bold).round() as i32;
             }
 
-            // Рисуем активную строку (Black) и ее слова
             let mut active_plain_img =
-                ImageBuffer::from_pixel(line_w_black, render_line_height, Rgba([0, 0, 0, 0]));
+                ImageBuffer::from_pixel(line_w_bold, render_line_height, Rgba([0, 0, 0, 0]));
             let mut active_inactive_base_img =
-                ImageBuffer::from_pixel(line_w_black, render_line_height, Rgba([0, 0, 0, 0]));
-            let mut x_black = line_text_x;
+                ImageBuffer::from_pixel(line_w_bold, render_line_height, Rgba([0, 0, 0, 0]));
+            let mut x_active = line_text_x;
             let mut layers = Vec::with_capacity(line.words.len());
             for (idx, word) in line.words.iter().enumerate() {
                 draw_text_mut(
                     &mut active_plain_img,
                     active,
-                    x_black,
+                    x_active,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font_black,
+                    font_bold,
                     &word.word,
                 );
                 draw_text_mut(
                     &mut active_inactive_base_img,
                     inactive,
-                    x_black,
+                    x_active,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font_black,
+                    font_bold,
                     &word.word,
                 );
 
-                let word_w = widths_black[idx].ceil() as u32;
+                let word_w = widths_bold[idx].ceil() as u32;
                 let mut active_img = ImageBuffer::from_pixel(
                     word_w + word_pad,
                     render_line_height,
@@ -450,7 +432,7 @@ fn build_line_cache(
                     word_active_offset,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font_black,
+                    font_bold,
                     &word.word,
                 );
 
@@ -466,7 +448,7 @@ fn build_line_cache(
                 layers.push(WordLayer {
                     start: word.start,
                     end: word.end,
-                    paste_x: ((x_black - word_active_offset) as f32 / text_supersample).round()
+                    paste_x: ((x_active - word_active_offset) as f32 / text_supersample).round()
                         as i32,
                     fill_width: ((word_active_offset.max(0) as f32 + word_w as f32)
                         / text_supersample)
@@ -474,7 +456,7 @@ fn build_line_cache(
                         .max(1.0) as u32,
                     image: base_active_img,
                 });
-                x_black += (widths_black[idx] + space_w_black).round() as i32;
+                x_active += (widths_bold[idx] + space_w_bold).round() as i32;
             }
 
             let base_inactive_img = imageops::resize(
@@ -485,13 +467,13 @@ fn build_line_cache(
             );
             let base_active_inactive_base_img = imageops::resize(
                 &active_inactive_base_img,
-                base_line_w_black,
+                base_line_w_bold,
                 line_height,
                 imageops::FilterType::Lanczos3,
             );
             let base_active_plain_img = imageops::resize(
                 &active_plain_img,
-                base_line_w_black,
+                base_line_w_bold,
                 line_height,
                 imageops::FilterType::Lanczos3,
             );
@@ -503,7 +485,7 @@ fn build_line_cache(
                 words: layers,
                 width_inactive: base_line_w_bold,
                 height_inactive: line_height,
-                width_active: base_line_w_black,
+                width_active: base_line_w_bold,
                 height_active: line_height,
             }
         })
@@ -685,7 +667,7 @@ fn write_ass_file(
         ass_color(inactive, 255)
     ));
     ass.push_str(&format!(
-        "Style: DynamicActive,Montserrat Black,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        "Style: DynamicActive,Montserrat,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
         ASS_BASE_FONT_SIZE * size_scale,
         ass_color(active, 0),
         ass_color(active, 0),
@@ -697,8 +679,8 @@ fn write_ass_file(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
     );
 
-    let font_black = FontArc::try_from_slice(MONTSERRAT_BLACK)
-        .map_err(|_| "Не удалось загрузить Montserrat Black".to_string())?;
+    let font_bold = FontArc::try_from_slice(MONTSERRAT_BOLD)
+        .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
     let base_font_size = ASS_BASE_FONT_SIZE * size_scale;
     let min_font_size = base_font_size * (26.0 / 42.0);
     let line_spacing = 62.0_f32 * size_scale;
@@ -706,7 +688,7 @@ fn write_ass_file(
     let line_y_cutoff = 110.0_f32 * size_scale;
     let dist_cutoff = 95.0_f32 * size_scale;
     let safe_line_w = safe_text_width(width, size_scale);
-    let metrics = build_ass_metrics(lines, &font_black, base_font_size);
+    let metrics = build_ass_metrics(lines, &font_bold, base_font_size);
     let total_frames = (duration * event_fps).ceil() as usize;
     let scrolls = scroll_positions(
         transitions,
@@ -722,7 +704,7 @@ fn write_ass_file(
     // change by more than a sub-pixel threshold. This reduces events by 10-30x
     // while keeping pixel-identical output.
 
-    // Sub-pixel thresholds — changes below these are invisible
+    // Sub-pixel thresholds — changes below these are invisible.
     const POS_THRESH: f32 = 0.5; // position: ±0.5px
     const FS_THRESH: f32 = 0.3; // font size: ±0.3px
     const ALPHA_THRESH: u8 = 1; // alpha: ±1/255
@@ -1199,8 +1181,6 @@ fn render(config: RenderConfig) -> Result<(), String> {
 
     let font_bold = FontArc::try_from_slice(MONTSERRAT_BOLD)
         .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
-    let font_black = FontArc::try_from_slice(MONTSERRAT_BLACK)
-        .map_err(|_| "Не удалось загрузить Montserrat Black".to_string())?;
     let text_supersample = 3.0_f32;
     // Pillow/FreeType and ab_glyph expose slightly different perceived pixel sizes.
     // This compensation keeps Montserrat visually aligned with the legacy renderer.
@@ -1208,7 +1188,6 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let cache = build_line_cache(
         &lines,
         &font_bold,
-        &font_black,
         render_font_size_max,
         line_h,
         y_draw,
@@ -1266,6 +1245,12 @@ fn render(config: RenderConfig) -> Result<(), String> {
 
             let mut line_img = if config.plain_lines && is_display_active {
                 line_cache.active_plain.clone()
+            } else if is_display_active {
+                let mut img = line_cache.active_inactive_base.clone();
+                if is_highlight_live {
+                    paint_line_highlight(&mut img, &line_cache.words, highlight_t);
+                }
+                img
             } else if is_highlight_live {
                 let mut img = line_cache.active_inactive_base.clone();
                 paint_line_highlight(&mut img, &line_cache.words, highlight_t);
@@ -1274,7 +1259,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 line_cache.inactive.clone()
             };
 
-            let (lc_width, lc_height) = if is_display_active {
+            let (lc_width, lc_height) = if is_display_active || is_highlight_live {
                 (line_cache.width_active, line_cache.height_active)
             } else {
                 (line_cache.width_inactive, line_cache.height_inactive)
