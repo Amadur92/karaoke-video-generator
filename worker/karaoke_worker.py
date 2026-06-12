@@ -129,6 +129,14 @@ def parse_timestamped_lyrics(lyrics):
         return None
     return sorted(entries, key=lambda item: item["time"])
 
+def strip_lrc_timestamps(lyrics):
+    cleaned_lines = []
+    for raw_line in (lyrics or '').splitlines():
+        line = replace_special_spaces(raw_line)
+        line = re.sub(r'\[[0-9]{1,2}:[0-9]{2}(?:[.:][0-9]{1,3})?\]', '', line).strip()
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
 def estimate_line_duration(words, available):
     if not words:
         return 0.0
@@ -739,6 +747,63 @@ def build_karaoke_from_timestamped_lyrics(lyrics, audio_duration=None):
             })
     return lyrics_karaoke
 
+def timestamped_matches_whisper_probe(timestamped_karaoke, whisper_words, avg_limit=0.35, max_limit=0.65):
+    if not timestamped_karaoke or not whisper_words:
+        return False, "нет данных для сравнения"
+
+    lrc_words = []
+    for line in timestamped_karaoke:
+        for word in line.get("words", []) or []:
+            clean = clean_word(word.get("word", ""))
+            if clean:
+                lrc_words.append((clean, float(line.get("start", word.get("start", 0.0)))))
+                break
+        if len(lrc_words) >= 8:
+            break
+
+    whisper_probe = []
+    for word in whisper_words[:45]:
+        clean = clean_word(getattr(word, "word", "") or "")
+        if clean and hasattr(word, "start"):
+            try:
+                whisper_probe.append((clean, float(word.start)))
+            except Exception:
+                pass
+        if len(whisper_probe) >= 18:
+            break
+
+    if not lrc_words or not whisper_probe:
+        return False, "нет первых слов для сравнения"
+
+    diffs = []
+    signed_diffs = []
+    whisper_idx = 0
+    for lrc_word, lrc_start in lrc_words:
+        matched = False
+        for probe_idx in range(whisper_idx, min(whisper_idx + 8, len(whisper_probe))):
+            whisper_word, whisper_start = whisper_probe[probe_idx]
+            if fuzzy_word_match(lrc_word, whisper_word):
+                signed = lrc_start - whisper_start
+                signed_diffs.append(signed)
+                diffs.append(abs(signed))
+                whisper_idx = probe_idx + 1
+                matched = True
+                break
+        if len(diffs) >= 5:
+            break
+        if not matched and diffs:
+            break
+
+    if len(diffs) < 3:
+        return False, "первые слова не совпали по тексту"
+
+    avg_diff = sum(diffs) / len(diffs)
+    max_seen = max(diffs)
+    avg_signed = sum(signed_diffs) / len(signed_diffs)
+    ok = avg_diff <= avg_limit and max_seen <= max_limit
+    direction = "LRC раньше Whisper" if avg_signed < -0.05 else "LRC позже Whisper" if avg_signed > 0.05 else "без сдвига"
+    return ok, f"совпало {len(diffs)} первых строк, среднее {avg_diff:.2f}с, максимум {max_seen:.2f}с, сдвиг {avg_signed:+.2f}с ({direction})"
+
 def infer_lyrics_language(text):
     return 'ru' if re.search(r'[А-Яа-яЁё]', text or '') else 'en'
 
@@ -1166,7 +1231,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         lyrics = normalize_lyrics_text(lyrics)
         artist = replace_special_spaces(artist)
         title = replace_special_spaces(title)
-        lyrics_language = infer_lyrics_language(lyrics)
+        lyrics_language = infer_lyrics_language(strip_lrc_timestamps(lyrics) or lyrics)
 
         timestamped_karaoke = None
         try:
@@ -1178,7 +1243,10 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         except Exception:
             timestamped_karaoke = None
 
-        if timestamped_karaoke:
+        probe_timestamped_with_whisper = bool(timestamped_karaoke and timings_only)
+        alignment_lyrics = strip_lrc_timestamps(lyrics) if timestamped_karaoke else lyrics
+
+        if timestamped_karaoke and not probe_timestamped_with_whisper:
             lyrics_karaoke = timestamped_karaoke
             jobs[job_id]["status"] = "✅ Использована точная разметка из текста. Тайминги подготовлены."
             try:
@@ -1210,7 +1278,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         model_name,
                         status_callback=lambda message: jobs[job_id].update({"status": message}),
                         language=lyrics_language,
-                        lyrics_text=lyrics,
+                        lyrics_text=alignment_lyrics,
                     )
                     vocal_start = max(0.0, float(detected.get('vocal_start') or 0.0))
                     if vocal_start >= 0.5:
@@ -1226,7 +1294,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             jobs[job_id]["progress"] = 0.2
 
             # Пре-считаем строки и длительность — нужны для решения о чанках
-            _align_raw_lines = lyrics.split('\n')
+            _align_raw_lines = alignment_lyrics.split('\n')
             _align_non_empty = [l.strip() for l in _align_raw_lines if l.strip()]
             # Получаем длительность аудио заранее (нужна и для чанков, и для интерполяции)
             audio_duration = 120.0
@@ -1266,7 +1334,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
                 result = model.align(
                     align_audio_path,
-                    lyrics,
+                    alignment_lyrics,
                     language=lyrics_language,
                     original_split=True,
                     max_word_dur=2.0,
@@ -1381,7 +1449,29 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             num_whisper_words = len(whisper_words)
             jobs[job_id]["status"] = f"Обработано {num_whisper_words} слов (интерполировано: {interpolated_count})"
 
-            raw_lines = lyrics.split('\n')
+            if timestamped_karaoke:
+                lrc_is_close, lrc_probe_reason = timestamped_matches_whisper_probe(
+                    timestamped_karaoke,
+                    whisper_words,
+                )
+                if lrc_is_close:
+                    lyrics_karaoke = timestamped_karaoke
+                    jobs[job_id]["status"] = f"✅ LRC совпал с Whisper: {lrc_probe_reason}. Используем тайминги из текста."
+                    try:
+                        final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
+                        with open(final_dump_path, 'w', encoding='utf-8') as f:
+                            json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
+                        jobs[job_id]["timings_file"] = final_dump_path
+                    except Exception:
+                        pass
+                    if timings_only:
+                        jobs[job_id]["progress"] = 1.0
+                        jobs[job_id]["done"] = True
+                        return
+                else:
+                    jobs[job_id]["status"] = f"⚠️ LRC не совпал с Whisper: {lrc_probe_reason}. Используем тайминги Whisper."
+
+            raw_lines = alignment_lyrics.split('\n')
             lyrics_karaoke = []
             whisper_idx = 0
             LOOKAHEAD = 5
