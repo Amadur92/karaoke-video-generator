@@ -4373,14 +4373,14 @@ impl eframe::App for KaraokeApp {
                                         ui.add_space(20.0);
                                         ui.label("Лимит поиска:");
                                         ui.add(egui::Slider::new(&mut self.dl_limit_candidates, 1..=10));
-
-                                        ui.add_space(20.0);
-                                        ui.label("Потоков:");
-                                        ui.add(egui::Slider::new(&mut self.dl_max_workers, 1..=5));
                                     });
                                     ui.add_space(8.0);
 
                                     ui.horizontal(|ui| {
+                                        ui.label("Потоков:");
+                                        ui.add(egui::Slider::new(&mut self.dl_max_workers, 1..=5));
+
+                                        ui.add_space(20.0);
                                         ui.checkbox(&mut self.dl_overwrite, "Перезаписывать существующие файлы");
                                     });
                                     ui.add_space(16.0);
