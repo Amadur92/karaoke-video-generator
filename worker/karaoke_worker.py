@@ -809,6 +809,7 @@ def infer_lyrics_language(text):
 
 def get_system_font(font_name='montserrat', bold=False, black=False):
     font_name = font_name.lower().strip()
+    black = False
     base_dir = os.path.dirname(os.path.abspath(__file__))
     repo_dir = os.path.dirname(base_dir)
     font_search_dirs = (
@@ -821,10 +822,7 @@ def get_system_font(font_name='montserrat', bold=False, black=False):
     
     # 1. Montserrat
     if font_name == 'montserrat':
-        if black:
-            font_file = "Montserrat-Black.ttf"
-        else:
-            font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
+        font_file = "Montserrat-Bold.ttf" if bold or black else "Montserrat-Regular.ttf"
         for search_dir in font_search_dirs:
             montserrat_path = os.path.join(search_dir, font_file)
             if os.path.exists(montserrat_path):
@@ -867,10 +865,7 @@ def get_system_font(font_name='montserrat', bold=False, black=False):
                 if os.path.exists(p): return p
                 
     # Default fallback to Montserrat
-    if black:
-        font_file = "Montserrat-Black.ttf"
-    else:
-        font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
+    font_file = "Montserrat-Bold.ttf" if bold or black else "Montserrat-Regular.ttf"
     for search_dir in font_search_dirs:
         montserrat_path = os.path.join(search_dir, font_file)
         if os.path.exists(montserrat_path):
@@ -1819,6 +1814,11 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             **subprocess_no_window_kwargs()
         )
 
+        transition_duration = 0.80
+        transition_total_frames = max(1, int(round(transition_duration * fps)))
+        last_target_y = 0.0
+        transition_start_y = 0.0
+        transition_frame = transition_total_frames
         current_scroll_y = 0.0
 
         font_cache = {}
@@ -1848,7 +1848,6 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             resampling_filter = Image.BILINEAR
 
         font_max_bold = get_font_at_size(style='bold', size=font_size_max)
-        font_max_black = font_max_bold
         word_pad = int(20 * size_scale)
         word_active_offset = int(10 * size_scale)
         line_pad_x = int(40 * size_scale)
@@ -1859,58 +1858,40 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         for line_data in lyrics_karaoke:
             words = line_data["words"]
             
-            # Bold metrics for inactive
             widths_bold, space_w_bold = get_word_widths(words, font_max_bold)
             total_w_bold = sum(widths_bold) + space_w_bold * max(0, len(words) - 1)
             line_img_w_bold = max(1, total_w_bold + line_pad_x)
             
-            widths_black = widths_bold
-            space_w_black = space_w_bold
-            line_img_w_black = line_img_w_bold
-            
             inactive_img = Image.new("RGBA", (line_img_w_bold, line_img_h), (0, 0, 0, 0))
-            active_inactive_base_img = Image.new("RGBA", (line_img_w_black, line_img_h), (0, 0, 0, 0))
-            active_plain_img = Image.new("RGBA", (line_img_w_black, line_img_h), (0, 0, 0, 0))
+            active_plain_img = Image.new("RGBA", (line_img_w_bold, line_img_h), (0, 0, 0, 0))
             inactive_draw = ImageDraw.Draw(inactive_img)
-            active_inactive_base_draw = ImageDraw.Draw(active_inactive_base_img)
             active_plain_draw = ImageDraw.Draw(active_plain_img)
 
-            # Draw inactive (Bold)
             x_draw_bold = line_text_x
+            word_layers = []
             for w_idx, w_data in enumerate(words):
                 word = w_data["word"]
                 word_w_bold = widths_bold[w_idx]
                 inactive_draw.text((x_draw_bold, y_draw), word, fill=rgba_inactive, font=font_max_bold)
-                x_draw_bold += word_w_bold + space_w_bold
+                active_plain_draw.text((x_draw_bold, y_draw), word, fill=rgba_active, font=font_max_bold)
 
-            # Draw active (Black)
-            x_draw_black = line_text_x
-            word_layers = []
-            for w_idx, w_data in enumerate(words):
-                word = w_data["word"]
-                word_w_black = widths_black[w_idx]
-                active_inactive_base_draw.text((x_draw_black, y_draw), word, fill=rgba_inactive, font=font_max_black)
-                active_plain_draw.text((x_draw_black, y_draw), word, fill=rgba_active, font=font_max_black)
-
-                active_word_img = Image.new("RGBA", (word_w_black + word_pad, line_img_h), (0, 0, 0, 0))
+                active_word_img = Image.new("RGBA", (word_w_bold + word_pad, line_img_h), (0, 0, 0, 0))
                 active_word_draw = ImageDraw.Draw(active_word_img)
-                active_word_draw.text((word_active_offset, y_draw), word, fill=rgba_active, font=font_max_black)
+                active_word_draw.text((word_active_offset, y_draw), word, fill=rgba_active, font=font_max_bold)
                 word_layers.append({
                     "start": w_data["start"],
                     "end": w_data["end"],
-                    "paste_x": x_draw_black - word_active_offset,
+                    "paste_x": x_draw_bold - word_active_offset,
                     "image": active_word_img,
                     "width": active_word_img.width,
                 })
-                x_draw_black += word_w_black + space_w_black
+                x_draw_bold += word_w_bold + space_w_bold
 
             line_render_cache.append({
                 "inactive": inactive_img,
-                "active_inactive_base": active_inactive_base_img,
                 "active_plain": active_plain_img,
                 "word_layers": word_layers,
-                "width_inactive": line_img_w_bold,
-                "width_active": line_img_w_black,
+                "width": line_img_w_bold,
                 "height": line_img_h,
             })
 
@@ -1948,7 +1929,18 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 active_line_idx = max(0, min(len(lyrics_karaoke) - 1, bisect.bisect_right(transition_times, display_t) - 1))
 
             target_scroll_y = active_line_idx * line_spacing
-            current_scroll_y += (target_scroll_y - current_scroll_y) * scroll_alpha
+            if target_scroll_y != last_target_y:
+                transition_start_y = current_scroll_y
+                transition_frame = 0
+                last_target_y = target_scroll_y
+                
+            if transition_frame < transition_total_frames:
+                transition_frame += 1
+                x = transition_frame / transition_total_frames
+                p = x * x * x * (x * (x * 6.0 - 15.0) + 10.0) # Perlin's smootherstep
+                current_scroll_y = transition_start_y + (target_scroll_y - transition_start_y) * p
+            else:
+                current_scroll_y = target_scroll_y
             
             for idx, line_data in enumerate(lyrics_karaoke):
                 line_y = y_center + (idx * line_spacing) - current_scroll_y
@@ -1963,12 +1955,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 
                 # Масштабируем холст строки методом субпиксельной интерполяции BILINEAR
                 target_scale = (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max
-                cached_width = max(
-                    cached_line.get("width_active", 0),
-                    cached_line.get("width_inactive", 0),
-                    cached_line.get("width", 0),
-                )
-                fit_scale = min(1.0, safe_line_w / max(1, cached_width))
+                fit_scale = min(1.0, safe_line_w / max(1, cached_line["width"]))
                 scale = min(target_scale, fit_scale)
                 
                 # Применяем плавное изменение прозрачности в зависимости от положения на экране
@@ -1990,7 +1977,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         resized_img = non_active_cache[cache_key]
                     else:
                         line_img = cached_line["inactive"]
-                        new_w = max(1, int(cached_line["width_inactive"] * scale))
+                        new_w = max(1, int(cached_line["width"] * scale))
                         new_h = max(1, int(cached_line["height"] * scale))
                         resized_img = line_img.resize((new_w, new_h), resampling_filter)
                         
@@ -2004,7 +1991,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 else:
                     # Для активной строки строим картинку с пословной заливкой
                     if not plain_lines:
-                        line_img = cached_line["active_inactive_base"].copy()
+                        line_img = cached_line["inactive"].copy()
                         for layer in cached_line["word_layers"]:
                             w_start = layer["start"]
                             w_end = layer["end"]
@@ -2022,7 +2009,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     else:
                         line_img = cached_line["active_plain"]
                         
-                    new_w = max(1, int(cached_line["width_active"] * scale))
+                    new_w = max(1, int(cached_line["width"] * scale))
                     new_h = max(1, int(cached_line["height"] * scale))
                     resized_img = line_img.resize((new_w, new_h), resampling_filter)
                     

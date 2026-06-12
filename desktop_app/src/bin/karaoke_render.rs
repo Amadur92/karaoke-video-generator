@@ -49,13 +49,10 @@ struct WordLayer {
 
 struct LineCache {
     inactive: RgbaImage,
-    active_inactive_base: RgbaImage,
     active_plain: RgbaImage,
     words: Vec<WordLayer>,
-    width_inactive: u32,
-    height_inactive: u32,
-    width_active: u32,
-    height_active: u32,
+    width: u32,
+    height: u32,
 }
 
 fn line_highlight_is_live(words: &[WordLayer], t: f64) -> bool {
@@ -346,7 +343,7 @@ fn frame_to_rgb24(frame: &RgbaImage, out: &mut Vec<u8>) {
 
 fn build_line_cache(
     lines: &[KaraokeLine],
-    font_bold: &FontArc,
+    font: &FontArc,
     font_size: f32,
     line_height: u32,
     y_draw: i32,
@@ -363,64 +360,48 @@ fn build_line_cache(
     let word_active_offset = (10.0 * render_scale).round() as i32;
     let line_pad_x = (40.0 * render_scale).round() as u32;
     let line_text_x = (20.0 * render_scale).round() as i32;
-    let space_w_bold = text_width(font_bold, render_font_size, " ");
+    let space_w = text_width(font, render_font_size, " ");
 
     lines
         .iter()
         .map(|line| {
-            let widths_bold: Vec<f32> = line
+            let widths: Vec<f32> = line
                 .words
                 .iter()
-                .map(|word| text_width(font_bold, render_font_size, &word.word))
+                .map(|word| text_width(font, render_font_size, &word.word))
                 .collect();
-            let total_w_bold = widths_bold.iter().sum::<f32>()
-                + space_w_bold * line.words.len().saturating_sub(1) as f32;
-            let line_w_bold = (total_w_bold.ceil() as u32 + line_pad_x).max(1);
-            let base_line_w_bold = (line_w_bold as f32 / text_supersample).round().max(1.0) as u32;
-
+            let total_w =
+                widths.iter().sum::<f32>() + space_w * line.words.len().saturating_sub(1) as f32;
+            let line_w = (total_w.ceil() as u32 + line_pad_x).max(1);
+            let base_line_w = (line_w as f32 / text_supersample).round().max(1.0) as u32;
             let mut inactive_img =
-                ImageBuffer::from_pixel(line_w_bold, render_line_height, Rgba([0, 0, 0, 0]));
-            let mut x_bold = line_text_x;
+                ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
+            let mut active_plain_img =
+                ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
+
+            let mut x = line_text_x;
+            let mut layers = Vec::with_capacity(line.words.len());
             for (idx, word) in line.words.iter().enumerate() {
                 draw_text_mut(
                     &mut inactive_img,
                     inactive,
-                    x_bold,
+                    x,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font_bold,
+                    font,
                     &word.word,
                 );
-                x_bold += (widths_bold[idx] + space_w_bold).round() as i32;
-            }
-
-            let mut active_plain_img =
-                ImageBuffer::from_pixel(line_w_bold, render_line_height, Rgba([0, 0, 0, 0]));
-            let mut active_inactive_base_img =
-                ImageBuffer::from_pixel(line_w_bold, render_line_height, Rgba([0, 0, 0, 0]));
-            let mut x_active = line_text_x;
-            let mut layers = Vec::with_capacity(line.words.len());
-            for (idx, word) in line.words.iter().enumerate() {
                 draw_text_mut(
                     &mut active_plain_img,
                     active,
-                    x_active,
+                    x,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font_bold,
-                    &word.word,
-                );
-                draw_text_mut(
-                    &mut active_inactive_base_img,
-                    inactive,
-                    x_active,
-                    render_y_draw,
-                    PxScale::from(render_font_size),
-                    font_bold,
+                    font,
                     &word.word,
                 );
 
-                let word_w = widths_bold[idx].ceil() as u32;
+                let word_w = widths[idx].ceil() as u32;
                 let mut active_img = ImageBuffer::from_pixel(
                     word_w + word_pad,
                     render_line_height,
@@ -432,7 +413,7 @@ fn build_line_cache(
                     word_active_offset,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font_bold,
+                    font,
                     &word.word,
                 );
 
@@ -448,45 +429,35 @@ fn build_line_cache(
                 layers.push(WordLayer {
                     start: word.start,
                     end: word.end,
-                    paste_x: ((x_active - word_active_offset) as f32 / text_supersample).round()
-                        as i32,
+                    paste_x: ((x - word_active_offset) as f32 / text_supersample).round() as i32,
                     fill_width: ((word_active_offset.max(0) as f32 + word_w as f32)
                         / text_supersample)
                         .round()
                         .max(1.0) as u32,
                     image: base_active_img,
                 });
-                x_active += (widths_bold[idx] + space_w_bold).round() as i32;
+                x += (widths[idx] + space_w).round() as i32;
             }
 
             let base_inactive_img = imageops::resize(
                 &inactive_img,
-                base_line_w_bold,
-                line_height,
-                imageops::FilterType::Lanczos3,
-            );
-            let base_active_inactive_base_img = imageops::resize(
-                &active_inactive_base_img,
-                base_line_w_bold,
+                base_line_w,
                 line_height,
                 imageops::FilterType::Lanczos3,
             );
             let base_active_plain_img = imageops::resize(
                 &active_plain_img,
-                base_line_w_bold,
+                base_line_w,
                 line_height,
                 imageops::FilterType::Lanczos3,
             );
 
             LineCache {
                 inactive: base_inactive_img,
-                active_inactive_base: base_active_inactive_base_img,
                 active_plain: base_active_plain_img,
                 words: layers,
-                width_inactive: base_line_w_bold,
-                height_inactive: line_height,
-                width_active: base_line_w_bold,
-                height_active: line_height,
+                width: base_line_w,
+                height: line_height,
             }
         })
         .collect()
@@ -543,11 +514,14 @@ fn scroll_positions(
 ) -> Vec<f32> {
     let mut positions = Vec::with_capacity(total_frames);
     let mut scroll_y = 0.0_f32;
-    let scroll_alpha = std::env::var("KARAOKE_SCROLL_SMOOTHING")
-        .ok()
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or(0.065)
-        .clamp(0.01, 0.25);
+    
+    let transition_duration = 0.80_f64; // 0.80 seconds
+    let transition_total_frames = (transition_duration * fps).round().max(1.0) as usize;
+    
+    let mut last_target_y = 0.0_f32;
+    let mut transition_start_y = 0.0_f32;
+    let mut transition_frame = transition_total_frames; // initially not in transition
+    
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / fps - audio_delay;
         let active_idx = if transitions.is_empty() {
@@ -556,7 +530,22 @@ fn scroll_positions(
             active_line(transitions, t)
         };
         let target_scroll_y = active_idx as f32 * line_spacing;
-        scroll_y += (target_scroll_y - scroll_y) * scroll_alpha;
+        
+        if target_scroll_y != last_target_y {
+            transition_start_y = scroll_y;
+            transition_frame = 0;
+            last_target_y = target_scroll_y;
+        }
+        
+        if transition_frame < transition_total_frames {
+            transition_frame += 1;
+            let x = transition_frame as f32 / transition_total_frames as f32;
+            let p = x * x * x * (x * (x * 6.0 - 15.0) + 10.0); // Perlin's smootherstep
+            scroll_y = transition_start_y + (target_scroll_y - transition_start_y) * p;
+        } else {
+            scroll_y = target_scroll_y;
+        }
+        
         positions.push(scroll_y);
     }
     positions
@@ -659,15 +648,7 @@ fn write_ass_file(
     ass.push_str("[V4+ Styles]\n");
     ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
     ass.push_str(&format!(
-        "Style: Dynamic,Montserrat,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n",
-        ASS_BASE_FONT_SIZE * size_scale,
-        ass_color(inactive, 0),
-        ass_color(inactive, 0),
-        ass_color(inactive, 255),
-        ass_color(inactive, 255)
-    ));
-    ass.push_str(&format!(
-        "Style: DynamicActive,Montserrat,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        "Style: Dynamic,Montserrat,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
         ASS_BASE_FONT_SIZE * size_scale,
         ass_color(active, 0),
         ass_color(active, 0),
@@ -679,7 +660,7 @@ fn write_ass_file(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
     );
 
-    let font_bold = FontArc::try_from_slice(MONTSERRAT_BOLD)
+    let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
         .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
     let base_font_size = ASS_BASE_FONT_SIZE * size_scale;
     let min_font_size = base_font_size * (26.0 / 42.0);
@@ -688,7 +669,7 @@ fn write_ass_file(
     let line_y_cutoff = 110.0_f32 * size_scale;
     let dist_cutoff = 95.0_f32 * size_scale;
     let safe_line_w = safe_text_width(width, size_scale);
-    let metrics = build_ass_metrics(lines, &font_bold, base_font_size);
+    let metrics = build_ass_metrics(lines, &font, base_font_size);
     let total_frames = (duration * event_fps).ceil() as usize;
     let scrolls = scroll_positions(
         transitions,
@@ -704,11 +685,11 @@ fn write_ass_file(
     // change by more than a sub-pixel threshold. This reduces events by 10-30x
     // while keeping pixel-identical output.
 
-    // Sub-pixel thresholds — changes below these are invisible.
-    const POS_THRESH: f32 = 0.5; // position: ±0.5px
-    const FS_THRESH: f32 = 0.3; // font size: ±0.3px
-    const ALPHA_THRESH: u8 = 1; // alpha: ±1/255
-    const CLIP_THRESH: f32 = 0.8; // clip boundary: ±0.8px
+    // Sub-pixel thresholds — changes below these are invisible
+    const POS_THRESH: f32 = 0.05; // position: ±0.05px
+    const FS_THRESH: f32 = 0.05; // font size: ±0.05px
+    const ALPHA_THRESH: u8 = 1;   // alpha: ±1/255
+    const CLIP_THRESH: f32 = 0.1; // clip boundary: ±0.1px
 
     #[derive(Clone)]
     struct LineEvent {
@@ -737,14 +718,9 @@ fn write_ass_file(
         if end <= start {
             return;
         }
-        let style = if ev.is_active {
-            "DynamicActive"
-        } else {
-            "Dynamic"
-        };
         ass.push_str(&format!(
-            "Dialogue: 0,{},{},{},,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
-            ass_time(start), ass_time(end), style, x, ev.y, ev.fs,
+            "Dialogue: 0,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
+            ass_time(start), ass_time(end), x, ev.y, ev.fs,
             ass_color(color, 0), ev.alpha, &metrics[idx].text
         ));
     };
@@ -761,7 +737,7 @@ fn write_ass_file(
             return;
         }
         ass.push_str(&format!(
-            "Dialogue: 1,{},{},DynamicActive,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&\\clip({:.0},0,{:.0},{height})}}{}\n",
+            "Dialogue: 1,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&\\clip({:.0},0,{:.0},{height})}}{}\n",
             ass_time(start), ass_time(end), x, ev.y, ev.fs,
             ass_color(active, 0), ev.alpha, ev.clip_left.max(0.0), ev.clip_right,
             &metrics[idx].text
@@ -838,13 +814,7 @@ fn write_ass_file(
             let font_size = target_font_size.min(fit_font_size);
             let scale = font_size / base_font_size;
             let mut opacity = if scrolling {
-                let flat_ratio = 0.7_f32;
-                if dist < dist_cutoff * flat_ratio {
-                    1.0
-                } else {
-                    (1.0 - (dist - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio)))
-                        .clamp(0.0, 1.0)
-                }
+                (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
             } else {
                 1.0
             };
@@ -1179,7 +1149,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
         eprintln!("[Rust] ffmpeg ASS/subtitles filter not found; falling back to frame renderer");
     }
 
-    let font_bold = FontArc::try_from_slice(MONTSERRAT_BOLD)
+    let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
         .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
     let text_supersample = 3.0_f32;
     // Pillow/FreeType and ab_glyph expose slightly different perceived pixel sizes.
@@ -1187,7 +1157,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let render_font_size_max = font_size_max * 1.18;
     let cache = build_line_cache(
         &lines,
-        &font_bold,
+        &font,
         render_font_size_max,
         line_h,
         y_draw,
@@ -1245,42 +1215,24 @@ fn render(config: RenderConfig) -> Result<(), String> {
 
             let mut line_img = if config.plain_lines && is_display_active {
                 line_cache.active_plain.clone()
-            } else if is_display_active {
-                let mut img = line_cache.active_inactive_base.clone();
-                if is_highlight_live {
-                    paint_line_highlight(&mut img, &line_cache.words, highlight_t);
-                }
-                img
             } else if is_highlight_live {
-                let mut img = line_cache.active_inactive_base.clone();
+                let mut img = line_cache.inactive.clone();
                 paint_line_highlight(&mut img, &line_cache.words, highlight_t);
                 img
             } else {
                 line_cache.inactive.clone()
             };
 
-            let (lc_width, lc_height) = if is_display_active || is_highlight_live {
-                (line_cache.width_active, line_cache.height_active)
-            } else {
-                (line_cache.width_inactive, line_cache.height_inactive)
-            };
-
             let target_scale =
                 (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max;
-            let fit_scale = (safe_line_w / lc_width as f32).min(1.0);
+            let fit_scale = (safe_line_w / line_cache.width as f32).min(1.0);
             let scale = target_scale.min(fit_scale);
-            let new_w = ((lc_width as f32 * scale).round() as u32).max(1);
-            let new_h = ((lc_height as f32 * scale).round() as u32).max(1);
+            let new_w = ((line_cache.width as f32 * scale).round() as u32).max(1);
+            let new_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
             line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
 
             let mut opacity = if config.scrolling {
-                let flat_ratio = 0.7_f32;
-                if dist < dist_cutoff * flat_ratio {
-                    1.0
-                } else {
-                    (1.0 - (dist - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio)))
-                        .clamp(0.0, 1.0)
-                }
+                (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
             } else {
                 1.0
             };
