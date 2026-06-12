@@ -1041,7 +1041,6 @@ struct KaraokeApp {
     batch_current_index: Option<usize>,
     batch_selected_index: Option<usize>,
     batch_status_text: String,
-    batch_view: bool,
     active_tab: ActiveTab,
     dl_mode_excel: bool,
     dl_track_query: String,
@@ -1171,7 +1170,6 @@ impl KaraokeApp {
             batch_current_index: None,
             batch_selected_index: None,
             batch_status_text: String::new(),
-            batch_view: false,
             active_tab: ActiveTab::SingleTrack,
             dl_mode_excel: false,
             dl_track_query: String::new(),
@@ -4220,15 +4218,15 @@ impl eframe::App for KaraokeApp {
                 let batch_margin = 14.0;
                 let content_width = ui.available_width() - batch_margin * 2.0;
                 let col_height = ui.available_height() - 20.0;
-                
+
                 ui.horizontal(|ui| {
                     ui.add_space(batch_margin);
-                    
+
                     if self.dl_mode_excel {
                         // ПАКЕТНЫЙ РЕЖИМ (Две колонки)
                         let spacing = 18.0;
                         let col_width = (content_width - spacing) / 2.0;
-                        
+
                         ui.horizontal(|ui| {
                             // Левая колонка: настройки и логи
                             ui.vertical(|ui| {
@@ -4237,7 +4235,7 @@ impl eframe::App for KaraokeApp {
                                 card_frame.show(ui, |ui| {
                                     ui.set_min_width(col_width - 36.0);
                                     ui.set_min_height(col_height - 36.0);
-                                    
+
                                     ui.label(
                                         egui::RichText::new("Настройки загрузчика")
                                             .strong()
@@ -4245,7 +4243,7 @@ impl eframe::App for KaraokeApp {
                                             .color(text),
                                     );
                                     ui.add_space(14.0);
-                                    
+
                                     // Выбор режима
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Режим:").strong());
@@ -4257,14 +4255,14 @@ impl eframe::App for KaraokeApp {
                                         }
                                     });
                                     ui.add_space(12.0);
-                                    
+
                                     // Excel файл
                                     ui.horizontal(|ui| {
                                         ui.label("Файл Excel (.xlsx):");
                                         if ui.button("Выбрать файл").clicked() && !self.dl_is_running {
                                             if let Some(path) = rfd::FileDialog::new()
                                                 .add_filter("Excel Files", &["xlsx"])
-                                                .pick_file() 
+                                                .pick_file()
                                             {
                                                 self.dl_excel_path = Some(path.clone());
                                                 self.start_parsing_excel(path, ctx.clone());
@@ -4277,7 +4275,7 @@ impl eframe::App for KaraokeApp {
                                         }
                                     });
                                     ui.add_space(10.0);
-                                    
+
                                     // Папка сохранения
                                     ui.horizontal(|ui| {
                                         ui.label("Папка для сохранения:");
@@ -4293,7 +4291,7 @@ impl eframe::App for KaraokeApp {
                                         }
                                     });
                                     ui.add_space(12.0);
-                                    
+
                                     // Дополнительные параметры
                                     ui.horizontal(|ui| {
                                         ui.label("Формат:");
@@ -4304,38 +4302,38 @@ impl eframe::App for KaraokeApp {
                                                 ui.selectable_value(&mut self.dl_format, "flac".to_string(), "FLAC");
                                                 ui.selectable_value(&mut self.dl_format, "m4a".to_string(), "M4A");
                                             });
-                                            
+
                                         ui.add_space(20.0);
                                         ui.label("Лимит поиска:");
                                         ui.add(egui::Slider::new(&mut self.dl_limit_candidates, 1..=10));
                                     });
                                     ui.add_space(8.0);
-                                    
+
                                     ui.horizontal(|ui| {
                                         ui.checkbox(&mut self.dl_overwrite, "Перезаписывать существующие файлы");
                                     });
                                     ui.add_space(16.0);
-                                    
+
                                     // Кнопки
                                     ui.horizontal(|ui| {
-                                        let can_start = self.dl_excel_path.is_some() 
-                                            && self.dl_output_dir.is_some() 
-                                            && !self.dl_is_running 
+                                        let can_start = self.dl_excel_path.is_some()
+                                            && self.dl_output_dir.is_some()
+                                            && !self.dl_is_running
                                             && !self.dl_is_parsing_excel;
-                                            
+
                                         if ui.add_enabled(
                                             can_start,
                                             egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
                                         ).clicked() {
                                             self.start_download(ctx);
                                         }
-                                        
+
                                         if ui.button("Очистить лог").clicked() {
                                             self.dl_log_output.clear();
                                         }
                                     });
                                     ui.add_space(14.0);
-                                    
+
                                      // Статус и лог
                                      ui.add_space(8.0);
                                      ui.separator();
@@ -4343,7 +4341,7 @@ impl eframe::App for KaraokeApp {
 
                                      ui.label(egui::RichText::new("Статус загрузки").strong().size(15.0));
                                      ui.add_space(6.0);
-                                     
+
                                      let status_color = if self.dl_is_running {
                                          accent
                                      } else if self.dl_status_text.contains("успешно") {
@@ -4388,7 +4386,7 @@ impl eframe::App for KaraokeApp {
 
                                              ui.label(egui::RichText::new("🔄 Сейчас скачивается:").strong());
                                              ui.add_space(4.0);
-                                             
+
                                              if active_downloads.is_empty() {
                                                  ui.label(egui::RichText::new("Подключение к источникам...").italics().color(muted));
                                              } else {
@@ -4423,7 +4421,7 @@ impl eframe::App for KaraokeApp {
                                      ui.add_space(10.0);
                                 });
                             });
-                            
+
                             // Правая колонка: список треков с чекбоксами
                             ui.vertical(|ui| {
                                 ui.set_width(col_width);
@@ -4431,7 +4429,7 @@ impl eframe::App for KaraokeApp {
                                 card_frame.show(ui, |ui| {
                                     ui.set_min_width(col_width - 36.0);
                                     ui.set_min_height(col_height - 36.0);
-                                    
+
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             egui::RichText::new("Список треков в файле")
@@ -4439,7 +4437,7 @@ impl eframe::App for KaraokeApp {
                                                 .size(18.0)
                                                 .color(text),
                                         );
-                                        
+
                                         if self.dl_is_parsing_excel {
                                             ui.add_space(8.0);
                                             ui.add(egui::widgets::Spinner::new());
@@ -4447,12 +4445,12 @@ impl eframe::App for KaraokeApp {
                                         }
                                     });
                                     ui.add_space(14.0);
-                                    
+
                                     if !self.dl_tracks.is_empty() {
                                         ui.horizontal(|ui| {
                                             let selected_count = self.dl_tracks.iter().filter(|t| t.selected).count();
                                             ui.label(format!("Выбрано: {} из {}", selected_count, self.dl_tracks.len()));
-                                            
+
                                             ui.add_space(10.0);
                                             if ui.button("Выбрать все").clicked() && !self.dl_is_running {
                                                 for t in &mut self.dl_tracks {
@@ -4466,7 +4464,7 @@ impl eframe::App for KaraokeApp {
                                             }
                                         });
                                         ui.add_space(8.0);
-                                        
+
                                         let tracks_height = ui.available_height() - 10.0;
                                         egui::ScrollArea::vertical()
                                             .auto_shrink([false, false])
@@ -4484,10 +4482,10 @@ impl eframe::App for KaraokeApp {
                                                                 !self.dl_is_running,
                                                                 egui::Checkbox::without_text(&mut track.selected)
                                                             );
-                                                            
+
                                                             // Номер
                                                             ui.label(egui::RichText::new(format!("{:02}.", track.pos)).color(muted));
-                                                            
+
                                                             // Название / Артист (ограничиваем ширину и обрезаем с троеточием)
                                                             let name_text = format!("{} — {}", track.artist, track.title);
                                                             ui.allocate_ui(egui::vec2((col_width - 240.0).max(150.0), 20.0), |ui| {
@@ -4497,7 +4495,7 @@ impl eframe::App for KaraokeApp {
                                                                     ).truncate()
                                                                 );
                                                             });
-                                                            
+
                                                             // Статус
                                                             let (status_text, status_color) = match track.status {
                                                                 TrackStatus::Pending => ("⏳ Ожидание", muted),
@@ -4534,7 +4532,7 @@ impl eframe::App for KaraokeApp {
                             card_frame.show(ui, |ui| {
                                 let inner_width = (content_width - 36.0).max(760.0);
                                 ui.set_min_width(inner_width);
-                                
+
                                 ui.label(
                                     egui::RichText::new("Загрузчик аудио")
                                         .strong()
@@ -4542,7 +4540,7 @@ impl eframe::App for KaraokeApp {
                                         .color(text),
                                 );
                                 ui.add_space(14.0);
-                                
+
                                 // Выбор режима
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("Режим:").strong());
@@ -4554,14 +4552,14 @@ impl eframe::App for KaraokeApp {
                                     }
                                 });
                                 ui.add_space(12.0);
-                                
+
                                 // Одиночный трек
                                 ui.horizontal(|ui| {
                                     ui.label("Название трека/запрос:");
                                     ui.text_edit_singleline(&mut self.dl_track_query);
                                 });
                                 ui.add_space(10.0);
-                                
+
                                 // Папка сохранения
                                 ui.horizontal(|ui| {
                                     ui.label("Папка для сохранения:");
@@ -4577,7 +4575,7 @@ impl eframe::App for KaraokeApp {
                                     }
                                 });
                                 ui.add_space(12.0);
-                                
+
                                 // Дополнительные параметры
                                 ui.horizontal(|ui| {
                                     ui.label("Формат:");
@@ -4588,36 +4586,36 @@ impl eframe::App for KaraokeApp {
                                             ui.selectable_value(&mut self.dl_format, "flac".to_string(), "FLAC");
                                             ui.selectable_value(&mut self.dl_format, "m4a".to_string(), "M4A");
                                         });
-                                        
+
                                     ui.add_space(20.0);
                                     ui.label("Лимит поиска:");
                                     ui.add(egui::Slider::new(&mut self.dl_limit_candidates, 1..=10));
                                 });
                                 ui.add_space(16.0);
-                                
+
                                 // Кнопки
                                 ui.horizontal(|ui| {
-                                    let can_start = !self.dl_track_query.trim().is_empty() 
-                                        && self.dl_output_dir.is_some() 
+                                    let can_start = !self.dl_track_query.trim().is_empty()
+                                        && self.dl_output_dir.is_some()
                                         && !self.dl_is_running;
-                                        
+
                                     if ui.add_enabled(
                                         can_start,
                                         egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
                                     ).clicked() {
                                         self.start_download(ctx);
                                     }
-                                    
+
                                     if ui.button("Очистить лог").clicked() {
                                         self.dl_log_output.clear();
                                     }
                                 });
                                 ui.add_space(14.0);
-                                
+
                                 // Поле логов и статус
                                 ui.label(egui::RichText::new(&self.dl_status_text).strong().color(accent));
                                 ui.add_space(8.0);
-                                
+
                                 let logs_height = (ui.available_height() - 36.0).max(200.0);
                                 egui::ScrollArea::vertical()
                                     .max_height(logs_height)
@@ -4634,7 +4632,7 @@ impl eframe::App for KaraokeApp {
                             });
                         });
                     }
-                    
+
                     ui.add_space(batch_margin);
                 });
             } else {
