@@ -288,6 +288,7 @@ def discover_youtube_lyrics_videos(track: TrackMetadata, limit: int = 3) -> list
         "extract_flat": True,
         "noplaylist": True,
         "ignoreerrors": True,
+        "nocheckcertificate": True,
     }
     try:
         with YoutubeDL(options) as ydl:

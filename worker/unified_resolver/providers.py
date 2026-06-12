@@ -209,6 +209,7 @@ class YouTubeSearchProvider(Provider):
             "extract_flat": True,
             "noplaylist": True,
             "ignoreerrors": True,
+            "nocheckcertificate": True,
         }
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(query, download=False)

@@ -58,7 +58,7 @@ def fetch_lyrics(title: str, artist: str) -> Optional[dict[str, str]]:
     try:
         url = f"https://lrclib.net/api/get?artist_name={urllib.parse.quote(artist)}&track_name={urllib.parse.quote(title)}"
         req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with safe_urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("plainLyrics") or data.get("syncedLyrics"):
                 return {
@@ -72,7 +72,7 @@ def fetch_lyrics(title: str, artist: str) -> Optional[dict[str, str]]:
     try:
         url = f"https://lrclib.net/api/search?artist_name={urllib.parse.quote(artist)}&track_name={urllib.parse.quote(title)}"
         req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with safe_urlopen(req, timeout=10) as resp:
             results = json.loads(resp.read().decode("utf-8"))
             if results:
                 # Find first with synced, then first with plain
@@ -444,7 +444,7 @@ class Downloader:
         try:
             url = f"https://www.jiosaavn.com/api.php?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids={pid}"
             req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with safe_urlopen(req, timeout=10) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 song_data = res.get(pid)
                 if not song_data:
@@ -463,7 +463,7 @@ class Downloader:
                 temp_file.close()
                 
                 req_audio = urllib.request.Request(decrypted_url, headers={"User-Agent": DEFAULT_UA})
-                with urllib.request.urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
+                with safe_urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
                     f_out.write(audio_resp.read())
                     
                 return temp_path
@@ -478,7 +478,7 @@ class Downloader:
         try:
             url = f"https://music.wjhe.top/api/music/qobuz/url?ID={track_id}&quality=1000&format=flac"
             req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with safe_urlopen(req, timeout=10) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 stream_url = res.get("url") or res.get("download_url")
                 if not stream_url and "data" in res:
@@ -495,7 +495,7 @@ class Downloader:
                 temp_file.close()
                 
                 req_audio = urllib.request.Request(stream_url, headers={"User-Agent": DEFAULT_UA})
-                with urllib.request.urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
+                with safe_urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
                     f_out.write(audio_resp.read())
                     
                 return temp_path
@@ -522,6 +522,7 @@ class Downloader:
                 "quiet": True,
                 "nooverwrites": True,
                 "noplaylist": True,
+                "nocheckcertificate": True,
             }
             
             print(f"[*] Downloading from YouTube URL: {video_url}...")
@@ -556,6 +557,7 @@ class Downloader:
                 "quiet": True,
                 "nooverwrites": True,
                 "noplaylist": True,
+                "nocheckcertificate": True,
             }
             
             # Simple check for critical words
@@ -620,7 +622,7 @@ class Downloader:
             temp_file.close()
             
             req = urllib.request.Request(track.cover_url, headers={"User-Agent": DEFAULT_UA})
-            with urllib.request.urlopen(req, timeout=30) as resp, open(temp_path, "wb") as f_out:
+            with safe_urlopen(req, timeout=30) as resp, open(temp_path, "wb") as f_out:
                 f_out.write(resp.read())
             return temp_path
         except Exception as e:

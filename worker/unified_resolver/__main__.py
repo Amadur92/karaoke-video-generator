@@ -190,8 +190,6 @@ def find_column_indices(headers: list[str]) -> tuple[int, int, int]:
         missing.append("исполнитель (artist)")
     if track_idx == -1:
         missing.append("трек (track)")
-    if position_idx == -1:
-        missing.append("порядковый номер (position)")
 
     if missing:
         raise ValueError(f"Не удалось найти колонки: {', '.join(missing)}. Заголовки таблицы: {headers}")
@@ -245,24 +243,30 @@ def parse_spreadsheet(file_path: str) -> list[tuple[int, str, str]]:
     parsed_tracks = []
     for r_idx in range(header_idx + 1, len(raw_rows)):
         row = raw_rows[r_idx]
-        if not row or len(row) <= max(artist_col, track_col, pos_col):
+        required_len = max(artist_col, track_col)
+        if pos_col != -1:
+            required_len = max(required_len, pos_col)
+        if not row or len(row) <= required_len:
             continue
             
         artist_val = str(row[artist_col]).strip()
         track_val = str(row[track_col]).strip()
-        pos_val_raw = str(row[pos_col]).strip()
         
         if not artist_val or not track_val:
             continue
             
-        try:
-            pos_val = int(float(pos_val_raw))
-        except ValueError:
-            if not pos_val_raw:
-                pos_val = r_idx - header_idx
-            else:
-                digits = "".join(c for c in pos_val_raw if c.isdigit())
-                pos_val = int(digits) if digits else (r_idx - header_idx)
+        if pos_col != -1:
+            pos_val_raw = str(row[pos_col]).strip()
+            try:
+                pos_val = int(float(pos_val_raw))
+            except ValueError:
+                if not pos_val_raw:
+                    pos_val = r_idx - header_idx
+                else:
+                    digits = "".join(c for c in pos_val_raw if c.isdigit())
+                    pos_val = int(digits) if digits else (r_idx - header_idx)
+        else:
+            pos_val = r_idx - header_idx
                 
         parsed_tracks.append((pos_val, artist_val, track_val))
         
@@ -495,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
                 return False
 
         success_count = 0
-        max_workers = 4
+        max_workers = 2
         print(f"[*] Starting parallel download with {max_workers} threads...")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(process_track, track): track for track in tracks}

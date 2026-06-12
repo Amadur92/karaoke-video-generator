@@ -16,8 +16,8 @@ def safe_urlopen(req: Any, timeout: int = 10) -> Any:
     try:
         return urllib.request.urlopen(req, timeout=timeout)
     except Exception as e:
-        err_str = str(e)
-        if "CERTIFICATE_VERIFY_FAILED" in err_str or "certificate verify failed" in err_str:
+        err_str = str(e).lower()
+        if "cert" in err_str or "ssl" in err_str or "handshake" in err_str or isinstance(e, ssl.SSLError):
             try:
                 ctx = ssl._create_unverified_context()
                 return urllib.request.urlopen(req, timeout=timeout, context=ctx)

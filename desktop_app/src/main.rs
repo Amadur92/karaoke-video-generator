@@ -4178,12 +4178,20 @@ impl eframe::App for KaraokeApp {
                                                     .max_height(text_height)
                                                     .auto_shrink([false, false])
                                                     .show(ui, |ui| {
-                                                        ui.label(
-                                                            egui::RichText::new(&self.lyrics)
-                                                                .monospace()
-                                                                .size(12.0)
-                                                                .color(text),
+                                                        let edit_response = ui.add(
+                                                            egui::TextEdit::multiline(&mut self.lyrics)
+                                                                .font(egui::TextStyle::Monospace)
+                                                                .desired_width(ui.available_width())
+                                                                .desired_rows(16)
                                                         );
+                                                        if edit_response.changed() {
+                                                            if let Some(selected_idx) = self.batch_selected_index {
+                                                                 if selected_idx < self.batch_items.len() {
+                                                                     let path = &self.batch_items[selected_idx].lyrics_path;
+                                                                     let _ = std::fs::write(path, &self.lyrics);
+                                                                 }
+                                                            }
+                                                        }
                                                     });
                                             },
                                         );
