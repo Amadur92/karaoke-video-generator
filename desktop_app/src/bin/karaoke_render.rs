@@ -391,7 +391,8 @@ fn build_line_cache(
             let total_w_black = widths_black.iter().sum::<f32>()
                 + space_w_black * line.words.len().saturating_sub(1) as f32;
             let line_w_black = (total_w_black.ceil() as u32 + line_pad_x).max(1);
-            let base_line_w_black = (line_w_black as f32 / text_supersample).round().max(1.0) as u32;
+            let base_line_w_black =
+                (line_w_black as f32 / text_supersample).round().max(1.0) as u32;
 
             // Рисуем неактивную строку (Bold)
             let mut inactive_img =
@@ -465,7 +466,8 @@ fn build_line_cache(
                 layers.push(WordLayer {
                     start: word.start,
                     end: word.end,
-                    paste_x: ((x_black - word_active_offset) as f32 / text_supersample).round() as i32,
+                    paste_x: ((x_black - word_active_offset) as f32 / text_supersample).round()
+                        as i32,
                     fill_width: ((word_active_offset.max(0) as f32 + word_w as f32)
                         / text_supersample)
                         .round()
@@ -753,7 +755,11 @@ fn write_ass_file(
         if end <= start {
             return;
         }
-        let style = if ev.is_active { "DynamicActive" } else { "Dynamic" };
+        let style = if ev.is_active {
+            "DynamicActive"
+        } else {
+            "Dynamic"
+        };
         ass.push_str(&format!(
             "Dialogue: 0,{},{},{},,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
             ass_time(start), ass_time(end), style, x, ev.y, ev.fs,
@@ -854,7 +860,8 @@ fn write_ass_file(
                 if dist < dist_cutoff * flat_ratio {
                     1.0
                 } else {
-                    (1.0 - (dist - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio))).clamp(0.0, 1.0)
+                    (1.0 - (dist - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio)))
+                        .clamp(0.0, 1.0)
                 }
             } else {
                 1.0
@@ -1286,7 +1293,8 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 if dist < dist_cutoff * flat_ratio {
                     1.0
                 } else {
-                    (1.0 - (dist - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio))).clamp(0.0, 1.0)
+                    (1.0 - (dist - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio)))
+                        .clamp(0.0, 1.0)
                 }
             } else {
                 1.0

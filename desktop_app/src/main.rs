@@ -1567,7 +1567,12 @@ impl KaraokeApp {
             self.set_audio_file(path, ctx);
         } else if is_lyrics_file(&path) {
             self.set_lyrics_file(path);
-        } else if path.extension().map(|ext| ext.to_string_lossy().to_string().to_lowercase()).as_deref() == Some("xlsx") {
+        } else if path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_string().to_lowercase())
+            .as_deref()
+            == Some("xlsx")
+        {
             self.dl_excel_path = Some(path.clone());
             self.dl_mode_excel = true;
             self.active_tab = ActiveTab::Downloader;
@@ -1683,12 +1688,14 @@ impl KaraokeApp {
         let worker_path = match find_worker() {
             Some(w) => w,
             None => {
-                let _ = tx.send(Err("Не удалось найти исполняемый файл воркера (karaoke_worker)".to_string()));
+                let _ = tx.send(Err(
+                    "Не удалось найти исполняемый файл воркера (karaoke_worker)".to_string(),
+                ));
                 ctx.request_repaint();
                 return;
             }
         };
-        
+
         std::thread::spawn(move || {
             let mut cmd = if is_python_worker(&worker_path) {
                 let mut cmd = std::process::Command::new("python3");
@@ -1697,10 +1704,9 @@ impl KaraokeApp {
             } else {
                 std::process::Command::new(&worker_path)
             };
-            
+
             cmd.env("PYTHONUTF8", "1");
-            cmd.arg("parse-sheet")
-                .arg(&path);
+            cmd.arg("parse-sheet").arg(&path);
 
             #[cfg(windows)]
             cmd.creation_flags(0x08000000);
@@ -1727,7 +1733,10 @@ impl KaraokeApp {
                     let _ = tx.send(Ok(tracks));
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(format!("Ошибка декодирования JSON: {}, вывод: {}", e, stdout_str)));
+                    let _ = tx.send(Err(format!(
+                        "Ошибка декодирования JSON: {}, вывод: {}",
+                        e, stdout_str
+                    )));
                 }
             }
             ctx.request_repaint();
@@ -1757,8 +1766,17 @@ impl KaraokeApp {
 
         let mut tracks_file_path = None;
         if mode_excel {
-            let selected_tracks: Vec<TrackItem> = self.dl_tracks.iter().filter(|t| t.selected).cloned().collect();
-            self.dl_log_output.push_str(&format!("📁 Всего треков в списке: {}, выбрано для скачивания: {}\n", self.dl_tracks.len(), selected_tracks.len()));
+            let selected_tracks: Vec<TrackItem> = self
+                .dl_tracks
+                .iter()
+                .filter(|t| t.selected)
+                .cloned()
+                .collect();
+            self.dl_log_output.push_str(&format!(
+                "📁 Всего треков в списке: {}, выбрано для скачивания: {}\n",
+                self.dl_tracks.len(),
+                selected_tracks.len()
+            ));
             if selected_tracks.is_empty() {
                 self.dl_status_text = "Ошибка: не выбрано ни одного трека для загрузки".to_string();
                 return;
@@ -1770,12 +1788,13 @@ impl KaraokeApp {
                 }
             }
 
-            let project_id = excel_path.as_ref()
+            let project_id = excel_path
+                .as_ref()
                 .and_then(|p| p.file_stem())
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            
+
             let temp_path = std::env::temp_dir().join(format!("tracks_{}.json", project_id));
             match serde_json::to_string_pretty(&selected_tracks) {
                 Ok(json_str) => {
@@ -1795,7 +1814,9 @@ impl KaraokeApp {
         let worker_path = match find_worker() {
             Some(w) => w,
             None => {
-                self.dl_status_text = "Ошибка: не удалось найти исполняемый файл воркера (karaoke_worker)".to_string();
+                self.dl_status_text =
+                    "Ошибка: не удалось найти исполняемый файл воркера (karaoke_worker)"
+                        .to_string();
                 return;
             }
         };
@@ -1817,7 +1838,7 @@ impl KaraokeApp {
             } else {
                 std::process::Command::new(&worker_path)
             };
-            
+
             cmd.env("PYTHONUTF8", "1");
 
             if mode_excel {
@@ -1855,7 +1876,12 @@ impl KaraokeApp {
                     cmd.arg("--overwrite");
                 }
 
-                let _ = tx.send(format!("📁 Пакетный режим.\nФайл: {}\nПроект: {}\nПапка сохранения: {}", xlsx_path.to_string_lossy(), project_id, output_path.to_string_lossy()));
+                let _ = tx.send(format!(
+                    "📁 Пакетный режим.\nФайл: {}\nПроект: {}\nПапка сохранения: {}",
+                    xlsx_path.to_string_lossy(),
+                    project_id,
+                    output_path.to_string_lossy()
+                ));
             } else {
                 cmd.arg("download")
                     .arg(&query)
@@ -1866,7 +1892,11 @@ impl KaraokeApp {
                     .arg("--format")
                     .arg(&format);
 
-                let _ = tx.send(format!("🎵 Одиночный режим.\nТрек: {}\nПапка сохранения: {}", query, output_path.to_string_lossy()));
+                let _ = tx.send(format!(
+                    "🎵 Одиночный режим.\nТрек: {}\nПапка сохранения: {}",
+                    query,
+                    output_path.to_string_lossy()
+                ));
             }
 
             #[cfg(windows)]
@@ -3081,7 +3111,8 @@ impl eframe::App for KaraokeApp {
                 match res {
                     Ok(tracks) => {
                         self.dl_tracks = tracks;
-                        self.dl_status_text = format!("Загружено треков из файла: {}", self.dl_tracks.len());
+                        self.dl_status_text =
+                            format!("Загружено треков из файла: {}", self.dl_tracks.len());
                     }
                     Err(err) => {
                         self.dl_status_text = format!("Ошибка: {}", err);
@@ -3100,11 +3131,13 @@ impl eframe::App for KaraokeApp {
             if log_line == "___FINISHED_SUCCESS___" {
                 self.dl_is_running = false;
                 self.dl_status_text = "Загрузка успешно завершена!".to_string();
-                self.dl_log_output.push_str("\n🎉 Загрузка успешно завершена!\n");
+                self.dl_log_output
+                    .push_str("\n🎉 Загрузка успешно завершена!\n");
             } else if log_line == "___FINISHED_FAILURE___" {
                 self.dl_is_running = false;
                 self.dl_status_text = "Загрузка завершилась с ошибкой".to_string();
-                self.dl_log_output.push_str("\n❌ Загрузка прервана из-за ошибки.\n");
+                self.dl_log_output
+                    .push_str("\n❌ Загрузка прервана из-за ошибки.\n");
             } else {
                 parse_log_line_and_update_status(&log_line, &mut self.dl_tracks);
                 self.dl_log_output.push_str(&format!("{}\n", log_line));
@@ -3738,26 +3771,22 @@ impl eframe::App for KaraokeApp {
                                                                                     egui::Align::Center,
                                                                                 ),
                                                                                 |ui| {
-                                                                                    let percent =
-                                                                                        match &item.status {
-                                                                                            BatchStatus::Done => 100,
-                                                                                            BatchStatus::Error(_) => (item.progress * 100.0).round() as i32,
-                                                                                            _ => (item.progress * 100.0).round() as i32,
-                                                                                        }
-                                                                                        .clamp(0, 100);
-                                                                                    ui.label(
-                                                                                        egui::RichText::new(format!(
-                                                                                            "{}%",
-                                                                                            percent
-                                                                                        ))
-                                                                                        .monospace()
-                                                                                        .size(11.0)
-                                                                                        .color(if item.status == BatchStatus::Running {
-                                                                                            accent
-                                                                                        } else {
-                                                                                            muted
-                                                                                        }),
-                                                                                    );
+                                                                                    if item.status == BatchStatus::Running {
+                                                                                        let percent =
+                                                                                            ((item.progress * 100.0).round() as i32)
+                                                                                                .clamp(0, 100);
+                                                                                        ui.label(
+                                                                                            egui::RichText::new(format!(
+                                                                                                "{}%",
+                                                                                                percent
+                                                                                            ))
+                                                                                            .monospace()
+                                                                                            .size(11.0)
+                                                                                            .color(accent),
+                                                                                        );
+                                                                                    } else {
+                                                                                        ui.add_space(30.0);
+                                                                                    }
                                                                                 },
                                                                             );
                                                                         });
