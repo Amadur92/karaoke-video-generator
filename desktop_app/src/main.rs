@@ -308,6 +308,33 @@ fn is_ffmpeg_progress_key(line: &str) -> bool {
     ) || key.starts_with("stream_")
 }
 
+fn open_in_explorer(path: &std::path::Path) {
+    let path_to_open = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(path_to_open)
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg(path_to_open)
+            .status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(path_to_open)
+            .status();
+    }
+}
+
 fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
     let mut cmd = std::process::Command::new(tool_path("ffprobe"));
     hide_subprocess_window(&mut cmd);
@@ -689,13 +716,6 @@ fn scan_batch_folder(
         }
 
         for audio_path in audio_files {
-            let Some(lyrics_path) = find_matching_lyrics(&audio_path, &files) else {
-                warnings.push(format!(
-                    "{}: найдено аудио, но нет .lrc/.txt",
-                    display_file_name(&folder)
-                ));
-                continue;
-            };
             let duration_ms = match probe_audio_duration_ms(&audio_path.to_string_lossy()) {
                 Ok(duration) => duration,
                 Err(err) => {
@@ -713,6 +733,16 @@ fn scan_batch_folder(
                 .to_string_lossy()
                 .to_string();
             let (artist, title) = parse_artist_title_from_stem(&stem);
+            let (lyrics_path, status) = match find_matching_lyrics(&audio_path, &files) {
+                Some(path) => (path, BatchStatus::Ready),
+                None => {
+                    warnings.push(format!(
+                        "{}: найдено аудио, но нет .lrc/.txt",
+                        display_file_name(&folder)
+                    ));
+                    (PathBuf::new(), BatchStatus::MissingLyrics)
+                }
+            };
             items.push(BatchItem {
                 folder: folder.clone(),
                 audio_path,
@@ -724,7 +754,7 @@ fn scan_batch_folder(
                 trim_end_ms: duration_ms,
                 fade_in_ms,
                 fade_out_ms,
-                status: BatchStatus::Ready,
+                status,
                 progress: 0.0,
                 output_path: None,
             });
@@ -732,6 +762,36 @@ fn scan_batch_folder(
     }
 
     (items, warnings)
+}
+
+fn safe_output_filename(value: &str) -> String {
+    value.replace("/", "_").replace("\\", "_")
+}
+
+fn batch_timings_path(audio_path: &Path) -> PathBuf {
+    let stem = audio_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    audio_path.with_file_name(format!("{}_timings.json", stem))
+}
+
+fn batch_output_path(item: &BatchItem) -> PathBuf {
+    let artist = if item.artist.trim().is_empty() {
+        "Исполнитель"
+    } else {
+        item.artist.trim()
+    };
+    let title = if item.title.trim().is_empty() {
+        "Песня"
+    } else {
+        item.title.trim()
+    };
+    item.folder.join(safe_output_filename(&format!(
+        "{} - {} (karaoke).mp4",
+        artist, title
+    )))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -782,13 +842,23 @@ struct CLIProgress {
     done: bool,
     error: Option<String>,
     file: Option<String>,
+    #[serde(default)]
+    batch_align_index: Option<usize>,
 }
 
 enum ProgressUpdate {
     Progress(CLIProgress),
+    BatchProgress {
+        index: usize,
+        status: BatchStatus,
+        progress: f32,
+        message: String,
+        output_path: Option<String>,
+    },
     RawLog(String),
     Error(String),
     Finished(bool),
+    BatchFinished,
 }
 
 struct VideoFrame {
@@ -805,7 +875,10 @@ struct AudioLoadUpdate {
 #[derive(Clone, Debug, PartialEq)]
 enum BatchStatus {
     Ready,
-    Running,
+    MissingLyrics,
+    Aligning,
+    ReadyToRender,
+    Rendering,
     Done,
     Error(String),
 }
@@ -981,6 +1054,14 @@ fn default_true() -> bool {
     true
 }
 
+struct BatchScanResult {
+    root: Option<PathBuf>,
+    items: Vec<BatchItem>,
+    warnings: Vec<String>,
+    folder_count: usize,
+    first_folder_name: String,
+}
+
 struct KaraokeApp {
     audio_path: Option<String>,
     audio_duration_ms: Option<i64>,
@@ -1041,6 +1122,10 @@ struct KaraokeApp {
     batch_current_index: Option<usize>,
     batch_selected_index: Option<usize>,
     batch_status_text: String,
+    batch_is_scanning: bool,
+    batch_scan_rx: Option<Receiver<BatchScanResult>>,
+    batch_single_mode: bool,
+    batch_cancel: Arc<AtomicBool>,
     active_tab: ActiveTab,
     dl_mode_excel: bool,
     dl_track_query: String,
@@ -1059,6 +1144,8 @@ struct KaraokeApp {
     dl_max_workers: usize,
     dl_stop_requested: bool,
     dl_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    batch_start_time: Option<Instant>,
+    dl_start_time: Option<Instant>,
 }
 
 impl KaraokeApp {
@@ -1173,6 +1260,10 @@ impl KaraokeApp {
             batch_current_index: None,
             batch_selected_index: None,
             batch_status_text: String::new(),
+            batch_is_scanning: false,
+            batch_scan_rx: None,
+            batch_single_mode: false,
+            batch_cancel: Arc::new(AtomicBool::new(false)),
             active_tab: ActiveTab::SingleTrack,
             dl_mode_excel: false,
             dl_track_query: String::new(),
@@ -1191,6 +1282,8 @@ impl KaraokeApp {
             dl_max_workers: 2,
             dl_stop_requested: false,
             dl_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            batch_start_time: None,
+            dl_start_time: None,
         }
     }
 
@@ -1566,7 +1659,7 @@ impl KaraokeApp {
         }
 
         if path.is_dir() {
-            self.load_batch_folder(path);
+            self.load_batch_folder(path, ctx);
         } else if is_audio_file(&path) {
             self.set_audio_file(path, ctx);
         } else if is_lyrics_file(&path) {
@@ -1590,66 +1683,73 @@ impl KaraokeApp {
         }
     }
 
-    fn load_batch_folder(&mut self, path: PathBuf) {
-        let (items, warnings) = scan_batch_folder(&path, self.fade_in_ms, self.fade_out_ms);
-        self.batch_root = Some(path.clone());
-        self.batch_items = items;
-        self.batch_running = false;
-        self.batch_stop_requested = false;
-        self.batch_current_index = None;
-        self.batch_selected_index = if self.batch_items.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
-        self.batch_status_text = format!(
-            "Найдено {} пар в {}",
-            self.batch_items.len(),
-            display_file_name(&path)
-        );
-        self.log_output
-            .push_str(&format!("📁 Batch-папка: {}\n", path.to_string_lossy()));
-        self.log_output
-            .push_str(&format!("🎵 Найдено пар: {}\n", self.batch_items.len()));
-        for warning in warnings {
-            self.log_output.push_str(&format!("⚠️ {}\n", warning));
+    fn load_batch_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.batch_is_scanning {
+            return;
         }
+        self.batch_is_scanning = true;
+        self.batch_status_text = "Сканирование папки...".to_string();
+
+        let (tx, rx) = channel::<BatchScanResult>();
+        self.batch_scan_rx = Some(rx);
+
+        let fade_in = self.fade_in_ms;
+        let fade_out = self.fade_out_ms;
+        let ctx_clone = ctx.clone();
+
+        std::thread::spawn(move || {
+            let (items, warnings) = scan_batch_folder(&path, fade_in, fade_out);
+            let first_folder_name = display_file_name(&path);
+            let _ = tx.send(BatchScanResult {
+                root: Some(path),
+                items,
+                warnings,
+                folder_count: 1,
+                first_folder_name,
+            });
+            ctx_clone.request_repaint();
+        });
     }
 
-    fn load_batch_folders(&mut self, paths: Vec<PathBuf>) {
-        let mut items = Vec::new();
-        let mut warnings = Vec::new();
-        for path in &paths {
-            let (mut folder_items, mut folder_warnings) =
-                scan_batch_folder(path, self.fade_in_ms, self.fade_out_ms);
-            items.append(&mut folder_items);
-            warnings.append(&mut folder_warnings);
+    fn load_batch_folders(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if self.batch_is_scanning {
+            return;
         }
-        items.sort_by_key(|item| folder_sort_key(&item.folder));
+        self.batch_is_scanning = true;
+        self.batch_status_text = "Сканирование папок...".to_string();
 
-        self.batch_root = paths.first().cloned();
-        self.batch_items = items;
-        self.batch_running = false;
-        self.batch_stop_requested = false;
-        self.batch_current_index = None;
-        self.batch_selected_index = if self.batch_items.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
-        self.batch_status_text = format!(
-            "Найдено {} пар в {} папках",
-            self.batch_items.len(),
-            paths.len()
-        );
-        self.log_output.push_str(&format!(
-            "📁 Batch: перетащено папок: {}, найдено пар: {}\n",
-            paths.len(),
-            self.batch_items.len()
-        ));
-        for warning in warnings {
-            self.log_output.push_str(&format!("⚠️ {}\n", warning));
-        }
+        let (tx, rx) = channel::<BatchScanResult>();
+        self.batch_scan_rx = Some(rx);
+
+        let fade_in = self.fade_in_ms;
+        let fade_out = self.fade_out_ms;
+        let ctx_clone = ctx.clone();
+
+        std::thread::spawn(move || {
+            let mut items = Vec::new();
+            let mut warnings = Vec::new();
+            for path in &paths {
+                let (mut folder_items, mut folder_warnings) =
+                    scan_batch_folder(path, fade_in, fade_out);
+                items.append(&mut folder_items);
+                warnings.append(&mut folder_warnings);
+            }
+            items.sort_by_key(|item| folder_sort_key(&item.folder));
+
+            let first_folder_name = paths
+                .first()
+                .map(|p| display_file_name(p))
+                .unwrap_or_default();
+
+            let _ = tx.send(BatchScanResult {
+                root: paths.first().cloned(),
+                items,
+                warnings,
+                folder_count: paths.len(),
+                first_folder_name,
+            });
+            ctx_clone.request_repaint();
+        });
     }
 
     fn apply_batch_item_to_single_state(&mut self, index: usize) -> Result<(), String> {
@@ -1658,7 +1758,13 @@ impl KaraokeApp {
             .get(index)
             .cloned()
             .ok_or_else(|| "Задание не найдено".to_string())?;
-        let lyrics = read_lyrics_file(&item.lyrics_path)?;
+        let lyrics = if item.status == BatchStatus::MissingLyrics
+            || item.lyrics_path.as_os_str().is_empty()
+        {
+            String::new()
+        } else {
+            read_lyrics_file(&item.lyrics_path)?
+        };
 
         self.stop_preview();
         self.stop_video_preview();
@@ -1753,6 +1859,7 @@ impl KaraokeApp {
         }
 
         self.dl_stop_requested = false;
+        self.dl_start_time = Some(Instant::now());
         let mode_excel = self.dl_mode_excel;
         let query = self.dl_track_query.trim().to_string();
         let excel_path = self.dl_excel_path.clone();
@@ -1777,7 +1884,9 @@ impl KaraokeApp {
                 .iter()
                 .filter(|t| {
                     if continue_only {
-                        t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Skipped
+                        t.selected
+                            && t.status != TrackStatus::Success
+                            && t.status != TrackStatus::Skipped
                     } else {
                         t.selected
                     }
@@ -1796,7 +1905,10 @@ impl KaraokeApp {
 
             for t in &mut self.dl_tracks {
                 if continue_only {
-                    if t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Skipped {
+                    if t.selected
+                        && t.status != TrackStatus::Success
+                        && t.status != TrackStatus::Skipped
+                    {
                         t.status = TrackStatus::Pending;
                     }
                 } else {
@@ -1970,7 +2082,7 @@ impl KaraokeApp {
             }
 
             let _ = stderr_thread.join();
-            
+
             let mut child_opt = None;
             if let Ok(mut guard) = dl_child_clone.lock() {
                 child_opt = guard.take();
@@ -2003,7 +2115,8 @@ impl KaraokeApp {
         }
         self.dl_stop_requested = true;
         self.dl_status_text = "Остановка загрузки...".to_string();
-        self.dl_log_output.push_str("⚠️ Остановка загрузки пользователем...\n");
+        self.dl_log_output
+            .push_str("⚠️ Остановка загрузки пользователем...\n");
         if let Ok(mut guard) = self.dl_child.lock() {
             if let Some(mut child) = guard.take() {
                 let _ = child.kill();
@@ -2016,47 +2129,546 @@ impl KaraokeApp {
         if self.batch_items.is_empty() || self.is_generating {
             return;
         }
-
         for item in &mut self.batch_items {
+            if item.status == BatchStatus::MissingLyrics {
+                continue;
+            }
             item.progress = 0.0;
             item.output_path = None;
             item.status = BatchStatus::Ready;
+            let _ = std::fs::remove_file(batch_timings_path(&item.audio_path));
         }
-        self.batch_running = true;
-        self.batch_stop_requested = false;
-        self.batch_current_index = None;
-        self.progress = 0.0;
-        self.status_text = "Batch: запуск очереди...".to_string();
-        self.batch_status_text = format!("В очереди {} заданий", self.batch_items.len());
-        self.log_output.push_str(&format!(
-            "🚀 Batch: запуск {} заданий\n",
-            self.batch_items.len()
-        ));
-        self.start_next_batch_item(ctx);
+        self.start_batch_pipeline(ctx, false);
     }
 
     fn continue_batch_queue(&mut self, ctx: &egui::Context) {
         if self.batch_items.is_empty() || self.is_generating || self.batch_running {
             return;
         }
-        if !self
-            .batch_items
-            .iter()
-            .any(|item| item.status == BatchStatus::Ready)
-        {
+        for item in &mut self.batch_items {
+            if item.status == BatchStatus::Done
+                || item.status == BatchStatus::MissingLyrics
+                || matches!(item.status, BatchStatus::Error(_))
+            {
+                continue;
+            }
+            item.progress = 0.0;
+            item.output_path = None;
+            item.status = if batch_timings_path(&item.audio_path).exists() {
+                BatchStatus::ReadyToRender
+            } else {
+                BatchStatus::Ready
+            };
+        }
+        self.start_batch_pipeline(ctx, true);
+    }
+
+    fn start_batch_pipeline(&mut self, ctx: &egui::Context, resume: bool) {
+        if self.batch_items.is_empty() || self.is_generating || self.batch_running {
             return;
         }
+        let worker_path = match find_worker() {
+            Some(path) => path,
+            None => {
+                self.log_output
+                    .push_str("❌ Batch: не найден karaoke_worker.\n");
+                return;
+            }
+        };
+        let renderer_path = match find_rust_renderer() {
+            Some(path) => path,
+            None => {
+                self.log_output
+                    .push_str("❌ Batch: не найден Rust-рендер karaoke_render.\n");
+                return;
+            }
+        };
 
         self.batch_running = true;
+        self.batch_start_time = Some(Instant::now());
         self.batch_stop_requested = false;
         self.batch_current_index = None;
-        self.batch_status_text = "Batch: продолжение очереди...".to_string();
-        self.log_output.push_str("▶️ Batch: продолжение очереди.\n");
-        self.start_next_batch_item(ctx);
+        self.batch_cancel.store(false, Ordering::Relaxed);
+        self.progress = 0.0;
+        self.status_text = "Batch: подготовка очереди...".to_string();
+        self.batch_status_text = if resume {
+            "Batch: продолжение очереди...".to_string()
+        } else {
+            format!("В очереди {} заданий", self.batch_items.len())
+        };
+        self.log_output.push_str(&format!(
+            "🚀 Batch: {} {} заданий через общий align-процесс\n",
+            if resume {
+                "продолжение"
+            } else {
+                "запуск"
+            },
+            self.batch_items.len()
+        ));
+
+        let items = self.batch_items.clone();
+        let model = self.model.clone();
+        let quality = self.quality.clone();
+        let font = self.font.clone();
+        let active_hex = format!(
+            "#{:02X}{:02X}{:02X}",
+            self.color_active[0], self.color_active[1], self.color_active[2]
+        );
+        let inactive_hex = format!(
+            "#{:02X}{:02X}{:02X}",
+            self.color_inactive[0], self.color_inactive[1], self.color_inactive[2]
+        );
+        let bg_hex = format!(
+            "#{:02X}{:02X}{:02X}",
+            self.color_bg[0], self.color_bg[1], self.color_bg[2]
+        );
+        let inactive_opacity = self.inactive_opacity.clamp(0.0, 1.0);
+        let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
+        let plain_lines = self.plain_lines;
+        let cancel = self.batch_cancel.clone();
+        let temp = temp_dir().join("batch");
+        let (tx, rx) = channel::<ProgressUpdate>();
+        self.rx = Some(rx);
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            #[derive(Serialize)]
+            struct AlignQueueEntry {
+                index: usize,
+                audio: String,
+                artist: String,
+                title: String,
+                lyrics_file: String,
+                timings_output: String,
+            }
+
+            #[derive(Clone)]
+            struct RenderTask {
+                index: usize,
+                audio_path: PathBuf,
+                timings_path: PathBuf,
+                output_path: PathBuf,
+                duration_ms: i64,
+            }
+
+            let _ = std::fs::create_dir_all(&temp);
+            let mut align_queue = Vec::new();
+            let mut render_tasks = Vec::new();
+
+            for (idx, item) in items.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ProgressUpdate::RawLog("⏸ Batch остановлен.".to_string()));
+                    let _ = tx.send(ProgressUpdate::BatchFinished);
+                    ctx.request_repaint();
+                    return;
+                }
+
+                if item.status == BatchStatus::Done
+                    || item.status == BatchStatus::MissingLyrics
+                    || matches!(item.status, BatchStatus::Error(_))
+                {
+                    continue;
+                }
+
+                let item_temp = temp.join(format!("{:03}", idx + 1));
+                let _ = std::fs::create_dir_all(&item_temp);
+                let timings_path = batch_timings_path(&item.audio_path);
+                let mut render_audio_path = item.audio_path.clone();
+                let mut lyrics_text =
+                    std::fs::read_to_string(&item.lyrics_path).unwrap_or_else(|_| String::new());
+
+                let start = item
+                    .trim_start_ms
+                    .clamp(0, item.duration_ms.saturating_sub(1000));
+                let end = item.trim_end_ms.clamp(start + 1000, item.duration_ms);
+                let should_trim = start > 0
+                    || end < item.duration_ms.saturating_sub(250)
+                    || item.fade_in_ms > 0
+                    || item.fade_out_ms > 0;
+
+                if should_trim {
+                    let trimmed_path = item_temp.join("audio.wav");
+                    match render_trimmed_audio(
+                        &item.audio_path.to_string_lossy(),
+                        start,
+                        end,
+                        item.fade_in_ms as i64,
+                        item.fade_out_ms as i64,
+                        &trimmed_path,
+                    ) {
+                        Ok(()) => {
+                            lyrics_text =
+                                shift_lrc_for_trim(&lyrics_text, start, end.saturating_sub(start));
+                            render_audio_path = trimmed_path;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(ProgressUpdate::BatchProgress {
+                                index: idx,
+                                status: BatchStatus::Error(err.clone()),
+                                progress: 0.0,
+                                message: err,
+                                output_path: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
+                let lyrics_path = item_temp.join("lyrics.txt");
+                if let Err(err) = std::fs::write(&lyrics_path, lyrics_text) {
+                    let message = format!("Не удалось подготовить текст: {err}");
+                    let _ = tx.send(ProgressUpdate::BatchProgress {
+                        index: idx,
+                        status: BatchStatus::Error(message.clone()),
+                        progress: 0.0,
+                        message,
+                        output_path: None,
+                    });
+                    continue;
+                }
+
+                if timings_path.exists() {
+                    let _ = tx.send(ProgressUpdate::BatchProgress {
+                        index: idx,
+                        status: BatchStatus::ReadyToRender,
+                        progress: 1.0,
+                        message: "Тайминги уже есть, Whisper пропущен.".to_string(),
+                        output_path: None,
+                    });
+                } else {
+                    align_queue.push(AlignQueueEntry {
+                        index: idx,
+                        audio: render_audio_path.to_string_lossy().to_string(),
+                        artist: item.artist.clone(),
+                        title: item.title.clone(),
+                        lyrics_file: lyrics_path.to_string_lossy().to_string(),
+                        timings_output: timings_path.to_string_lossy().to_string(),
+                    });
+                }
+
+                render_tasks.push(RenderTask {
+                    index: idx,
+                    audio_path: render_audio_path,
+                    timings_path,
+                    output_path: batch_output_path(item),
+                    duration_ms: (end - start).max(1),
+                });
+            }
+
+            if !align_queue.is_empty() {
+                let queue_path = temp.join("align_queue.json");
+                match serde_json::to_string_pretty(&align_queue)
+                    .map_err(|err| err.to_string())
+                    .and_then(|data| {
+                        std::fs::write(&queue_path, data).map_err(|err| err.to_string())
+                    }) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let _ = tx.send(ProgressUpdate::Error(format!(
+                            "Batch: не удалось записать очередь align: {err}"
+                        )));
+                        let _ = tx.send(ProgressUpdate::BatchFinished);
+                        return;
+                    }
+                }
+
+                let _ = tx.send(ProgressUpdate::RawLog(format!(
+                    "🧠 Batch align: {} треков, модель загрузится один раз.",
+                    align_queue.len()
+                )));
+
+                let mut cmd = if is_python_worker(&worker_path) {
+                    let mut cmd = std::process::Command::new("python3");
+                    cmd.arg(&worker_path);
+                    cmd
+                } else {
+                    std::process::Command::new(&worker_path)
+                };
+                hide_subprocess_window(&mut cmd);
+                if let Some(bin_dir) = bundled_bin_dir() {
+                    let old_path = std::env::var_os("PATH").unwrap_or_default();
+                    let mut paths = vec![bin_dir];
+                    paths.extend(std::env::split_paths(&old_path));
+                    if let Ok(joined) = std::env::join_paths(paths) {
+                        cmd.env("PATH", joined);
+                    }
+                }
+                cmd.env("PYTHONUTF8", "1")
+                    .arg("--cli")
+                    .arg("--batch-align-queue")
+                    .arg(&queue_path)
+                    .arg("--model")
+                    .arg(&model)
+                    .arg("--quality")
+                    .arg(&quality)
+                    .arg("--font")
+                    .arg(&font)
+                    .arg("--color-active")
+                    .arg(&active_hex)
+                    .arg("--color-inactive")
+                    .arg(&inactive_hex)
+                    .arg("--color-bg")
+                    .arg(&bg_hex)
+                    .arg("--inactive-opacity")
+                    .arg(inactive_opacity.to_string())
+                    .arg("--audio-delay")
+                    .arg(audio_delay_seconds.to_string())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                if plain_lines {
+                    cmd.arg("--plain-lines");
+                }
+
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        let tx_err = tx.clone();
+                        let ctx_err = ctx.clone();
+                        let stderr_handle = child.stderr.take().map(|stderr| {
+                            std::thread::spawn(move || {
+                                use std::io::{BufRead, BufReader};
+                                let reader = BufReader::new(stderr);
+                                for line in reader.lines().map_while(Result::ok) {
+                                    let trimmed = line.trim();
+                                    if !trimmed.is_empty() {
+                                        let _ = tx_err.send(ProgressUpdate::RawLog(format!(
+                                            "[LOG] {}",
+                                            trimmed
+                                        )));
+                                        ctx_err.request_repaint();
+                                    }
+                                }
+                            })
+                        });
+
+                        if let Some(stdout) = child.stdout.take() {
+                            use std::io::{BufRead, BufReader};
+                            let reader = BufReader::new(stdout);
+                            for line in reader.lines().map_while(Result::ok) {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let _ = child.kill();
+                                    break;
+                                }
+                                let trimmed = line.trim();
+                                if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                                    if let Ok(update) = serde_json::from_str::<CLIProgress>(trimmed)
+                                    {
+                                        if let Some(index) = update.batch_align_index {
+                                            let status = if update.error.is_some() {
+                                                BatchStatus::Error(
+                                                    update
+                                                        .error
+                                                        .clone()
+                                                        .unwrap_or_else(|| "Ошибка".to_string()),
+                                                )
+                                            } else if update.done {
+                                                BatchStatus::ReadyToRender
+                                            } else {
+                                                BatchStatus::Aligning
+                                            };
+                                            let _ = tx.send(ProgressUpdate::BatchProgress {
+                                                index,
+                                                status,
+                                                progress: update.progress.clamp(0.0, 1.0),
+                                                message: update.status,
+                                                output_path: None,
+                                            });
+                                            ctx.request_repaint();
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if !trimmed.is_empty() {
+                                    let _ = tx.send(ProgressUpdate::RawLog(trimmed.to_string()));
+                                    ctx.request_repaint();
+                                }
+                            }
+                        }
+                        if let Some(handle) = stderr_handle {
+                            let _ = handle.join();
+                        }
+                        let success = child.wait().map(|status| status.success()).unwrap_or(false);
+                        if !success && !cancel.load(Ordering::Relaxed) {
+                            let _ = tx.send(ProgressUpdate::RawLog(
+                                "❌ Batch align завершился с ошибкой.".to_string(),
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(ProgressUpdate::Error(format!(
+                            "Batch: не удалось запустить align worker: {err}"
+                        )));
+                        let _ = tx.send(ProgressUpdate::BatchFinished);
+                        return;
+                    }
+                }
+            }
+
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressUpdate::RawLog("⏸ Batch остановлен.".to_string()));
+                let _ = tx.send(ProgressUpdate::BatchFinished);
+                ctx.request_repaint();
+                return;
+            }
+
+            let _ = tx.send(ProgressUpdate::RawLog(
+                "🎬 Batch render: рендерим видео по готовым таймингам.".to_string(),
+            ));
+
+            for task in render_tasks {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !task.timings_path.exists() {
+                    let _ = tx.send(ProgressUpdate::BatchProgress {
+                        index: task.index,
+                        status: BatchStatus::Error("Нет файла таймингов".to_string()),
+                        progress: 0.0,
+                        message: "Нет файла таймингов".to_string(),
+                        output_path: None,
+                    });
+                    continue;
+                }
+
+                let _ = tx.send(ProgressUpdate::BatchProgress {
+                    index: task.index,
+                    status: BatchStatus::Rendering,
+                    progress: 0.0,
+                    message: "Рендеринг".to_string(),
+                    output_path: None,
+                });
+
+                let mut render_cmd = std::process::Command::new(&renderer_path);
+                hide_subprocess_window(&mut render_cmd);
+                if let Some(bin_dir) = bundled_bin_dir() {
+                    let old_path = std::env::var_os("PATH").unwrap_or_default();
+                    let mut paths = vec![bin_dir];
+                    paths.extend(std::env::split_paths(&old_path));
+                    if let Ok(joined) = std::env::join_paths(paths) {
+                        render_cmd.env("PATH", joined);
+                    }
+                }
+                render_cmd
+                    .arg("--timings")
+                    .arg(&task.timings_path)
+                    .arg("--audio")
+                    .arg(&task.audio_path)
+                    .arg("--output")
+                    .arg(&task.output_path)
+                    .arg("--quality")
+                    .arg(&quality)
+                    .arg("--color-active")
+                    .arg(&active_hex)
+                    .arg("--color-inactive")
+                    .arg(&inactive_hex)
+                    .arg("--color-bg")
+                    .arg(&bg_hex)
+                    .arg("--inactive-opacity")
+                    .arg(inactive_opacity.to_string())
+                    .arg("--engine")
+                    .arg(
+                        std::env::var("KARAOKE_RENDER_ENGINE")
+                            .unwrap_or_else(|_| "ass".to_string()),
+                    )
+                    .arg("--audio-delay")
+                    .arg(audio_delay_seconds.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped());
+                if plain_lines {
+                    render_cmd.arg("--plain-lines");
+                }
+
+                match render_cmd.spawn() {
+                    Ok(mut child) => {
+                        if let Some(stderr) = child.stderr.take() {
+                            use std::io::{BufRead, BufReader};
+                            let reader = BufReader::new(stderr);
+                            for line in reader.lines().map_while(Result::ok) {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let _ = child.kill();
+                                    break;
+                                }
+                                let trimmed = line.trim();
+                                let progress = parse_ffmpeg_time_ms(trimmed)
+                                    .map(|time_ms| {
+                                        (time_ms as f32 / task.duration_ms as f32).clamp(0.0, 0.98)
+                                    })
+                                    .or_else(|| {
+                                        trimmed.strip_prefix("render ").and_then(|percent| {
+                                            percent
+                                                .trim_end_matches('%')
+                                                .parse::<f32>()
+                                                .ok()
+                                                .map(|value| (value / 100.0).clamp(0.0, 0.98))
+                                        })
+                                    });
+                                if let Some(progress) = progress {
+                                    let _ = tx.send(ProgressUpdate::BatchProgress {
+                                        index: task.index,
+                                        status: BatchStatus::Rendering,
+                                        progress,
+                                        message: format!(
+                                            "Рендеринг: {}%",
+                                            (progress * 100.0).round() as i32
+                                        ),
+                                        output_path: None,
+                                    });
+                                    ctx.request_repaint();
+                                    continue;
+                                }
+                                if is_ffmpeg_progress_key(trimmed) {
+                                    continue;
+                                }
+                                if !trimmed.is_empty() {
+                                    let _ = tx.send(ProgressUpdate::RawLog(format!(
+                                        "[Rust] {}",
+                                        trimmed
+                                    )));
+                                }
+                            }
+                        }
+                        let success = child.wait().map(|status| status.success()).unwrap_or(false);
+                        if success && !cancel.load(Ordering::Relaxed) {
+                            let output = task.output_path.to_string_lossy().to_string();
+                            let _ = tx.send(ProgressUpdate::BatchProgress {
+                                index: task.index,
+                                status: BatchStatus::Done,
+                                progress: 1.0,
+                                message: "Готово".to_string(),
+                                output_path: Some(output),
+                            });
+                        } else if !cancel.load(Ordering::Relaxed) {
+                            let _ = tx.send(ProgressUpdate::BatchProgress {
+                                index: task.index,
+                                status: BatchStatus::Error(
+                                    "Rust-рендер завершился с ошибкой".to_string(),
+                                ),
+                                progress: 0.0,
+                                message: "Rust-рендер завершился с ошибкой".to_string(),
+                                output_path: None,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("Ошибка запуска Rust-рендера: {err}");
+                        let _ = tx.send(ProgressUpdate::BatchProgress {
+                            index: task.index,
+                            status: BatchStatus::Error(message.clone()),
+                            progress: 0.0,
+                            message,
+                            output_path: None,
+                        });
+                    }
+                }
+            }
+
+            let _ = tx.send(ProgressUpdate::BatchFinished);
+            ctx.request_repaint();
+        });
     }
 
     fn request_stop_batch(&mut self) {
         self.batch_stop_requested = true;
+        self.batch_cancel.store(true, Ordering::Relaxed);
         self.batch_status_text =
             "Остановка запрошена: текущее видео будет завершено, новые не начнутся.".to_string();
         self.log_output
@@ -2097,7 +2709,7 @@ impl KaraokeApp {
         };
 
         if let Some(item) = self.batch_items.get_mut(index) {
-            item.status = BatchStatus::Running;
+            item.status = BatchStatus::Rendering;
             item.progress = 0.0;
         }
         self.batch_current_index = Some(index);
@@ -2149,7 +2761,59 @@ impl KaraokeApp {
             };
         }
         self.is_generating = false;
-        self.start_next_batch_item(ctx);
+        if self.batch_single_mode {
+            self.batch_running = false;
+            self.batch_single_mode = false;
+            self.batch_status_text = "Генерация выбранного трека завершена.".to_string();
+        } else {
+            self.start_next_batch_item(ctx);
+        }
+    }
+
+    fn start_single_batch_item(&mut self, index: usize, ctx: &egui::Context) {
+        if self.batch_items.is_empty() || self.is_generating || self.batch_running {
+            return;
+        }
+        if index >= self.batch_items.len() {
+            return;
+        }
+
+        if let Some(item) = self.batch_items.get_mut(index) {
+            item.status = BatchStatus::Rendering;
+            item.progress = 0.0;
+        }
+
+        self.batch_running = true;
+        self.batch_single_mode = true;
+        self.batch_stop_requested = false;
+        self.batch_current_index = Some(index);
+        self.progress = 0.0;
+
+        if let Err(err) = self.apply_batch_item_to_single_state(index) {
+            if let Some(item) = self.batch_items.get_mut(index) {
+                item.status = BatchStatus::Error(err.clone());
+            }
+            self.log_output
+                .push_str(&format!("❌ Batch (выбранный): {} — {}\n", index + 1, err));
+            self.batch_current_index = None;
+            self.batch_running = false;
+            self.batch_single_mode = false;
+            return;
+        }
+
+        let item_name = self
+            .batch_items
+            .get(index)
+            .map(|item| format!("{} - {}", item.artist, item.title))
+            .unwrap_or_else(|| format!("Задание {}", index + 1));
+
+        self.batch_status_text = format!("Генерация выбранного: {}", item_name);
+        self.log_output.push_str(&format!(
+            "\n🚀 Запуск генерации выбранного трека: {}\n",
+            item_name
+        ));
+        self.batch_start_time = Some(Instant::now());
+        self.start_generation(ctx.clone());
     }
 
     fn clamped_trim_bounds(&self) -> Option<(i64, i64)> {
@@ -2841,6 +3505,7 @@ impl KaraokeApp {
                         done: false,
                         error: None,
                         file: None,
+                        batch_align_index: None,
                     }));
                     let _ = tx.send(ProgressUpdate::RawLog(format!(
                         "🎬 Rust-рендер: {}",
@@ -2919,6 +3584,7 @@ impl KaraokeApp {
                                             done: false,
                                             error: None,
                                             file: None,
+                                            batch_align_index: None,
                                         }));
                                         ctx.request_repaint();
                                         continue;
@@ -2937,6 +3603,7 @@ impl KaraokeApp {
                                                     done: false,
                                                     error: None,
                                                     file: None,
+                                                    batch_align_index: None,
                                                 }));
                                             ctx.request_repaint();
                                             continue;
@@ -2967,6 +3634,7 @@ impl KaraokeApp {
                                     done: true,
                                     error: None,
                                     file: Some(output_mp4_path.to_string_lossy().to_string()),
+                                    batch_align_index: None,
                                 }));
                             } else {
                                 let _ = tx.send(ProgressUpdate::Error(
@@ -3113,6 +3781,35 @@ impl eframe::App for KaraokeApp {
                         }
                     }
                 }
+                ProgressUpdate::BatchProgress {
+                    index,
+                    status,
+                    progress,
+                    message,
+                    output_path,
+                } => {
+                    self.progress = progress;
+                    self.status_text = message.clone();
+                    self.batch_status_text = format!(
+                        "Batch: {}/{} — {}",
+                        index + 1,
+                        self.batch_items.len(),
+                        message
+                    );
+                    self.batch_current_index = Some(index);
+                    if let Some(item) = self.batch_items.get_mut(index) {
+                        item.status = status;
+                        item.progress = progress;
+                        if output_path.is_some() {
+                            item.output_path = output_path.clone();
+                        }
+                    }
+                    if let Some(path) = output_path {
+                        self.generated_file = Some(path.clone());
+                        self.log_output
+                            .push_str(&format!("🎉 Batch сохранено: {}\n", path));
+                    }
+                }
                 ProgressUpdate::RawLog(log) => {
                     debug_log(format!("[worker-raw] {}", log));
                     self.log_output.push_str(&format!("{}\n", log));
@@ -3149,6 +3846,97 @@ impl eframe::App for KaraokeApp {
                         self.log_output
                             .push_str("❌ Процесс завершился с кодом ошибки.\n");
                     }
+                }
+                ProgressUpdate::BatchFinished => {
+                    self.batch_running = false;
+                    self.batch_current_index = None;
+                    self.batch_stop_requested = false;
+                    self.batch_cancel.store(false, Ordering::Relaxed);
+                    self.is_generating = false;
+                    let done = self
+                        .batch_items
+                        .iter()
+                        .filter(|item| item.status == BatchStatus::Done)
+                        .count();
+                    let missing = self
+                        .batch_items
+                        .iter()
+                        .filter(|item| item.status == BatchStatus::MissingLyrics)
+                        .count();
+                    let failed = self
+                        .batch_items
+                        .iter()
+                        .filter(|item| matches!(item.status, BatchStatus::Error(_)))
+                        .count();
+                    self.batch_status_text = format!(
+                        "Batch завершен: готово {}, ошибок {}, без текста {}",
+                        done, failed, missing
+                    );
+                    self.log_output.push_str(&format!(
+                        "✅ Batch завершен: готово {}, ошибок {}, без текста {}\n",
+                        done, failed, missing
+                    ));
+                }
+            }
+        }
+
+        // Опрос фонового канала сканирования папок (Batch)
+        if let Some(rx) = &self.batch_scan_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.batch_is_scanning = false;
+                self.batch_scan_rx = None;
+
+                self.batch_root = res.root;
+                self.batch_items = res.items;
+                self.batch_running = false;
+                self.batch_stop_requested = false;
+                self.batch_current_index = None;
+                self.batch_selected_index = if self.batch_items.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+
+                let total_items = self.batch_items.len();
+                let missing_lyrics = self
+                    .batch_items
+                    .iter()
+                    .filter(|item| item.status == BatchStatus::MissingLyrics)
+                    .count();
+                let processable_items = total_items.saturating_sub(missing_lyrics);
+
+                if res.folder_count == 1 {
+                    self.batch_status_text = format!(
+                        "Найдено {} треков в {} · к обработке {} · без текста {}",
+                        total_items, res.first_folder_name, processable_items, missing_lyrics
+                    );
+                    self.log_output.push_str(&format!(
+                        "📁 Batch-папка: {}\n",
+                        self.batch_root
+                            .as_ref()
+                            .map(|r| r.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    ));
+                } else {
+                    self.batch_status_text = format!(
+                        "Найдено {} треков в {} папках · к обработке {} · без текста {}",
+                        total_items, res.folder_count, processable_items, missing_lyrics
+                    );
+                    self.log_output.push_str(&format!(
+                        "📁 Batch: перетащено папок: {}, найдено треков: {}, к обработке: {}, без текста: {}\n",
+                        res.folder_count,
+                        total_items,
+                        processable_items,
+                        missing_lyrics
+                    ));
+                }
+
+                self.log_output.push_str(&format!(
+                    "🎵 Найдено треков: {}, к обработке: {}, без текста: {}\n",
+                    total_items, processable_items, missing_lyrics
+                ));
+                for warning in res.warnings {
+                    self.log_output.push_str(&format!("⚠️ {}\n", warning));
                 }
             }
         }
@@ -3215,7 +4003,7 @@ impl eframe::App for KaraokeApp {
             .cloned()
             .collect();
         if dropped_dirs.len() > 1 && !self.is_generating && !self.batch_running {
-            self.load_batch_folders(dropped_dirs);
+            self.load_batch_folders(dropped_dirs, ctx);
             self.active_tab = ActiveTab::Batch;
         } else {
             for path in dropped_paths {
@@ -3353,6 +4141,11 @@ impl eframe::App for KaraokeApp {
                                 .iter()
                                 .filter(|item| matches!(item.status, BatchStatus::Error(_)))
                                 .count();
+                            let missing_lyrics = self
+                                .batch_items
+                                .iter()
+                                .filter(|item| item.status == BatchStatus::MissingLyrics)
+                                .count();
 
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
@@ -3369,7 +4162,7 @@ impl eframe::App for KaraokeApp {
                                         ui.horizontal_wrapped(|ui| {
                                             if ui
                                                 .add_enabled(
-                                                    !self.is_generating && !self.batch_running,
+                                                    !self.is_generating && !self.batch_running && !self.batch_is_scanning,
                                                     egui::Button::new(
                                                         egui::RichText::new("Выбрать папку")
                                                             .size(13.0)
@@ -3381,7 +4174,7 @@ impl eframe::App for KaraokeApp {
                                                 if let Some(path) =
                                                     rfd::FileDialog::new().pick_folder()
                                                 {
-                                                    self.load_batch_folder(path);
+                                                    self.load_batch_folder(path, ctx);
                                                 }
                                             }
 
@@ -3409,7 +4202,10 @@ impl eframe::App for KaraokeApp {
                                                 && self
                                                     .batch_items
                                                     .iter()
-                                                    .any(|item| item.status == BatchStatus::Ready);
+                                                    .any(|item| {
+                                                        item.status == BatchStatus::Ready
+                                                            || item.status == BatchStatus::ReadyToRender
+                                                    });
                                             if ui
                                                 .add_enabled(
                                                     can_continue_batch,
@@ -3422,6 +4218,31 @@ impl eframe::App for KaraokeApp {
                                                 .clicked()
                                             {
                                                 self.continue_batch_queue(ctx);
+                                            }
+
+                                            let can_gen_selected = !self.batch_items.is_empty()
+                                                && !self.is_generating
+                                                && !self.batch_running
+                                                && self.batch_selected_index.is_some();
+                                            let selected_can_generate = self
+                                                .batch_selected_index
+                                                .and_then(|idx| self.batch_items.get(idx))
+                                                .map(|item| item.status != BatchStatus::MissingLyrics)
+                                                .unwrap_or(false);
+                                            if ui
+                                                .add_enabled(
+                                                    can_gen_selected && selected_can_generate,
+                                                    egui::Button::new(
+                                                        egui::RichText::new("Сгенерировать выбранный")
+                                                            .size(13.0)
+                                                            .strong(),
+                                                    ).fill(egui::Color32::from_rgb(168, 85, 247)),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(idx) = self.batch_selected_index {
+                                                    self.start_single_batch_item(idx, ctx);
+                                                }
                                             }
 
                                             if ui
@@ -3463,7 +4284,59 @@ impl eframe::App for KaraokeApp {
                                                         muted
                                                     }),
                                             );
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} без текста",
+                                                    missing_lyrics
+                                                ))
+                                                .strong()
+                                                .size(13.0)
+                                                .color(if missing_lyrics > 0 {
+                                                    egui::Color32::from_rgb(255, 176, 96)
+                                                } else {
+                                                    muted
+                                                }),
+                                            );
                                         });
+                                        ui.add_space(4.0);
+
+                                        let batch_video_dir = self
+                                            .batch_root
+                                            .clone()
+                                            .unwrap_or_else(exports_dir);
+                                        if batch_video_dir.exists() {
+                                            if ui.button("📁 Открыть папку с видео").clicked() {
+                                                open_in_explorer(&batch_video_dir);
+                                            }
+                                            ui.add_space(4.0);
+                                        }
+
+                                        if self.batch_running {
+                                            if let Some(start_time) = self.batch_start_time {
+                                                let elapsed = start_time.elapsed().as_secs();
+                                                let elapsed_str = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
+
+                                                let mut time_str = format!("⏱️ Прошло: {}", elapsed_str);
+
+                                                let n = self.batch_items.len();
+                                                if n > 0 {
+                                                    let current_idx = self.batch_current_index.unwrap_or(0);
+                                                    let current_progress = self.progress;
+                                                    let total_progress = (current_idx as f32 + current_progress) / n as f32;
+
+                                                    if total_progress > 0.001 && total_progress < 1.0 {
+                                                        let total_est = elapsed as f32 / total_progress;
+                                                        let rem = (total_est - elapsed as f32).round() as u64;
+                                                        let rem_str = format!("{:02}:{:02}", rem / 60, rem % 60);
+                                                        time_str.push_str(&format!("  |  ⏳ Осталось ~{}", rem_str));
+                                                    }
+                                                }
+                                                ui.label(egui::RichText::new(time_str).size(12.0).color(muted));
+                                                ui.add_space(4.0);
+                                            }
+                                        }
+
                                         let folder_label = self
                                             .batch_root
                                             .as_ref()
@@ -3660,7 +4533,28 @@ impl eframe::App for KaraokeApp {
                         });
                         ui.add_space(6.0);
 
-                        if self.batch_items.is_empty() {
+                        if self.batch_is_scanning {
+                            drop_zone_frame.show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(30.0);
+                                    ui.add(egui::widgets::Spinner::new().size(30.0));
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        egui::RichText::new("Сканирование папки, считывание длительности аудио...")
+                                            .size(14.0)
+                                            .strong()
+                                            .color(accent),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new("Пожалуйста, подождите. Для больших папок это может занять несколько секунд.")
+                                            .size(11.0)
+                                            .color(muted),
+                                    );
+                                    ui.add_space(30.0);
+                                });
+                            });
+                        } else if self.batch_items.is_empty() {
                             drop_zone_frame.show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(20.0);
@@ -3761,8 +4655,11 @@ impl eframe::App for KaraokeApp {
                                                             let selected =
                                                                 self.batch_selected_index
                                                                     == Some(idx);
-                                                            let is_running =
-                                                                item.status == BatchStatus::Running;
+                                                            let is_running = matches!(
+                                                                item.status,
+                                                                BatchStatus::Aligning
+                                                                    | BatchStatus::Rendering
+                                                            );
                                                             let row_fill = if is_running {
                                                                 egui::Color32::from_rgb(24, 39, 66)
                                                             } else if selected {
@@ -3828,7 +4725,11 @@ impl eframe::App for KaraokeApp {
                                                                                     egui::Align::Center,
                                                                                 ),
                                                                                 |ui| {
-                                                                                    if item.status == BatchStatus::Running {
+                                                                                    if matches!(
+                                                                                        item.status,
+                                                                                        BatchStatus::Aligning
+                                                                                            | BatchStatus::Rendering
+                                                                                    ) {
                                                                                         let percent =
                                                                                             ((item.progress * 100.0).round() as i32)
                                                                                                 .clamp(0, 100);
@@ -3840,6 +4741,16 @@ impl eframe::App for KaraokeApp {
                                                                                             .monospace()
                                                                                             .size(11.0)
                                                                                             .color(accent),
+                                                                                        );
+                                                                                    } else if item.status
+                                                                                        == BatchStatus::MissingLyrics
+                                                                                    {
+                                                                                        ui.label(
+                                                                                            egui::RichText::new("нет текста")
+                                                                                                .size(10.5)
+                                                                                                .color(egui::Color32::from_rgb(
+                                                                                                    255, 176, 96,
+                                                                                                )),
                                                                                         );
                                                                                     } else {
                                                                                         ui.add_space(30.0);
@@ -3924,12 +4835,36 @@ impl eframe::App for KaraokeApp {
                                                                         ),
                                                                     );
                                                                 }
-                                                                BatchStatus::Running => {
+                                                                BatchStatus::Aligning
+                                                                | BatchStatus::Rendering => {
                                                                     painter.circle_stroke(
                                                                         status_center,
-                                                                        8.0,
+                                                                        11.5,
                                                                         egui::Stroke::new(
                                                                             1.5, accent,
+                                                                        ),
+                                                                    );
+                                                                    painter.circle_filled(
+                                                                        status_center,
+                                                                        4.0,
+                                                                        accent,
+                                                                    );
+                                                                }
+                                                                BatchStatus::ReadyToRender => {
+                                                                    painter.circle_filled(
+                                                                        status_center,
+                                                                        8.0,
+                                                                        egui::Color32::from_rgb(
+                                                                            246, 181, 70,
+                                                                        ),
+                                                                    );
+                                                                    painter.text(
+                                                                        status_center,
+                                                                        egui::Align2::CENTER_CENTER,
+                                                                        "R",
+                                                                        egui::FontId::monospace(8.0),
+                                                                        egui::Color32::from_rgb(
+                                                                            18, 16, 10,
                                                                         ),
                                                                     );
                                                                 }
@@ -3960,6 +4895,24 @@ impl eframe::App for KaraokeApp {
                                                                             egui::Color32::from_rgb(
                                                                                 42, 52, 68,
                                                                             ),
+                                                                        ),
+                                                                    );
+                                                                }
+                                                                BatchStatus::MissingLyrics => {
+                                                                    painter.circle_filled(
+                                                                        status_center,
+                                                                        8.0,
+                                                                        egui::Color32::from_rgb(
+                                                                            255, 176, 96,
+                                                                        ),
+                                                                    );
+                                                                    painter.text(
+                                                                        status_center,
+                                                                        egui::Align2::CENTER_CENTER,
+                                                                        "T",
+                                                                        egui::FontId::monospace(8.0),
+                                                                        egui::Color32::from_rgb(
+                                                                            24, 18, 8,
                                                                         ),
                                                                     );
                                                                 }
@@ -4219,14 +5172,16 @@ impl eframe::App for KaraokeApp {
                                                         .size(14.0)
                                                         .color(text),
                                                 );
+                                                let lyrics_path_label =
+                                                    if item_snapshot.lyrics_path.as_os_str().is_empty() {
+                                                        "LRC/TXT не найден".to_string()
+                                                    } else {
+                                                        item_snapshot.lyrics_path.to_string_lossy().to_string()
+                                                    };
                                                 ui.label(
-                                                    egui::RichText::new(
-                                                        item_snapshot
-                                                            .lyrics_path
-                                                            .to_string_lossy(),
-                                                    )
-                                                    .size(10.0)
-                                                    .color(muted),
+                                                    egui::RichText::new(lyrics_path_label)
+                                                        .size(10.0)
+                                                        .color(muted),
                                                 );
                                                 ui.add_space(8.0);
                                                 let text_top = ui.cursor().top();
@@ -4245,10 +5200,22 @@ impl eframe::App for KaraokeApp {
                                                         );
                                                         if edit_response.changed() {
                                                             if let Some(selected_idx) = self.batch_selected_index {
-                                                                 if selected_idx < self.batch_items.len() {
-                                                                     let path = &self.batch_items[selected_idx].lyrics_path;
-                                                                     let _ = std::fs::write(path, &self.lyrics);
-                                                                 }
+                                                                if let Some(item) = self.batch_items.get_mut(selected_idx) {
+                                                                    let path = if item.lyrics_path.as_os_str().is_empty() {
+                                                                        item.folder.join("lyrics.txt")
+                                                                    } else {
+                                                                        item.lyrics_path.clone()
+                                                                    };
+                                                                    if std::fs::write(&path, &self.lyrics).is_ok() {
+                                                                        item.lyrics_path = path;
+                                                                        if item.status == BatchStatus::MissingLyrics
+                                                                            && !self.lyrics.trim().is_empty()
+                                                                        {
+                                                                            item.status = BatchStatus::Ready;
+                                                                            item.progress = 0.0;
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     });
@@ -5105,6 +6072,18 @@ impl eframe::App for KaraokeApp {
                                         });
                                         ui.add_space(6.0);
                                         ui.add(egui::ProgressBar::new(self.progress).animate(self.is_generating));
+
+                                        if !self.is_generating && self.status_text.contains("успешно") {
+                                            if let Some(ref file_path) = self.generated_file {
+                                                let path = std::path::PathBuf::from(file_path);
+                                                if path.exists() {
+                                                    ui.add_space(6.0);
+                                                    if ui.button("📁 Открыть папку с видео").clicked() {
+                                                        open_in_explorer(&path);
+                                                    }
+                                                }
+                                            }
+                                        }
 
                                         ui.add_space(10.0);
                                         log_frame.show(ui, |ui| {

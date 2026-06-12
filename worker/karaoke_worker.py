@@ -2813,7 +2813,8 @@ if __name__ == '__main__':
         import argparse
         parser = argparse.ArgumentParser(description="Караоке-Генератор CLI")
         parser.add_argument('--cli', action='store_true')
-        parser.add_argument('--audio', required=True)
+        parser.add_argument('--audio', required=False)
+        parser.add_argument('--batch-align-queue')
         parser.add_argument('--artist', default='Исполнитель')
         parser.add_argument('--title', default='Песня')
         parser.add_argument('--lyrics-file')
@@ -2836,135 +2837,221 @@ if __name__ == '__main__':
         parser.print_help()
         sys.exit(0)
 
-    if '--cli' in sys.argv:
-        import argparse
-        parser = argparse.ArgumentParser(description="Караоке-Генератор CLI")
-        parser.add_argument('--cli', action='store_true')
-        parser.add_argument('--audio', required=True)
-        parser.add_argument('--artist', default='Исполнитель')
-        parser.add_argument('--title', default='Песня')
-        parser.add_argument('--lyrics-file')
-        parser.add_argument('--model', default='base')
-        parser.add_argument('--quality', default='medium')
-        parser.add_argument('--font', default='montserrat')
-        parser.add_argument('--color-active', default='#000000')
-        parser.add_argument('--color-inactive', default='#B4B9C3')
-        parser.add_argument('--color-bg', default='#FFFFFF')
-        parser.add_argument('--audio-delay', type=float, default=0.0)
-        parser.add_argument('--inactive-opacity', type=float, default=0.65)
-        parser.add_argument('--vocal-start', type=float, default=0.0)
-        parser.add_argument('--auto-vocal-start', action='store_true')
-        parser.add_argument('--detect-vocal-start', action='store_true')
-        parser.add_argument('--detect-window', type=float, default=45.0)
-        parser.add_argument('--timings-only', action='store_true')
-        parser.add_argument('--timings-output')
-        parser.add_argument('--plain-lines', action='store_true', default=False)
-        parser.add_argument('--no-scrolling', action='store_true', dest='plain_lines')
-        
-        args = parser.parse_args()
+class ObservableDict(dict):
+    def __init__(self, parent, key, *args, **kwargs):
+        self.parent = parent
+        self.key = key
+        super().__init__(*args, **kwargs)
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self.parent.notify(self.key, self)
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.parent.notify(self.key, self)
 
-        if args.detect_vocal_start:
-            try:
-                print(json.dumps({"progress": 0.05, "status": "Предобработка: поиск первого вокала...", "done": False}), flush=True)
-                lyrics_for_detect = ''
-                if args.lyrics_file:
-                    try:
-                        with open(args.lyrics_file, 'r', encoding='utf-8') as f:
-                            lyrics_for_detect = f.read()
-                    except Exception:
-                        lyrics_for_detect = ''
-                detected = detect_vocal_start(
-                    args.audio,
-                    args.model,
-                    args.detect_window,
-                    language=infer_lyrics_language(lyrics_for_detect),
-                    lyrics_text=lyrics_for_detect,
-                )
-                print(json.dumps({
-                    "progress": 1.0,
-                    "status": f"Первый вокал найден: {detected['vocal_start']:.1f} сек.",
-                    "done": True,
-                    "vocal_start": detected["vocal_start"],
-                    "confidence": detected["confidence"],
-                    "segments": detected["segments"],
-                }), flush=True)
-                sys.exit(0)
-            except Exception as e:
-                print(json.dumps({"progress": 1.0, "status": f"Предобработка не удалась: {str(e)}", "done": True, "error": str(e), "vocal_start": 0.0}), flush=True)
-                sys.exit(1)
+class CLIJobsDict(dict):
+    def __init__(self, batch_align_index=None, *args, **kwargs):
+        self.batch_align_index = batch_align_index
+        super().__init__(*args, **kwargs)
+    def __getitem__(self, key):
+        if key not in self:
+            super().__setitem__(key, ObservableDict(self, key))
+        return super().__getitem__(key)
+    def __setitem__(self, key, val):
+        if not isinstance(val, ObservableDict):
+            val = ObservableDict(self, key, val)
+        super().__setitem__(key, val)
+        self.notify(key, val)
+    def notify(self, key, val):
+        out = dict(val)
+        if self.batch_align_index is not None:
+            out["batch_align_index"] = self.batch_align_index
+        print(json.dumps(out), flush=True)
 
-        if not args.lyrics_file:
-            print(json.dumps({"progress": 1.0, "status": "❌ Ошибка: не указан файл текста", "done": True, "error": "lyrics-file is required"}), flush=True)
-            sys.exit(1)
-        
-        # Читаем текст песни из файла
-        with open(args.lyrics_file, 'r', encoding='utf-8') as f:
-            lyrics_text = f.read()
-            
-        # Создаем эмулятор-выводитель прогресса в stdout с поддержкой глубокого отслеживания мутаций
-        class ObservableDict(dict):
-            def __init__(self, parent, key, *args, **kwargs):
-                self.parent = parent
-                self.key = key
-                super().__init__(*args, **kwargs)
-            def __setitem__(self, k, v):
-                super().__setitem__(k, v)
-                self.parent.notify(self.key, self)
-            def update(self, *args, **kwargs):
-                super().update(*args, **kwargs)
-                self.parent.notify(self.key, self)
+def run_batch_align(queue_path, model_name, quality='medium', font_family='montserrat',
+                    color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF',
+                    audio_delay=0.0, plain_lines=False, inactive_opacity=0.65):
+    with open(queue_path, 'r', encoding='utf-8') as f:
+        queue = json.load(f)
 
-        class CLIJobsDict(dict):
-            def __getitem__(self, key):
-                if key not in self:
-                    super().__setitem__(key, ObservableDict(self, key))
-                return super().__getitem__(key)
-            def __setitem__(self, key, val):
-                if not isinstance(val, ObservableDict):
-                    val = ObservableDict(self, key, val)
-                super().__setitem__(key, val)
-                self.notify(key, val)
-            def notify(self, key, val):
-                print(json.dumps(val), flush=True)
-                
-        # Переопределяем глобальный словарь jobs
-        globals()['jobs'] = CLIJobsDict()
-        job_id = "cli_job"
+    for item in queue:
+        idx = item["index"]
+        audio_path = item["audio"]
+        artist = item["artist"]
+        title = item["title"]
+        lyrics_file = item["lyrics_file"]
+        timings_output = item["timings_output"]
+
+        # Read lyrics
+        with open(lyrics_file, 'r', encoding='utf-8') as lf:
+            lyrics_text = lf.read()
+
+        # Set up globals for this item
+        globals()['jobs'] = CLIJobsDict(batch_align_index=idx)
+        job_id = f"batch_job_{idx}"
         jobs[job_id] = {
             "progress": 0.0,
-            "status": "Инициализация CLI-генерации...",
+            "status": f"Начало синхронизации...",
             "done": False,
             "error": None,
             "file": None
         }
-        
+
         try:
             generate_karaoke_thread(
                 job_id=job_id,
-                audio_path=args.audio,
-                artist=args.artist,
-                title=args.title,
+                audio_path=audio_path,
+                artist=artist,
+                title=title,
                 lyrics=lyrics_text,
-                model_name=args.model,
+                model_name=model_name,
+                quality=quality,
+                font_family=font_family,
+                color_active=color_active,
+                color_inactive=color_inactive,
+                color_bg=color_bg,
+                audio_delay=audio_delay,
+                timings_only=True,
+                timings_output=timings_output,
+                plain_lines=plain_lines,
+                inactive_opacity=inactive_opacity
+            )
+            # Ensure done message is sent
+            jobs[job_id]["progress"] = 1.0
+            jobs[job_id]["status"] = "Синхронизация завершена"
+            jobs[job_id]["done"] = True
+        except Exception as e:
+            jobs[job_id]["progress"] = 1.0
+            jobs[job_id]["status"] = f"Ошибка: {str(e)}"
+            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["done"] = True
+
+def run_cli_entrypoint():
+    import argparse
+    parser = argparse.ArgumentParser(description="Караоке-Генератор CLI")
+    parser.add_argument('--cli', action='store_true')
+    parser.add_argument('--audio', required=False)
+    parser.add_argument('--batch-align-queue')
+    parser.add_argument('--artist', default='Исполнитель')
+    parser.add_argument('--title', default='Песня')
+    parser.add_argument('--lyrics-file')
+    parser.add_argument('--model', default='base')
+    parser.add_argument('--quality', default='medium')
+    parser.add_argument('--font', default='montserrat')
+    parser.add_argument('--color-active', default='#000000')
+    parser.add_argument('--color-inactive', default='#B4B9C3')
+    parser.add_argument('--color-bg', default='#FFFFFF')
+    parser.add_argument('--audio-delay', type=float, default=0.0)
+    parser.add_argument('--inactive-opacity', type=float, default=0.65)
+    parser.add_argument('--vocal-start', type=float, default=0.0)
+    parser.add_argument('--auto-vocal-start', action='store_true')
+    parser.add_argument('--detect-vocal-start', action='store_true')
+    parser.add_argument('--detect-window', type=float, default=45.0)
+    parser.add_argument('--timings-only', action='store_true')
+    parser.add_argument('--timings-output')
+    parser.add_argument('--plain-lines', action='store_true', default=False)
+    parser.add_argument('--no-scrolling', action='store_true', dest='plain_lines')
+
+    args = parser.parse_args()
+
+    if args.batch_align_queue:
+        try:
+            run_batch_align(
+                args.batch_align_queue,
+                args.model,
                 quality=args.quality,
                 font_family=args.font,
                 color_active=args.color_active,
                 color_inactive=args.color_inactive,
                 color_bg=args.color_bg,
                 audio_delay=args.audio_delay,
-                vocal_start=args.vocal_start,
-                auto_vocal_start=args.auto_vocal_start,
-                timings_only=args.timings_only,
-                timings_output=args.timings_output,
                 plain_lines=args.plain_lines,
-                inactive_opacity=args.inactive_opacity
+                inactive_opacity=args.inactive_opacity,
             )
-            if jobs[job_id].get("error"):
-                sys.exit(1)
+            sys.exit(0)
         except Exception as e:
-            print(json.dumps({"progress": 1.0, "status": f"❌ Ошибка: {str(e)}", "done": True, "error": str(e)}), flush=True)
+            print(json.dumps({"progress": 1.0, "status": f"❌ Ошибка пакетного выравнивания: {str(e)}", "done": True, "error": str(e)}), flush=True)
             sys.exit(1)
-        sys.exit(0)
+
+    if args.detect_vocal_start:
+        try:
+            print(json.dumps({"progress": 0.05, "status": "Предобработка: поиск первого вокала...", "done": False}), flush=True)
+            lyrics_for_detect = ''
+            if args.lyrics_file:
+                try:
+                    with open(args.lyrics_file, 'r', encoding='utf-8') as f:
+                        lyrics_for_detect = f.read()
+                except Exception:
+                    lyrics_for_detect = ''
+            detected = detect_vocal_start(
+                args.audio,
+                args.model,
+                args.detect_window,
+                language=infer_lyrics_language(lyrics_for_detect),
+                lyrics_text=lyrics_for_detect,
+            )
+            print(json.dumps({
+                "progress": 1.0,
+                "status": f"Первый вокал найден: {detected['vocal_start']:.1f} сек.",
+                "done": True,
+                "vocal_start": detected["vocal_start"],
+                "confidence": detected["confidence"],
+                "segments": detected["segments"],
+            }), flush=True)
+            sys.exit(0)
+        except Exception as e:
+            print(json.dumps({"progress": 1.0, "status": f"Предобработка не удалась: {str(e)}", "done": True, "error": str(e), "vocal_start": 0.0}), flush=True)
+            sys.exit(1)
+
+    if not args.lyrics_file:
+        print(json.dumps({"progress": 1.0, "status": "❌ Ошибка: не указан файл текста", "done": True, "error": "lyrics-file is required"}), flush=True)
+        sys.exit(1)
+
+    with open(args.lyrics_file, 'r', encoding='utf-8') as f:
+        lyrics_text = f.read()
+
+    globals()['jobs'] = CLIJobsDict()
+    job_id = "cli_job"
+    jobs[job_id] = {
+        "progress": 0.0,
+        "status": "Инициализация CLI-генерации...",
+        "done": False,
+        "error": None,
+        "file": None
+    }
+
+    try:
+        generate_karaoke_thread(
+            job_id=job_id,
+            audio_path=args.audio,
+            artist=args.artist,
+            title=args.title,
+            lyrics=lyrics_text,
+            model_name=args.model,
+            quality=args.quality,
+            font_family=args.font,
+            color_active=args.color_active,
+            color_inactive=args.color_inactive,
+            color_bg=args.color_bg,
+            audio_delay=args.audio_delay,
+            vocal_start=args.vocal_start,
+            auto_vocal_start=args.auto_vocal_start,
+            timings_only=args.timings_only,
+            timings_output=args.timings_output,
+            plain_lines=args.plain_lines,
+            inactive_opacity=args.inactive_opacity
+        )
+        if jobs[job_id].get("error"):
+            sys.exit(1)
+    except Exception as e:
+        print(json.dumps({"progress": 1.0, "status": f"❌ Ошибка: {str(e)}", "done": True, "error": str(e)}), flush=True)
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    if '--cli' in sys.argv:
+        run_cli_entrypoint()
 
     if getattr(sys, "frozen", False):
         print("This bundled worker is intended to be launched by Karaoke Generator with --cli.", file=sys.stderr)
@@ -2975,9 +3062,6 @@ if __name__ == '__main__':
     print("Браузер откроется автоматически через несколько секунд.")
     print("Вы также можете перейти по адресу вручную: http://127.0.0.1:5050")
     print("==================================================================")
-    
-    # Запускаем автоматическое открытие браузера в отдельном потоке
+
     threading.Thread(target=open_browser, daemon=True).start()
-    
-    # Запускаем Flask сервер локально на порту 5050
     app.run(host='127.0.0.1', port=5050, debug=False)

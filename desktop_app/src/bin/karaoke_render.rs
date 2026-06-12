@@ -514,14 +514,14 @@ fn scroll_positions(
 ) -> Vec<f32> {
     let mut positions = Vec::with_capacity(total_frames);
     let mut scroll_y = 0.0_f32;
-    
+
     let transition_duration = 0.80_f64; // 0.80 seconds
     let transition_total_frames = (transition_duration * fps).round().max(1.0) as usize;
-    
+
     let mut last_target_y = 0.0_f32;
     let mut transition_start_y = 0.0_f32;
     let mut transition_frame = transition_total_frames; // initially not in transition
-    
+
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 / fps - audio_delay;
         let active_idx = if transitions.is_empty() {
@@ -530,13 +530,13 @@ fn scroll_positions(
             active_line(transitions, t)
         };
         let target_scroll_y = active_idx as f32 * line_spacing;
-        
+
         if target_scroll_y != last_target_y {
             transition_start_y = scroll_y;
             transition_frame = 0;
             last_target_y = target_scroll_y;
         }
-        
+
         if transition_frame < transition_total_frames {
             transition_frame += 1;
             let x = transition_frame as f32 / transition_total_frames as f32;
@@ -545,7 +545,7 @@ fn scroll_positions(
         } else {
             scroll_y = target_scroll_y;
         }
-        
+
         positions.push(scroll_y);
     }
     positions
@@ -688,7 +688,7 @@ fn write_ass_file(
     // Sub-pixel thresholds — changes below these are invisible
     const POS_THRESH: f32 = 0.05; // position: ±0.05px
     const FS_THRESH: f32 = 0.05; // font size: ±0.05px
-    const ALPHA_THRESH: u8 = 1;   // alpha: ±1/255
+    const ALPHA_THRESH: u8 = 1; // alpha: ±1/255
     const CLIP_THRESH: f32 = 0.1; // clip boundary: ±0.1px
 
     #[derive(Clone)]
