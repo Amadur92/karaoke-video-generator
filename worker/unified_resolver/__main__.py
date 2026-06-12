@@ -326,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--no-url-check", action="store_true", help="skip public URL preflight checks")
     batch.add_argument("--tracks-file", help="path to JSON file containing subset of tracks to download")
     batch.add_argument("--overwrite", action="store_true", help="overwrite already downloaded tracks")
+    batch.add_argument("--workers", type=int, default=2, help="maximum parallel download workers")
 
     parse_sheet = sub.add_parser("parse-sheet", help="parse CSV or Excel file and print tracks as JSON")
     parse_sheet.add_argument("file_path", help="path to CSV or Excel file")
@@ -499,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
                 return False
 
         success_count = 0
-        max_workers = 2
+        max_workers = getattr(args, 'workers', 2)
         print(f"[*] Starting parallel download with {max_workers} threads...")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(process_track, track): track for track in tracks}

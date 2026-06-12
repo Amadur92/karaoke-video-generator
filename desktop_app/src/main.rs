@@ -1056,6 +1056,9 @@ struct KaraokeApp {
     dl_is_parsing_excel: bool,
     dl_parse_rx: Option<Receiver<Result<Vec<TrackItem>, String>>>,
     dl_overwrite: bool,
+    dl_max_workers: usize,
+    dl_stop_requested: bool,
+    dl_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
 }
 
 impl KaraokeApp {
@@ -1185,6 +1188,9 @@ impl KaraokeApp {
             dl_is_parsing_excel: false,
             dl_parse_rx: None,
             dl_overwrite: false,
+            dl_max_workers: 2,
+            dl_stop_requested: false,
+            dl_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1741,11 +1747,12 @@ impl KaraokeApp {
         });
     }
 
-    fn start_download(&mut self, ctx: &egui::Context) {
+    fn start_download(&mut self, ctx: &egui::Context, continue_only: bool) {
         if self.dl_is_running {
             return;
         }
 
+        self.dl_stop_requested = false;
         let mode_excel = self.dl_mode_excel;
         let query = self.dl_track_query.trim().to_string();
         let excel_path = self.dl_excel_path.clone();
@@ -1753,6 +1760,7 @@ impl KaraokeApp {
         let limit = self.dl_limit_candidates;
         let format = self.dl_format.clone();
         let overwrite = self.dl_overwrite;
+        let max_workers = self.dl_max_workers;
 
         let output_path = match output_dir {
             Some(p) => p,
@@ -1767,7 +1775,13 @@ impl KaraokeApp {
             let selected_tracks: Vec<TrackItem> = self
                 .dl_tracks
                 .iter()
-                .filter(|t| t.selected)
+                .filter(|t| {
+                    if continue_only {
+                        t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Skipped
+                    } else {
+                        t.selected
+                    }
+                })
                 .cloned()
                 .collect();
             self.dl_log_output.push_str(&format!(
@@ -1781,8 +1795,14 @@ impl KaraokeApp {
             }
 
             for t in &mut self.dl_tracks {
-                if t.selected {
-                    t.status = TrackStatus::Pending;
+                if continue_only {
+                    if t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Skipped {
+                        t.status = TrackStatus::Pending;
+                    }
+                } else {
+                    if t.selected {
+                        t.status = TrackStatus::Pending;
+                    }
                 }
             }
 
@@ -1827,6 +1847,7 @@ impl KaraokeApp {
         self.dl_rx = Some(rx);
 
         let ctx_clone = ctx.clone();
+        let dl_child_clone = self.dl_child.clone();
 
         std::thread::spawn(move || {
             let mut cmd = if is_python_worker(&worker_path) {
@@ -1874,6 +1895,8 @@ impl KaraokeApp {
                     cmd.arg("--overwrite");
                 }
 
+                cmd.arg("--workers").arg(max_workers.to_string());
+
                 let _ = tx.send(format!(
                     "📁 Пакетный режим.\nФайл: {}\nПроект: {}\nПапка сохранения: {}",
                     xlsx_path.to_string_lossy(),
@@ -1916,6 +1939,10 @@ impl KaraokeApp {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
 
+            if let Ok(mut guard) = dl_child_clone.lock() {
+                *guard = Some(child);
+            }
+
             let tx_err = tx.clone();
             let ctx_err = ctx_clone.clone();
             let stderr_thread = std::thread::spawn(move || {
@@ -1943,8 +1970,18 @@ impl KaraokeApp {
             }
 
             let _ = stderr_thread.join();
-            let status = child.wait();
-            let success = status.map(|s| s.success()).unwrap_or(false);
+            
+            let mut child_opt = None;
+            if let Ok(mut guard) = dl_child_clone.lock() {
+                child_opt = guard.take();
+            }
+
+            let success = if let Some(mut child) = child_opt {
+                let status = child.wait();
+                status.map(|s| s.success()).unwrap_or(false)
+            } else {
+                false
+            };
 
             if success {
                 let _ = tx.send("___FINISHED_SUCCESS___".to_string());
@@ -1958,6 +1995,21 @@ impl KaraokeApp {
 
             ctx_clone.request_repaint();
         });
+    }
+
+    fn request_stop_download(&mut self) {
+        if !self.dl_is_running {
+            return;
+        }
+        self.dl_stop_requested = true;
+        self.dl_status_text = "Остановка загрузки...".to_string();
+        self.dl_log_output.push_str("⚠️ Остановка загрузки пользователем...\n");
+        if let Ok(mut guard) = self.dl_child.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 
     fn start_batch_queue(&mut self, ctx: &egui::Context) {
@@ -3133,9 +3185,16 @@ impl eframe::App for KaraokeApp {
                     .push_str("\n🎉 Загрузка успешно завершена!\n");
             } else if log_line == "___FINISHED_FAILURE___" {
                 self.dl_is_running = false;
-                self.dl_status_text = "Загрузка завершилась с ошибкой".to_string();
-                self.dl_log_output
-                    .push_str("\n❌ Загрузка прервана из-за ошибки.\n");
+                if self.dl_stop_requested {
+                    self.dl_status_text = "Загрузка остановлена пользователем".to_string();
+                    self.dl_log_output
+                        .push_str("\n🛑 Загрузка остановлена пользователем.\n");
+                    self.dl_stop_requested = false;
+                } else {
+                    self.dl_status_text = "Загрузка завершилась с ошибкой".to_string();
+                    self.dl_log_output
+                        .push_str("\n❌ Загрузка прервана из-за ошибки.\n");
+                }
             } else {
                 parse_log_line_and_update_status(&log_line, &mut self.dl_tracks);
                 self.dl_log_output.push_str(&format!("{}\n", log_line));
@@ -4314,6 +4373,10 @@ impl eframe::App for KaraokeApp {
                                         ui.add_space(20.0);
                                         ui.label("Лимит поиска:");
                                         ui.add(egui::Slider::new(&mut self.dl_limit_candidates, 1..=10));
+
+                                        ui.add_space(20.0);
+                                        ui.label("Потоков:");
+                                        ui.add(egui::Slider::new(&mut self.dl_max_workers, 1..=5));
                                     });
                                     ui.add_space(8.0);
 
@@ -4324,16 +4387,33 @@ impl eframe::App for KaraokeApp {
 
                                     // Кнопки
                                     ui.horizontal(|ui| {
-                                        let can_start = self.dl_excel_path.is_some()
-                                            && self.dl_output_dir.is_some()
-                                            && !self.dl_is_running
-                                            && !self.dl_is_parsing_excel;
+                                        if self.dl_is_running {
+                                            if ui.button(egui::RichText::new("⏹ Остановить загрузку").strong()).clicked() {
+                                                self.request_stop_download();
+                                            }
+                                        } else {
+                                            let can_start = self.dl_excel_path.is_some()
+                                                && self.dl_output_dir.is_some()
+                                                && !self.dl_is_parsing_excel;
 
-                                        if ui.add_enabled(
-                                            can_start,
-                                            egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
-                                        ).clicked() {
-                                            self.start_download(ctx);
+                                            if ui.add_enabled(
+                                                can_start,
+                                                egui::Button::new(egui::RichText::new("▶ Начать заново").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
+                                            ).clicked() {
+                                                self.start_download(ctx, false);
+                                            }
+
+                                            let has_incomplete = self.dl_tracks.iter().any(|t| {
+                                                t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Skipped
+                                            });
+                                            let can_continue = can_start && has_incomplete;
+
+                                            if ui.add_enabled(
+                                                can_continue,
+                                                egui::Button::new(egui::RichText::new("⏯ Продолжить").strong()).fill(egui::Color32::from_rgb(34, 197, 94))
+                                            ).clicked() {
+                                                self.start_download(ctx, true);
+                                            }
                                         }
 
                                         if ui.button("Очистить лог").clicked() {
@@ -4603,15 +4683,20 @@ impl eframe::App for KaraokeApp {
 
                                 // Кнопки
                                 ui.horizontal(|ui| {
-                                    let can_start = !self.dl_track_query.trim().is_empty()
-                                        && self.dl_output_dir.is_some()
-                                        && !self.dl_is_running;
+                                    if self.dl_is_running {
+                                        if ui.button(egui::RichText::new("⏹ Остановить загрузку").strong()).clicked() {
+                                            self.request_stop_download();
+                                        }
+                                    } else {
+                                        let can_start = !self.dl_track_query.trim().is_empty()
+                                            && self.dl_output_dir.is_some();
 
-                                    if ui.add_enabled(
-                                        can_start,
-                                        egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
-                                    ).clicked() {
-                                        self.start_download(ctx);
+                                        if ui.add_enabled(
+                                            can_start,
+                                            egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
+                                        ).clicked() {
+                                            self.start_download(ctx, false);
+                                        }
                                     }
 
                                     if ui.button("Очистить лог").clicked() {
