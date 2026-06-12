@@ -17,6 +17,7 @@ use std::os::windows::process::CommandExt;
 // Шрифты Montserrat вкомпилированы прямо в бинарник — нулевая зависимость от внешних файлов
 const MONTSERRAT_REGULAR: &[u8] = include_bytes!("../assets/Montserrat-Regular.ttf");
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../assets/Montserrat-Bold.ttf");
+const MONTSERRAT_BLACK: &[u8] = include_bytes!("../assets/Montserrat-Black.ttf");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -943,6 +944,43 @@ fn batch_trim_timeline_static_ui(
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ActiveTab {
+    SingleTrack,
+    Batch,
+    Downloader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackStatus {
+    Pending,
+    Downloading,
+    Success,
+    Failed,
+    Skipped,
+}
+
+impl Default for TrackStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrackItem {
+    pub pos: usize,
+    pub artist: String,
+    pub title: String,
+    #[serde(default = "default_true")]
+    pub selected: bool,
+    #[serde(skip)]
+    pub status: TrackStatus,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 struct KaraokeApp {
     audio_path: Option<String>,
     audio_duration_ms: Option<i64>,
@@ -1004,6 +1042,21 @@ struct KaraokeApp {
     batch_selected_index: Option<usize>,
     batch_status_text: String,
     batch_view: bool,
+    active_tab: ActiveTab,
+    dl_mode_excel: bool,
+    dl_track_query: String,
+    dl_excel_path: Option<PathBuf>,
+    dl_output_dir: Option<PathBuf>,
+    dl_limit_candidates: usize,
+    dl_format: String,
+    dl_is_running: bool,
+    dl_status_text: String,
+    dl_log_output: String,
+    dl_rx: Option<Receiver<String>>,
+    dl_tracks: Vec<TrackItem>,
+    dl_is_parsing_excel: bool,
+    dl_parse_rx: Option<Receiver<Result<Vec<TrackItem>, String>>>,
+    dl_overwrite: bool,
 }
 
 impl KaraokeApp {
@@ -1041,6 +1094,10 @@ impl KaraokeApp {
             "montserrat_bold".to_owned(),
             egui::FontData::from_static(MONTSERRAT_BOLD),
         );
+        fonts.font_data.insert(
+            "montserrat_black".to_owned(),
+            egui::FontData::from_static(MONTSERRAT_BLACK),
+        );
         fonts
             .families
             .get_mut(&egui::FontFamily::Proportional)
@@ -1051,6 +1108,11 @@ impl KaraokeApp {
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
             .insert(1, "montserrat_bold".to_owned());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(2, "montserrat_black".to_owned());
         cc.egui_ctx.set_fonts(fonts);
 
         // 3. Загрузка сохраненных настроек
@@ -1082,7 +1144,7 @@ impl KaraokeApp {
             color_active: settings.color_active,
             color_inactive: settings.color_inactive,
             color_bg: settings.color_bg,
-            inactive_opacity: settings.inactive_opacity.clamp(0.2, 1.0),
+            inactive_opacity: settings.inactive_opacity.clamp(0.0, 1.0),
             audio_delay_ms: settings.audio_delay_ms,
             is_generating: false,
             progress: 0.0,
@@ -1110,6 +1172,21 @@ impl KaraokeApp {
             batch_selected_index: None,
             batch_status_text: String::new(),
             batch_view: false,
+            active_tab: ActiveTab::SingleTrack,
+            dl_mode_excel: false,
+            dl_track_query: String::new(),
+            dl_excel_path: None,
+            dl_output_dir: None,
+            dl_limit_candidates: 5,
+            dl_format: "mp3".to_string(),
+            dl_is_running: false,
+            dl_status_text: "Готов".to_string(),
+            dl_log_output: String::new(),
+            dl_rx: None,
+            dl_tracks: Vec::new(),
+            dl_is_parsing_excel: false,
+            dl_parse_rx: None,
+            dl_overwrite: false,
         }
     }
 
@@ -1490,10 +1567,15 @@ impl KaraokeApp {
             self.set_audio_file(path, ctx);
         } else if is_lyrics_file(&path) {
             self.set_lyrics_file(path);
+        } else if path.extension().map(|ext| ext.to_string_lossy().to_string().to_lowercase()).as_deref() == Some("xlsx") {
+            self.dl_excel_path = Some(path.clone());
+            self.dl_mode_excel = true;
+            self.active_tab = ActiveTab::Downloader;
+            self.start_parsing_excel(path, ctx.clone());
         } else {
             self.status_text = "Файл не поддерживается".to_string();
             self.log_output.push_str(&format!(
-                "⚠️ Файл {} не принят. Можно перетащить .mp3, .txt или .lrc.\n",
+                "⚠️ Файл {} не принят. Можно перетащить .mp3, .txt, .lrc или .xlsx.\n",
                 display_file_name(&path)
             ));
         }
@@ -1588,6 +1670,266 @@ impl KaraokeApp {
         self.lyrics = lyrics;
         self.generated_file = None;
         Ok(())
+    }
+
+    fn start_parsing_excel(&mut self, path: PathBuf, ctx: egui::Context) {
+        self.dl_is_parsing_excel = true;
+        self.dl_tracks.clear();
+        self.dl_status_text = "Чтение файла Excel...".to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dl_parse_rx = Some(rx);
+
+        let worker_path = match find_worker() {
+            Some(w) => w,
+            None => {
+                let _ = tx.send(Err("Не удалось найти исполняемый файл воркера (karaoke_worker)".to_string()));
+                ctx.request_repaint();
+                return;
+            }
+        };
+        
+        std::thread::spawn(move || {
+            let mut cmd = if is_python_worker(&worker_path) {
+                let mut cmd = std::process::Command::new("python3");
+                cmd.arg(&worker_path);
+                cmd
+            } else {
+                std::process::Command::new(&worker_path)
+            };
+            
+            cmd.env("PYTHONUTF8", "1");
+            cmd.arg("parse-sheet")
+                .arg(&path);
+
+            #[cfg(windows)]
+            cmd.creation_flags(0x08000000);
+
+            let output = match cmd.output() {
+                Ok(out) => out,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Не удалось запустить python3: {}", e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                let _ = tx.send(Err(format!("Ошибка парсинга таблицы: {}", err_msg)));
+                ctx.request_repaint();
+                return;
+            }
+
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            match serde_json::from_str::<Vec<TrackItem>>(&stdout_str) {
+                Ok(tracks) => {
+                    let _ = tx.send(Ok(tracks));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Ошибка декодирования JSON: {}, вывод: {}", e, stdout_str)));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_download(&mut self, ctx: &egui::Context) {
+        if self.dl_is_running {
+            return;
+        }
+
+        let mode_excel = self.dl_mode_excel;
+        let query = self.dl_track_query.trim().to_string();
+        let excel_path = self.dl_excel_path.clone();
+        let output_dir = self.dl_output_dir.clone();
+        let limit = self.dl_limit_candidates;
+        let format = self.dl_format.clone();
+        let overwrite = self.dl_overwrite;
+
+        let output_path = match output_dir {
+            Some(p) => p,
+            None => {
+                self.dl_status_text = "Ошибка: не выбрана папка сохранения".to_string();
+                return;
+            }
+        };
+
+        let mut tracks_file_path = None;
+        if mode_excel {
+            let selected_tracks: Vec<TrackItem> = self.dl_tracks.iter().filter(|t| t.selected).cloned().collect();
+            self.dl_log_output.push_str(&format!("📁 Всего треков в списке: {}, выбрано для скачивания: {}\n", self.dl_tracks.len(), selected_tracks.len()));
+            if selected_tracks.is_empty() {
+                self.dl_status_text = "Ошибка: не выбрано ни одного трека для загрузки".to_string();
+                return;
+            }
+
+            for t in &mut self.dl_tracks {
+                if t.selected {
+                    t.status = TrackStatus::Pending;
+                }
+            }
+
+            let project_id = excel_path.as_ref()
+                .and_then(|p| p.file_stem())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            
+            let temp_path = std::env::temp_dir().join(format!("tracks_{}.json", project_id));
+            match serde_json::to_string_pretty(&selected_tracks) {
+                Ok(json_str) => {
+                    if let Err(e) = std::fs::write(&temp_path, json_str) {
+                        self.dl_status_text = format!("Ошибка записи временного файла: {}", e);
+                        return;
+                    }
+                    tracks_file_path = Some(temp_path);
+                }
+                Err(e) => {
+                    self.dl_status_text = format!("Ошибка сериализации треков: {}", e);
+                    return;
+                }
+            }
+        }
+
+        let worker_path = match find_worker() {
+            Some(w) => w,
+            None => {
+                self.dl_status_text = "Ошибка: не удалось найти исполняемый файл воркера (karaoke_worker)".to_string();
+                return;
+            }
+        };
+
+        self.dl_is_running = true;
+        self.dl_status_text = "Запуск процесса загрузки...".to_string();
+        self.dl_log_output.push_str("🚀 Запуск загрузчика...\n");
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        self.dl_rx = Some(rx);
+
+        let ctx_clone = ctx.clone();
+
+        std::thread::spawn(move || {
+            let mut cmd = if is_python_worker(&worker_path) {
+                let mut cmd = std::process::Command::new("python3");
+                cmd.arg(&worker_path);
+                cmd
+            } else {
+                std::process::Command::new(&worker_path)
+            };
+            
+            cmd.env("PYTHONUTF8", "1");
+
+            if mode_excel {
+                let xlsx_path = match excel_path {
+                    Some(p) => p,
+                    None => {
+                        let _ = tx.send("❌ Ошибка: не выбран файл Excel".to_string());
+                        let _ = tx.send("___FINISHED_FAILURE___".to_string());
+                        ctx_clone.request_repaint();
+                        return;
+                    }
+                };
+
+                let project_id = xlsx_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                cmd.arg("batch")
+                    .arg(&xlsx_path)
+                    .arg(&project_id)
+                    .arg("--output")
+                    .arg(&output_path)
+                    .arg("--limit")
+                    .arg(limit.to_string())
+                    .arg("--format")
+                    .arg(&format);
+
+                if let Some(ref json_path) = tracks_file_path {
+                    cmd.arg("--tracks-file").arg(json_path);
+                }
+
+                if overwrite {
+                    cmd.arg("--overwrite");
+                }
+
+                let _ = tx.send(format!("📁 Пакетный режим.\nФайл: {}\nПроект: {}\nПапка сохранения: {}", xlsx_path.to_string_lossy(), project_id, output_path.to_string_lossy()));
+            } else {
+                cmd.arg("download")
+                    .arg(&query)
+                    .arg("--output")
+                    .arg(&output_path)
+                    .arg("--limit")
+                    .arg(limit.to_string())
+                    .arg("--format")
+                    .arg(&format);
+
+                let _ = tx.send(format!("🎵 Одиночный режим.\nТрек: {}\nПапка сохранения: {}", query, output_path.to_string_lossy()));
+            }
+
+            #[cfg(windows)]
+            cmd.creation_flags(0x08000000);
+
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(format!("❌ Не удалось запустить python3: {}", e));
+                    let _ = tx.send("___FINISHED_FAILURE___".to_string());
+                    ctx_clone.request_repaint();
+                    return;
+                }
+            };
+
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let tx_err = tx.clone();
+            let ctx_err = ctx_clone.clone();
+            let stderr_thread = std::thread::spawn(move || {
+                if let Some(err) = stderr {
+                    use std::io::{BufRead, BufReader};
+                    let reader = BufReader::new(err);
+                    for line in reader.lines() {
+                        if let Ok(l) = line {
+                            let _ = tx_err.send(l);
+                            ctx_err.request_repaint();
+                        }
+                    }
+                }
+            });
+
+            if let Some(out) = stdout {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(out);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        let _ = tx.send(l);
+                        ctx_clone.request_repaint();
+                    }
+                }
+            }
+
+            let _ = stderr_thread.join();
+            let status = child.wait();
+            let success = status.map(|s| s.success()).unwrap_or(false);
+
+            if success {
+                let _ = tx.send("___FINISHED_SUCCESS___".to_string());
+            } else {
+                let _ = tx.send("___FINISHED_FAILURE___".to_string());
+            }
+
+            if let Some(ref json_path) = tracks_file_path {
+                let _ = std::fs::remove_file(json_path);
+            }
+
+            ctx_clone.request_repaint();
+        });
     }
 
     fn start_batch_queue(&mut self, ctx: &egui::Context) {
@@ -2153,7 +2495,7 @@ impl KaraokeApp {
         let active_color = self.color_active;
         let inactive_color = self.color_inactive;
         let bg_color = self.color_bg;
-        let inactive_opacity = self.inactive_opacity.clamp(0.2, 1.0);
+        let inactive_opacity = self.inactive_opacity.clamp(0.0, 1.0);
         let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
         let fade_in_ms = self.fade_in_ms;
         let fade_out_ms = self.fade_out_ms;
@@ -2731,6 +3073,44 @@ impl eframe::App for KaraokeApp {
             }
         }
 
+        // Опрос фонового канала парсинга Excel
+        if let Some(rx) = &self.dl_parse_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.dl_is_parsing_excel = false;
+                self.dl_parse_rx = None;
+                match res {
+                    Ok(tracks) => {
+                        self.dl_tracks = tracks;
+                        self.dl_status_text = format!("Загружено треков из файла: {}", self.dl_tracks.len());
+                    }
+                    Err(err) => {
+                        self.dl_status_text = format!("Ошибка: {}", err);
+                        self.dl_log_output.push_str(&format!("❌ {}\n", err));
+                    }
+                }
+            }
+        }
+
+        // Опрос фонового канала загрузчика
+        loop {
+            let update = self.dl_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            let Some(log_line) = update else {
+                break;
+            };
+            if log_line == "___FINISHED_SUCCESS___" {
+                self.dl_is_running = false;
+                self.dl_status_text = "Загрузка успешно завершена!".to_string();
+                self.dl_log_output.push_str("\n🎉 Загрузка успешно завершена!\n");
+            } else if log_line == "___FINISHED_FAILURE___" {
+                self.dl_is_running = false;
+                self.dl_status_text = "Загрузка завершилась с ошибкой".to_string();
+                self.dl_log_output.push_str("\n❌ Загрузка прервана из-за ошибки.\n");
+            } else {
+                parse_log_line_and_update_status(&log_line, &mut self.dl_tracks);
+                self.dl_log_output.push_str(&format!("{}\n", log_line));
+            }
+        }
+
         // Drag-and-drop файлов прямо на окно приложения: аудио и текст песни.
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -2746,7 +3126,7 @@ impl eframe::App for KaraokeApp {
             .collect();
         if dropped_dirs.len() > 1 && !self.is_generating && !self.batch_running {
             self.load_batch_folders(dropped_dirs);
-            self.batch_view = true;
+            self.active_tab = ActiveTab::Batch;
         } else {
             for path in dropped_paths {
                 self.handle_dropped_file(path, ctx);
@@ -2823,28 +3203,32 @@ impl eframe::App for KaraokeApp {
             });
             ui.add_space(18.0);
 
-            ui.horizontal(|ui| {
-                let single_selected = !self.batch_view;
-                let batch_selected = self.batch_view;
+             ui.horizontal(|ui| {
                 if ui
-                    .selectable_label(single_selected, egui::RichText::new("Один трек").strong())
+                    .selectable_label(self.active_tab == ActiveTab::SingleTrack, egui::RichText::new("Один трек").strong())
                     .clicked()
                     && !self.batch_running
                 {
-                    self.batch_view = false;
+                    self.active_tab = ActiveTab::SingleTrack;
                 }
                 if ui
-                    .selectable_label(batch_selected, egui::RichText::new("Batch").strong())
+                    .selectable_label(self.active_tab == ActiveTab::Batch, egui::RichText::new("Пакетный рендеринг").strong())
                     .clicked()
                 {
-                    self.batch_view = true;
+                    self.active_tab = ActiveTab::Batch;
+                }
+                if ui
+                    .selectable_label(self.active_tab == ActiveTab::Downloader, egui::RichText::new("Загрузчик аудио").strong())
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::Downloader;
                 }
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(if self.batch_view {
-                        "Массовая генерация: каждая подпапка получает свой MP4 рядом с MP3/LRC."
-                    } else {
-                        "Обычный режим для одного трека."
+                    egui::RichText::new(match self.active_tab {
+                        ActiveTab::SingleTrack => "Обычный режим создания караоке-видео для одного трека.",
+                        ActiveTab::Batch => "Массовая генерация: каждая подпапка получает свой MP4 рядом с MP3/LRC.",
+                        ActiveTab::Downloader => "Загрузка аудио: скачивание музыки по названию или списку из Excel.",
                     })
                     .size(12.0)
                     .color(muted),
@@ -2852,7 +3236,7 @@ impl eframe::App for KaraokeApp {
             });
             ui.add_space(14.0);
 
-            if self.batch_view {
+            if self.active_tab == ActiveTab::Batch {
                 let batch_margin = 14.0;
                 let content_width = ui.available_width() - batch_margin * 2.0;
                 ui.horizontal(|ui| {
@@ -3803,6 +4187,427 @@ impl eframe::App for KaraokeApp {
                     });
                     ui.add_space(page_margin);
                 });
+            } else if self.active_tab == ActiveTab::Downloader {
+                let batch_margin = 14.0;
+                let content_width = ui.available_width() - batch_margin * 2.0;
+                let col_height = ui.available_height() - 20.0;
+                
+                ui.horizontal(|ui| {
+                    ui.add_space(batch_margin);
+                    
+                    if self.dl_mode_excel {
+                        // ПАКЕТНЫЙ РЕЖИМ (Две колонки)
+                        let spacing = 18.0;
+                        let col_width = (content_width - spacing) / 2.0;
+                        
+                        ui.horizontal(|ui| {
+                            // Левая колонка: настройки и логи
+                            ui.vertical(|ui| {
+                                ui.set_width(col_width);
+                                ui.set_height(col_height);
+                                card_frame.show(ui, |ui| {
+                                    ui.set_min_width(col_width - 36.0);
+                                    ui.set_min_height(col_height - 36.0);
+                                    
+                                    ui.label(
+                                        egui::RichText::new("Настройки загрузчика")
+                                            .strong()
+                                            .size(18.0)
+                                            .color(text),
+                                    );
+                                    ui.add_space(14.0);
+                                    
+                                    // Выбор режима
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Режим:").strong());
+                                        if ui.selectable_label(false, "Поиск трека").clicked() && !self.dl_is_running {
+                                            self.dl_mode_excel = false;
+                                        }
+                                        if ui.selectable_label(true, "Пакетный (Excel)").clicked() && !self.dl_is_running {
+                                            self.dl_mode_excel = true;
+                                        }
+                                    });
+                                    ui.add_space(12.0);
+                                    
+                                    // Excel файл
+                                    ui.horizontal(|ui| {
+                                        ui.label("Файл Excel (.xlsx):");
+                                        if ui.button("Выбрать файл").clicked() && !self.dl_is_running {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("Excel Files", &["xlsx"])
+                                                .pick_file() 
+                                            {
+                                                self.dl_excel_path = Some(path.clone());
+                                                self.start_parsing_excel(path, ctx.clone());
+                                            }
+                                        }
+                                        if let Some(path) = &self.dl_excel_path {
+                                            ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                                        } else {
+                                            ui.label("Файл не выбран");
+                                        }
+                                    });
+                                    ui.add_space(10.0);
+                                    
+                                    // Папка сохранения
+                                    ui.horizontal(|ui| {
+                                        ui.label("Папка для сохранения:");
+                                        if ui.button("Выбрать папку").clicked() && !self.dl_is_running {
+                                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                self.dl_output_dir = Some(path);
+                                            }
+                                        }
+                                        if let Some(path) = &self.dl_output_dir {
+                                            ui.label(path.to_string_lossy());
+                                        } else {
+                                            ui.label("Папка не выбрана");
+                                        }
+                                    });
+                                    ui.add_space(12.0);
+                                    
+                                    // Дополнительные параметры
+                                    ui.horizontal(|ui| {
+                                        ui.label("Формат:");
+                                        egui::ComboBox::from_id_salt("dl_format_excel")
+                                            .selected_text(&self.dl_format)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut self.dl_format, "mp3".to_string(), "MP3");
+                                                ui.selectable_value(&mut self.dl_format, "flac".to_string(), "FLAC");
+                                                ui.selectable_value(&mut self.dl_format, "m4a".to_string(), "M4A");
+                                            });
+                                            
+                                        ui.add_space(20.0);
+                                        ui.label("Лимит поиска:");
+                                        ui.add(egui::Slider::new(&mut self.dl_limit_candidates, 1..=10));
+                                    });
+                                    ui.add_space(8.0);
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut self.dl_overwrite, "Перезаписывать существующие файлы");
+                                    });
+                                    ui.add_space(16.0);
+                                    
+                                    // Кнопки
+                                    ui.horizontal(|ui| {
+                                        let can_start = self.dl_excel_path.is_some() 
+                                            && self.dl_output_dir.is_some() 
+                                            && !self.dl_is_running 
+                                            && !self.dl_is_parsing_excel;
+                                            
+                                        if ui.add_enabled(
+                                            can_start,
+                                            egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
+                                        ).clicked() {
+                                            self.start_download(ctx);
+                                        }
+                                        
+                                        if ui.button("Очистить лог").clicked() {
+                                            self.dl_log_output.clear();
+                                        }
+                                    });
+                                    ui.add_space(14.0);
+                                    
+                                     // Статус и лог
+                                     ui.add_space(8.0);
+                                     ui.separator();
+                                     ui.add_space(8.0);
+
+                                     ui.label(egui::RichText::new("Статус загрузки").strong().size(15.0));
+                                     ui.add_space(6.0);
+                                     
+                                     let status_color = if self.dl_is_running {
+                                         accent
+                                     } else if self.dl_status_text.contains("успешно") {
+                                         egui::Color32::from_rgb(34, 197, 94)
+                                     } else if self.dl_status_text.contains("Ошибка") || self.dl_status_text.contains("Не удалось") {
+                                         egui::Color32::from_rgb(239, 68, 68)
+                                     } else {
+                                         muted
+                                     };
+                                     ui.label(egui::RichText::new(&self.dl_status_text).strong().color(status_color));
+                                     ui.add_space(8.0);
+
+                                     // Если процесс идет или завершен, показываем прогресс-бар и сводку
+                                     let total_selected = self.dl_tracks.iter().filter(|t| t.selected).count();
+                                     if total_selected > 0 {
+                                         let success_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Success).count();
+                                         let failed_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Failed).count();
+                                         let skipped_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Skipped).count();
+                                         let finished_count = success_count + failed_count + skipped_count;
+
+                                         let progress = finished_count as f32 / total_selected as f32;
+                                         ui.add(
+                                             egui::ProgressBar::new(progress)
+                                                 .text(format!("Обработано: {} из {}", finished_count, total_selected))
+                                                 .show_percentage()
+                                         );
+                                         ui.add_space(8.0);
+
+                                         ui.horizontal(|ui| {
+                                             ui.label(egui::RichText::new(format!("✅ Скачано: {}", success_count)).color(egui::Color32::from_rgb(34, 197, 94)));
+                                             ui.add_space(10.0);
+                                             ui.label(egui::RichText::new(format!("⏭️ Пропущено: {}", skipped_count)).color(egui::Color32::from_rgb(156, 163, 175)));
+                                             ui.add_space(10.0);
+                                             ui.label(egui::RichText::new(format!("❌ Ошибки: {}", failed_count)).color(egui::Color32::from_rgb(239, 68, 68)));
+                                         });
+                                         ui.add_space(14.0);
+
+                                         if self.dl_is_running {
+                                             let active_downloads: Vec<&TrackItem> = self.dl_tracks.iter()
+                                                 .filter(|t| t.selected && t.status == TrackStatus::Downloading)
+                                                 .collect();
+
+                                             ui.label(egui::RichText::new("🔄 Сейчас скачивается:").strong());
+                                             ui.add_space(4.0);
+                                             
+                                             if active_downloads.is_empty() {
+                                                 ui.label(egui::RichText::new("Подключение к источникам...").italics().color(muted));
+                                             } else {
+                                                 for track in active_downloads {
+                                                     ui.horizontal(|ui| {
+                                                         ui.add(egui::widgets::Spinner::new().size(12.0));
+                                                         ui.label(format!("{:02}. {} — {}", track.pos, track.artist, track.title));
+                                                     });
+                                                 }
+                                             }
+                                             ui.add_space(14.0);
+                                         }
+                                     }
+
+                                     ui.add_space(10.0);
+                                     ui.collapsing("⚙️ Лог диагностики", |ui| {
+                                         let logs_height = (ui.available_height() - 10.0).max(100.0);
+                                         egui::ScrollArea::vertical()
+                                             .auto_shrink([false, false])
+                                             .max_height(logs_height)
+                                             .id_salt("dl_log_scroll_excel")
+                                             .show(ui, |ui| {
+                                                 ui.add(
+                                                     egui::TextEdit::multiline(&mut self.dl_log_output)
+                                                         .font(egui::TextStyle::Monospace)
+                                                         .desired_width(f32::INFINITY)
+                                                         .desired_rows(8)
+                                                         .lock_focus(true)
+                                                 );
+                                             });
+                                     });
+                                     ui.add_space(10.0);
+                                });
+                            });
+                            
+                            // Правая колонка: список треков с чекбоксами
+                            ui.vertical(|ui| {
+                                ui.set_width(col_width);
+                                ui.set_height(col_height);
+                                card_frame.show(ui, |ui| {
+                                    ui.set_min_width(col_width - 36.0);
+                                    ui.set_min_height(col_height - 36.0);
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Список треков в файле")
+                                                .strong()
+                                                .size(18.0)
+                                                .color(text),
+                                        );
+                                        
+                                        if self.dl_is_parsing_excel {
+                                            ui.add_space(8.0);
+                                            ui.add(egui::widgets::Spinner::new());
+                                            ui.label(egui::RichText::new("Чтение...").color(muted));
+                                        }
+                                    });
+                                    ui.add_space(14.0);
+                                    
+                                    if !self.dl_tracks.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            let selected_count = self.dl_tracks.iter().filter(|t| t.selected).count();
+                                            ui.label(format!("Выбрано: {} из {}", selected_count, self.dl_tracks.len()));
+                                            
+                                            ui.add_space(10.0);
+                                            if ui.button("Выбрать все").clicked() && !self.dl_is_running {
+                                                for t in &mut self.dl_tracks {
+                                                    t.selected = true;
+                                                }
+                                            }
+                                            if ui.button("Снять все").clicked() && !self.dl_is_running {
+                                                for t in &mut self.dl_tracks {
+                                                    t.selected = false;
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(8.0);
+                                        
+                                        let tracks_height = ui.available_height() - 10.0;
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .max_height(tracks_height)
+                                            .id_salt("dl_tracks_scroll")
+                                            .show(ui, |ui| {
+                                                egui::Grid::new("dl_tracks_grid")
+                                                    .num_columns(4)
+                                                    .spacing([12.0, 8.0])
+                                                    .striped(true)
+                                                    .show(ui, |ui| {
+                                                        for track in &mut self.dl_tracks {
+                                                            // Чекбокс
+                                                            ui.add_enabled(
+                                                                !self.dl_is_running,
+                                                                egui::Checkbox::without_text(&mut track.selected)
+                                                            );
+                                                            
+                                                            // Номер
+                                                            ui.label(egui::RichText::new(format!("{:02}.", track.pos)).color(muted));
+                                                            
+                                                            // Название / Артист (ограничиваем ширину и обрезаем с троеточием)
+                                                            let name_text = format!("{} — {}", track.artist, track.title);
+                                                            ui.allocate_ui(egui::vec2((col_width - 240.0).max(150.0), 20.0), |ui| {
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(name_text).strong().color(text)
+                                                                    ).truncate()
+                                                                );
+                                                            });
+                                                            
+                                                            // Статус
+                                                            let (status_text, status_color) = match track.status {
+                                                                TrackStatus::Pending => ("⏳ Ожидание", muted),
+                                                                TrackStatus::Downloading => ("🔄 Загрузка", egui::Color32::from_rgb(250, 204, 21)),
+                                                                TrackStatus::Success => ("✅ Успешно", egui::Color32::from_rgb(34, 197, 94)),
+                                                                TrackStatus::Failed => ("❌ Ошибка", egui::Color32::from_rgb(239, 68, 68)),
+                                                                TrackStatus::Skipped => ("⏭️ Пропущен", egui::Color32::from_rgb(156, 163, 175)),
+                                                            };
+                                                            ui.label(egui::RichText::new(status_text).color(status_color));
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            });
+                                    } else {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(40.0);
+                                            if self.dl_is_parsing_excel {
+                                                ui.label("Идет парсинг таблицы, пожалуйста, подождите...");
+                                            } else if self.dl_excel_path.is_some() {
+                                                ui.label("Не найдено подходящих треков в файле.");
+                                            } else {
+                                                ui.label("Выберите файл Excel слева, чтобы просмотреть список треков.");
+                                            }
+                                            ui.add_space(40.0);
+                                        });
+                                    }
+                                });
+                            });
+                        });
+                    } else {
+                        // ОДИНОЧНЫЙ РЕЖИМ (Старый одноколоночный макет)
+                        ui.vertical(|ui| {
+                            ui.set_width(content_width.max(520.0));
+                            card_frame.show(ui, |ui| {
+                                let inner_width = (content_width - 36.0).max(760.0);
+                                ui.set_min_width(inner_width);
+                                
+                                ui.label(
+                                    egui::RichText::new("Загрузчик аудио")
+                                        .strong()
+                                        .size(18.0)
+                                        .color(text),
+                                );
+                                ui.add_space(14.0);
+                                
+                                // Выбор режима
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Режим:").strong());
+                                    if ui.selectable_label(true, "Поиск трека").clicked() && !self.dl_is_running {
+                                        self.dl_mode_excel = false;
+                                    }
+                                    if ui.selectable_label(false, "Пакетный (Excel)").clicked() && !self.dl_is_running {
+                                        self.dl_mode_excel = true;
+                                    }
+                                });
+                                ui.add_space(12.0);
+                                
+                                // Одиночный трек
+                                ui.horizontal(|ui| {
+                                    ui.label("Название трека/запрос:");
+                                    ui.text_edit_singleline(&mut self.dl_track_query);
+                                });
+                                ui.add_space(10.0);
+                                
+                                // Папка сохранения
+                                ui.horizontal(|ui| {
+                                    ui.label("Папка для сохранения:");
+                                    if ui.button("Выбрать папку").clicked() && !self.dl_is_running {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            self.dl_output_dir = Some(path);
+                                        }
+                                    }
+                                    if let Some(path) = &self.dl_output_dir {
+                                        ui.label(path.to_string_lossy());
+                                    } else {
+                                        ui.label("Папка не выбрана");
+                                    }
+                                });
+                                ui.add_space(12.0);
+                                
+                                // Дополнительные параметры
+                                ui.horizontal(|ui| {
+                                    ui.label("Формат:");
+                                    egui::ComboBox::from_id_salt("dl_format_single")
+                                        .selected_text(&self.dl_format)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.dl_format, "mp3".to_string(), "MP3");
+                                            ui.selectable_value(&mut self.dl_format, "flac".to_string(), "FLAC");
+                                            ui.selectable_value(&mut self.dl_format, "m4a".to_string(), "M4A");
+                                        });
+                                        
+                                    ui.add_space(20.0);
+                                    ui.label("Лимит поиска:");
+                                    ui.add(egui::Slider::new(&mut self.dl_limit_candidates, 1..=10));
+                                });
+                                ui.add_space(16.0);
+                                
+                                // Кнопки
+                                ui.horizontal(|ui| {
+                                    let can_start = !self.dl_track_query.trim().is_empty() 
+                                        && self.dl_output_dir.is_some() 
+                                        && !self.dl_is_running;
+                                        
+                                    if ui.add_enabled(
+                                        can_start,
+                                        egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
+                                    ).clicked() {
+                                        self.start_download(ctx);
+                                    }
+                                    
+                                    if ui.button("Очистить лог").clicked() {
+                                        self.dl_log_output.clear();
+                                    }
+                                });
+                                ui.add_space(14.0);
+                                
+                                // Поле логов и статус
+                                ui.label(egui::RichText::new(&self.dl_status_text).strong().color(accent));
+                                ui.add_space(8.0);
+                                
+                                let logs_height = (ui.available_height() - 36.0).max(200.0);
+                                egui::ScrollArea::vertical()
+                                    .max_height(logs_height)
+                                    .id_salt("dl_log_scroll_single")
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut self.dl_log_output)
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(12)
+                                                .lock_focus(true)
+                                        );
+                                    });
+                            });
+                        });
+                    }
+                    
+                    ui.add_space(batch_margin);
+                });
             } else {
             let total_width = ui.available_width();
             let spacing = 18.0;
@@ -4060,7 +4865,7 @@ impl eframe::App for KaraokeApp {
                                     ui.horizontal(|ui| {
                                         ui.add_sized(
                                             egui::vec2(ui.available_width() - 90.0, 20.0),
-                                            egui::Slider::new(&mut self.inactive_opacity, 0.2..=1.0).show_value(false)
+                                            egui::Slider::new(&mut self.inactive_opacity, 0.0..=1.0).show_value(false)
                                         );
                                         ui.label(egui::RichText::new(format!("{}%", (self.inactive_opacity * 100.0).round() as i32)).strong().color(accent));
                                     });
@@ -4543,4 +5348,48 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(KaraokeApp::new(cc)))),
     )
+}
+
+fn parse_log_line_and_update_status(log_line: &str, tracks: &mut [TrackItem]) {
+    if log_line.contains("[*] [") {
+        if let Some(pos) = extract_track_num_between(log_line, "[*] [", "]") {
+            update_status_by_pos(tracks, pos, TrackStatus::Downloading);
+        }
+    } else if log_line.contains("[#] Track ") {
+        if let Some(pos) = extract_track_num_after(log_line, "[#] Track ") {
+            update_status_by_pos(tracks, pos, TrackStatus::Skipped);
+        }
+    } else if log_line.contains("[+] [") {
+        if let Some(pos) = extract_track_num_between(log_line, "[+] [", "]") {
+            update_status_by_pos(tracks, pos, TrackStatus::Success);
+        }
+    } else if log_line.contains("[-] [") {
+        if let Some(pos) = extract_track_num_between(log_line, "[-] [", "]") {
+            update_status_by_pos(tracks, pos, TrackStatus::Failed);
+        }
+    } else if log_line.contains("[-] Thread error processing track ") {
+        if let Some(pos) = extract_track_num_after(log_line, "[-] Thread error processing track ") {
+            update_status_by_pos(tracks, pos, TrackStatus::Failed);
+        }
+    }
+}
+
+fn extract_track_num_between(s: &str, prefix: &str, suffix: &str) -> Option<usize> {
+    let start_idx = s.find(prefix)? + prefix.len();
+    let sub = &s[start_idx..];
+    let end_idx = sub.find(suffix)?;
+    sub[..end_idx].trim().parse::<usize>().ok()
+}
+
+fn extract_track_num_after(s: &str, prefix: &str) -> Option<usize> {
+    let start_idx = s.find(prefix)? + prefix.len();
+    let sub = &s[start_idx..];
+    let digits: String = sub.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<usize>().ok()
+}
+
+fn update_status_by_pos(tracks: &mut [TrackItem], pos: usize, status: TrackStatus) {
+    if let Some(t) = tracks.iter_mut().find(|t| t.pos == pos) {
+        t.status = status;
+    }
 }

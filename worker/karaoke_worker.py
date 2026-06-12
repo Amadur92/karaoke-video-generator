@@ -807,7 +807,7 @@ def timestamped_matches_whisper_probe(timestamped_karaoke, whisper_words, avg_li
 def infer_lyrics_language(text):
     return 'ru' if re.search(r'[А-Яа-яЁё]', text or '') else 'en'
 
-def get_system_font(font_name='montserrat', bold=False):
+def get_system_font(font_name='montserrat', bold=False, black=False):
     font_name = font_name.lower().strip()
     base_dir = os.path.dirname(os.path.abspath(__file__))
     repo_dir = os.path.dirname(base_dir)
@@ -821,21 +821,27 @@ def get_system_font(font_name='montserrat', bold=False):
     
     # 1. Montserrat
     if font_name == 'montserrat':
-        font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
+        if black:
+            font_file = "Montserrat-Black.ttf"
+        else:
+            font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
         for search_dir in font_search_dirs:
             montserrat_path = os.path.join(search_dir, font_file)
             if os.path.exists(montserrat_path):
                 return montserrat_path
+        if black:
+            # Fallback to bold if black not found
+            return get_system_font(font_name='montserrat', bold=True, black=False)
             
     # 2. Arial
     if font_name == 'arial':
         if sys.platform == "win32":
-            path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "arialbd.ttf" if bold else "arial.ttf")
+            path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "arialbd.ttf" if bold or black else "arial.ttf")
             if os.path.exists(path): return path
         elif sys.platform == "darwin":
             paths = [
-                "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
-                "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf"
+                "/Library/Fonts/Arial Bold.ttf" if bold or black else "/Library/Fonts/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold or black else "/System/Library/Fonts/Supplemental/Arial.ttf"
             ]
             for p in paths:
                 if os.path.exists(p): return p
@@ -845,33 +851,38 @@ def get_system_font(font_name='montserrat', bold=False):
         if sys.platform == "darwin":
             path = "/System/Library/Fonts/Helvetica.ttc"
             if os.path.exists(path): return path
-        return get_system_font(font_name='arial', bold=bold)
+        return get_system_font(font_name='arial', bold=bold or black)
         
     # 4. Georgia
     if font_name == 'georgia':
         if sys.platform == "win32":
-            path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "georgiab.ttf" if bold else "georgia.ttf")
+            path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "georgiab.ttf" if bold or black else "georgia.ttf")
             if os.path.exists(path): return path
         elif sys.platform == "darwin":
             paths = [
-                "/Library/Fonts/Georgia Bold.ttf" if bold else "/Library/Fonts/Georgia.ttf",
-                "/System/Library/Fonts/Supplemental/Georgia Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Georgia.ttf"
+                "/Library/Fonts/Georgia Bold.ttf" if bold or black else "/Library/Fonts/Georgia.ttf",
+                "/System/Library/Fonts/Supplemental/Georgia Bold.ttf" if bold or black else "/System/Library/Fonts/Supplemental/Georgia.ttf"
             ]
             for p in paths:
                 if os.path.exists(p): return p
                 
     # Default fallback to Montserrat
-    font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
+    if black:
+        font_file = "Montserrat-Black.ttf"
+    else:
+        font_file = "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"
     for search_dir in font_search_dirs:
         montserrat_path = os.path.join(search_dir, font_file)
         if os.path.exists(montserrat_path):
             return montserrat_path
+    if black:
+        return get_system_font(font_name='montserrat', bold=True, black=False)
         
     # Final generic fallback
     if sys.platform == "win32":
-        return os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "arialbd.ttf" if bold else "arial.ttf")
+        return os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts", "arialbd.ttf" if bold or black else "arial.ttf")
     elif sys.platform == "darwin":
-        return "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf"
+        return "/Library/Fonts/Arial Bold.ttf" if bold or black else "/Library/Fonts/Arial.ttf"
     return None
 
 
@@ -1212,7 +1223,7 @@ def detect_vocal_start(audio_path, model_name='base', window_seconds=45.0, chunk
     }
 
 # ----------------- РЕНДЕРИНГ (ФОНОВЫЙ ПОТОК) -----------------
-def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False):
+def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False, inactive_opacity=0.65):
     cleanup_align_audio_path = None
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -1771,6 +1782,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         
         font_path_reg = get_system_font(font_name=font_family, bold=False)
         font_path_bold = get_system_font(font_name=font_family, bold=True)
+        font_path_black = get_system_font(font_name=font_family, bold=True, black=True)
 
         clean_filename = f"{artist} - {title} (karaoke).mp4".replace("/", "_").replace("\\", "_")
         output_mp4_path = os.path.join(EXPORT_FOLDER, clean_filename)
@@ -1810,10 +1822,17 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         current_scroll_y = 0.0
 
         font_cache = {}
-        def get_font_at_size(bold, size):
-            key = (bold, size)
+        def get_font_at_size(style, size):
+            # style can be 'reg', 'bold', 'black'
+            key = (style, size)
             if key not in font_cache:
-                path = font_path_bold if bold else font_path_reg
+                if style == 'black':
+                    path = font_path_black
+                elif style == 'bold':
+                    path = font_path_bold
+                else:
+                    path = font_path_reg
+                
                 if path and os.path.exists(path):
                     try:
                         font_cache[key] = ImageFont.truetype(path, size)
@@ -1828,7 +1847,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         except AttributeError:
             resampling_filter = Image.BILINEAR
 
-        font_max = get_font_at_size(bold=True, size=font_size_max)
+        font_max_bold = get_font_at_size(style='bold', size=font_size_max)
+        font_max_black = get_font_at_size(style='black', size=font_size_max)
         word_pad = int(20 * size_scale)
         word_active_offset = int(10 * size_scale)
         line_pad_x = int(40 * size_scale)
@@ -1838,39 +1858,60 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         line_render_cache = []
         for line_data in lyrics_karaoke:
             words = line_data["words"]
-            widths, space_w = get_word_widths(words, font_max)
-            total_w = sum(widths) + space_w * max(0, len(words) - 1)
-            line_img_w = max(1, total_w + line_pad_x)
-            inactive_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
-            active_plain_img = Image.new("RGBA", (line_img_w, line_img_h), (0, 0, 0, 0))
+            
+            # Bold metrics for inactive
+            widths_bold, space_w_bold = get_word_widths(words, font_max_bold)
+            total_w_bold = sum(widths_bold) + space_w_bold * max(0, len(words) - 1)
+            line_img_w_bold = max(1, total_w_bold + line_pad_x)
+            
+            # Black metrics for active
+            widths_black, space_w_black = get_word_widths(words, font_max_black)
+            total_w_black = sum(widths_black) + space_w_black * max(0, len(words) - 1)
+            line_img_w_black = max(1, total_w_black + line_pad_x)
+            
+            inactive_img = Image.new("RGBA", (line_img_w_bold, line_img_h), (0, 0, 0, 0))
+            active_inactive_base_img = Image.new("RGBA", (line_img_w_black, line_img_h), (0, 0, 0, 0))
+            active_plain_img = Image.new("RGBA", (line_img_w_black, line_img_h), (0, 0, 0, 0))
             inactive_draw = ImageDraw.Draw(inactive_img)
+            active_inactive_base_draw = ImageDraw.Draw(active_inactive_base_img)
             active_plain_draw = ImageDraw.Draw(active_plain_img)
 
-            x_draw = line_text_x
+            # Draw inactive (Bold)
+            x_draw_bold = line_text_x
+            for w_idx, w_data in enumerate(words):
+                word = w_data["word"]
+                word_w_bold = widths_bold[w_idx]
+                inactive_draw.text((x_draw_bold, y_draw), word, fill=rgba_inactive, font=font_max_bold)
+                x_draw_bold += word_w_bold + space_w_bold
+
+            # Draw active (Black)
+            x_draw_black = line_text_x
             word_layers = []
             for w_idx, w_data in enumerate(words):
                 word = w_data["word"]
-                word_w = widths[w_idx]
-                inactive_draw.text((x_draw, y_draw), word, fill=rgba_inactive, font=font_max)
-                active_plain_draw.text((x_draw, y_draw), word, fill=rgba_active, font=font_max)
+                word_w_black = widths_black[w_idx]
+                active_inactive_base_draw.text((x_draw_black, y_draw), word, fill=rgba_inactive, font=font_max_black)
+                active_plain_draw.text((x_draw_black, y_draw), word, fill=rgba_active, font=font_max_black)
 
-                active_word_img = Image.new("RGBA", (word_w + word_pad, line_img_h), (0, 0, 0, 0))
+                active_word_img = Image.new("RGBA", (word_w_black + word_pad, line_img_h), (0, 0, 0, 0))
                 active_word_draw = ImageDraw.Draw(active_word_img)
-                active_word_draw.text((word_active_offset, y_draw), word, fill=rgba_active, font=font_max)
+                active_word_draw.text((word_active_offset, y_draw), word, fill=rgba_active, font=font_max_black)
                 word_layers.append({
                     "start": w_data["start"],
                     "end": w_data["end"],
-                    "paste_x": x_draw - word_active_offset,
+                    "paste_x": x_draw_black - word_active_offset,
                     "image": active_word_img,
                     "width": active_word_img.width,
                 })
-                x_draw += word_w + space_w
+                x_draw_black += word_w_black + space_w_black
 
             line_render_cache.append({
                 "inactive": inactive_img,
+                "active_inactive_base": active_inactive_base_img,
                 "active_plain": active_plain_img,
                 "word_layers": word_layers,
-                "width": line_img_w,
+                "width_inactive": line_img_w_bold,
+                "width_active": line_img_w_black,
                 "height": line_img_h,
             })
 
@@ -1927,9 +1968,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 scale = min(target_scale, fit_scale)
                 
                 # Применяем плавное изменение прозрачности в зависимости от положения на экране
-                opacity = max(0.0, min(1.0, 1.0 - (dist_from_center / dist_cutoff)))
+                flat_ratio = 0.7
+                if dist_from_center < dist_cutoff * flat_ratio:
+                    opacity = 1.0
+                else:
+                    opacity = max(0.0, min(1.0, 1.0 - (dist_from_center - dist_cutoff * flat_ratio) / (dist_cutoff * (1.0 - flat_ratio))))
                 if not is_active:
-                    opacity *= 0.5
+                    opacity *= inactive_opacity
                 
                 scale_key = round(scale, 2)
                 opacity_key = round(opacity, 2)
@@ -1941,7 +1986,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         resized_img = non_active_cache[cache_key]
                     else:
                         line_img = cached_line["inactive"]
-                        new_w = max(1, int(cached_line["width"] * scale))
+                        new_w = max(1, int(cached_line["width_inactive"] * scale))
                         new_h = max(1, int(cached_line["height"] * scale))
                         resized_img = line_img.resize((new_w, new_h), resampling_filter)
                         
@@ -1955,7 +2000,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 else:
                     # Для активной строки строим картинку с пословной заливкой
                     if not plain_lines:
-                        line_img = cached_line["inactive"].copy()
+                        line_img = cached_line["active_inactive_base"].copy()
                         for layer in cached_line["word_layers"]:
                             w_start = layer["start"]
                             w_end = layer["end"]
@@ -1973,7 +2018,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     else:
                         line_img = cached_line["active_plain"]
                         
-                    new_w = max(1, int(cached_line["width"] * scale))
+                    new_w = max(1, int(cached_line["width_active"] * scale))
                     new_h = max(1, int(cached_line["height"] * scale))
                     resized_img = line_img.resize((new_w, new_h), resampling_filter)
                     
@@ -2769,6 +2814,10 @@ def open_browser():
 
 if __name__ == '__main__':
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] in ("batch", "parse-sheet", "download", "resolve", "candidates", "lyrics", "lyrics-discover"):
+        from unified_resolver.__main__ import main as resolver_main
+        sys.exit(resolver_main(sys.argv[1:]))
+
     if '--help' in sys.argv or '-h' in sys.argv:
         import argparse
         parser = argparse.ArgumentParser(description="Караоке-Генератор CLI")
@@ -2784,6 +2833,7 @@ if __name__ == '__main__':
         parser.add_argument('--color-inactive', default='#B4B9C3')
         parser.add_argument('--color-bg', default='#FFFFFF')
         parser.add_argument('--audio-delay', type=float, default=0.0)
+        parser.add_argument('--inactive-opacity', type=float, default=0.65)
         parser.add_argument('--vocal-start', type=float, default=0.0)
         parser.add_argument('--auto-vocal-start', action='store_true')
         parser.add_argument('--detect-vocal-start', action='store_true')
@@ -2810,6 +2860,7 @@ if __name__ == '__main__':
         parser.add_argument('--color-inactive', default='#B4B9C3')
         parser.add_argument('--color-bg', default='#FFFFFF')
         parser.add_argument('--audio-delay', type=float, default=0.0)
+        parser.add_argument('--inactive-opacity', type=float, default=0.65)
         parser.add_argument('--vocal-start', type=float, default=0.0)
         parser.add_argument('--auto-vocal-start', action='store_true')
         parser.add_argument('--detect-vocal-start', action='store_true')
@@ -2914,7 +2965,8 @@ if __name__ == '__main__':
                 auto_vocal_start=args.auto_vocal_start,
                 timings_only=args.timings_only,
                 timings_output=args.timings_output,
-                plain_lines=args.plain_lines
+                plain_lines=args.plain_lines,
+                inactive_opacity=args.inactive_opacity
             )
             if jobs[job_id].get("error"):
                 sys.exit(1)
