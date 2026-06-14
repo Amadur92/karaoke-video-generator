@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & Clippy & Python compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (with clippy/rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop_app/target
+          key: ci-cargo-${{ hashFiles('desktop_app/Cargo.lock') }}
+          restore-keys: ci-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path desktop_app/Cargo.toml --check
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --manifest-path desktop_app/Cargo.toml --all-targets -- -D warnings
+
+      - name: Compile worker
+        run: python3 -m py_compile worker/karaoke_worker.py

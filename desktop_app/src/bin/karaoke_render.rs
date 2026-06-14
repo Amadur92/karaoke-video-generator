@@ -341,6 +341,8 @@ fn frame_to_rgb24(frame: &RgbaImage, out: &mut Vec<u8>) {
     }
 }
 
+// TODO: объединить параметры отрисовки в структуру Theme/RenderConfig при распиле рендерера.
+#[allow(clippy::too_many_arguments)]
 fn build_line_cache(
     lines: &[KaraokeLine],
     font: &FontArc,
@@ -623,6 +625,8 @@ fn ass_line_highlight_is_live(metric: &AssLineMetric, t: f64) -> bool {
         .unwrap_or(false)
 }
 
+// TODO: объединить параметры в структуру конфига асс-рендера при распиле рендерера.
+#[allow(clippy::too_many_arguments)]
 fn write_ass_file(
     path: &Path,
     lines: &[KaraokeLine],
@@ -744,7 +748,7 @@ fn write_ass_file(
         ));
     };
 
-    for frame_idx in 0..total_frames {
+    for (frame_idx, &scroll_y) in scrolls.iter().enumerate() {
         let display_t = frame_idx as f64 / event_fps - display_delay;
         let highlight_t = frame_idx as f64 / event_fps - highlight_delay;
         let active_idx = if transitions.is_empty() {
@@ -752,7 +756,6 @@ fn write_ass_file(
         } else {
             active_line(transitions, display_t)
         };
-        let scroll_y = scrolls[frame_idx];
 
         for (idx, metric) in metrics.iter().enumerate() {
             if !scrolling && idx != active_idx {
@@ -928,6 +931,8 @@ fn write_ass_file(
     std::fs::write(path, ass).map_err(|e| format!("Не удалось записать ASS: {e}"))
 }
 
+// TODO: объединить width/height/crf/preset/fps/scrolling/plain_lines в RenderConfig при распиле рендерера.
+#[allow(clippy::too_many_arguments)]
 fn render_ass(
     config: &RenderConfig,
     lines: &[KaraokeLine],
@@ -1327,7 +1332,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let mut last_active_idx = None;
     let mut cached_frame: Option<RgbaImage> = None;
 
-    for frame_idx in 0..total_frames {
+    for (frame_idx, &scroll_y) in scrolls.iter().enumerate().take(total_frames) {
         let display_t = frame_idx as f64 / fps - display_delay;
         let active_idx = if transitions.is_empty() {
             0
@@ -1336,17 +1341,23 @@ fn render(config: RenderConfig) -> Result<(), String> {
         };
 
         let can_use_cache = config.plain_lines && !config.scrolling;
-        let frame =
-            if can_use_cache && last_active_idx == Some(active_idx) && cached_frame.is_some() {
-                cached_frame.as_ref().unwrap().clone()
+        let frame = if can_use_cache && last_active_idx == Some(active_idx) {
+            if let Some(ref cached) = cached_frame {
+                cached.clone()
             } else {
-                let rendered = render_frame(frame_idx, scrolls[frame_idx]);
-                if can_use_cache {
-                    cached_frame = Some(rendered.clone());
-                    last_active_idx = Some(active_idx);
-                }
+                let rendered = render_frame(frame_idx, scroll_y);
+                cached_frame = Some(rendered.clone());
+                last_active_idx = Some(active_idx);
                 rendered
-            };
+            }
+        } else {
+            let rendered = render_frame(frame_idx, scroll_y);
+            if can_use_cache {
+                cached_frame = Some(rendered.clone());
+                last_active_idx = Some(active_idx);
+            }
+            rendered
+        };
 
         frame_to_rgb24(&frame, &mut rgb_frame);
         if let Err(err) = stdin.write_all(&rgb_frame) {
