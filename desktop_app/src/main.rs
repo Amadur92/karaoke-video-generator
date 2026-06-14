@@ -187,6 +187,9 @@ fn find_rust_renderer() -> Option<PathBuf> {
         base.join("../../../target/release").join(&renderer_exe),
         base.join("../../../desktop_app/target/release")
             .join(&renderer_exe),
+        base.join("../../../target/debug").join(&renderer_exe),
+        base.join("../../../desktop_app/target/debug")
+            .join(&renderer_exe),
     ];
 
     for candidate in candidates {
@@ -811,6 +814,8 @@ struct AppSettings {
     title: String,
     lyrics: String,
     plain_lines: bool,
+    verify_lrc_with_whisper: bool,
+    separate_vocals_for_word_level: bool,
 }
 
 impl Default for AppSettings {
@@ -830,6 +835,8 @@ impl Default for AppSettings {
             title: String::new(),
             lyrics: String::new(),
             plain_lines: false,
+            verify_lrc_with_whisper: false,
+            separate_vocals_for_word_level: false,
         }
     }
 }
@@ -1115,6 +1122,8 @@ struct KaraokeApp {
     video_started_at: Option<Instant>,
     video_started_ms: i64,
     plain_lines: bool,
+    verify_lrc_with_whisper: bool,
+    separate_vocals_for_word_level: bool,
     batch_root: Option<PathBuf>,
     batch_items: Vec<BatchItem>,
     batch_running: bool,
@@ -1253,6 +1262,8 @@ impl KaraokeApp {
             video_started_at: None,
             video_started_ms: 0,
             plain_lines: settings.plain_lines,
+            verify_lrc_with_whisper: settings.verify_lrc_with_whisper,
+            separate_vocals_for_word_level: settings.separate_vocals_for_word_level,
             batch_root: None,
             batch_items: Vec::new(),
             batch_running: false,
@@ -2146,10 +2157,7 @@ impl KaraokeApp {
             return;
         }
         for item in &mut self.batch_items {
-            if item.status == BatchStatus::Done
-                || item.status == BatchStatus::MissingLyrics
-                || matches!(item.status, BatchStatus::Error(_))
-            {
+            if item.status == BatchStatus::Done || item.status == BatchStatus::MissingLyrics {
                 continue;
             }
             item.progress = 0.0;
@@ -2225,6 +2233,8 @@ impl KaraokeApp {
         let inactive_opacity = self.inactive_opacity.clamp(0.0, 1.0);
         let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
         let plain_lines = self.plain_lines;
+        let verify_lrc_with_whisper = self.verify_lrc_with_whisper;
+        let separate_vocals_for_word_level = self.separate_vocals_for_word_level;
         let cancel = self.batch_cancel.clone();
         let temp = temp_dir().join("batch");
         let (tx, rx) = channel::<ProgressUpdate>();
@@ -2263,10 +2273,7 @@ impl KaraokeApp {
                     return;
                 }
 
-                if item.status == BatchStatus::Done
-                    || item.status == BatchStatus::MissingLyrics
-                    || matches!(item.status, BatchStatus::Error(_))
-                {
+                if item.status == BatchStatus::Done || item.status == BatchStatus::MissingLyrics {
                     continue;
                 }
 
@@ -2417,6 +2424,12 @@ impl KaraokeApp {
                     .stderr(std::process::Stdio::piped());
                 if plain_lines {
                     cmd.arg("--plain-lines");
+                }
+                if verify_lrc_with_whisper {
+                    cmd.arg("--verify-lrc-with-whisper");
+                }
+                if separate_vocals_for_word_level && !plain_lines {
+                    cmd.arg("--separate-vocals-for-alignment");
                 }
 
                 match cmd.spawn() {
@@ -3244,6 +3257,8 @@ impl KaraokeApp {
         let fade_in_ms = self.fade_in_ms;
         let fade_out_ms = self.fade_out_ms;
         let plain_lines = self.plain_lines;
+        let verify_lrc_with_whisper = self.verify_lrc_with_whisper;
+        let separate_vocals_for_word_level = self.separate_vocals_for_word_level;
         let trim_bounds = self.clamped_trim_bounds();
         let temp = temp_dir();
         let default_exports = exports_dir();
@@ -3413,6 +3428,12 @@ impl KaraokeApp {
 
             if plain_lines {
                 cmd.arg("--plain-lines");
+            }
+            if verify_lrc_with_whisper {
+                cmd.arg("--verify-lrc-with-whisper");
+            }
+            if separate_vocals_for_word_level && !plain_lines {
+                cmd.arg("--separate-vocals-for-alignment");
             }
 
             if use_rust_renderer {
@@ -3684,6 +3705,8 @@ impl eframe::App for KaraokeApp {
             title: self.title.clone(),
             lyrics: self.lyrics.clone(),
             plain_lines: self.plain_lines,
+            verify_lrc_with_whisper: self.verify_lrc_with_whisper,
+            separate_vocals_for_word_level: self.separate_vocals_for_word_level,
         };
 
         // Единая современная темная тема для всех стандартных виджетов egui.
@@ -4518,6 +4541,14 @@ impl eframe::App for KaraokeApp {
                                                 .color(accent),
                                             );
                                             ui.checkbox(&mut self.plain_lines, "Только строки");
+                                            ui.checkbox(
+                                                &mut self.verify_lrc_with_whisper,
+                                                "Проверять LRC в режиме строк",
+                                            );
+                                            ui.checkbox(
+                                                &mut self.separate_vocals_for_word_level,
+                                                "Вокал для слов (Demucs)",
+                                            );
                                         });
                                     },
                                 );
@@ -5975,6 +6006,14 @@ impl eframe::App for KaraokeApp {
                                         &mut self.plain_lines,
                                         "Только строки без подсветки слов",
                                     );
+                                    ui.checkbox(
+                                        &mut self.verify_lrc_with_whisper,
+                                        "Проверять LRC через Whisper даже в режиме строк",
+                                    );
+                                    ui.checkbox(
+                                        &mut self.separate_vocals_for_word_level,
+                                        "Выделять вокал для word-level через Demucs (медленно, нужен внешний demucs)",
+                                    );
                                 });
                             });
                     }
@@ -6419,6 +6458,8 @@ impl eframe::App for KaraokeApp {
             title: self.title.clone(),
             lyrics: self.lyrics.clone(),
             plain_lines: self.plain_lines,
+            verify_lrc_with_whisper: self.verify_lrc_with_whisper,
+            separate_vocals_for_word_level: self.separate_vocals_for_word_level,
         };
 
         if old_settings != new_settings {
