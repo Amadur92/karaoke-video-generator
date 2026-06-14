@@ -1,9 +1,11 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Скрывает консоль на Windows в релиз-сборке
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod paths; // Скрывает консоль на Windows в релиз-сборке
 
 use eframe::egui;
 use rodio::Source;
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -107,157 +109,6 @@ fn app_icon() -> egui::IconData {
     }
 }
 
-/// Вычисляет путь к файлу настроек в домашней директории пользователя
-fn settings_path() -> PathBuf {
-    let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push("karaoke-generator");
-    let _ = std::fs::create_dir_all(&p);
-    p.push("settings.json");
-    p
-}
-
-fn app_data_dir() -> PathBuf {
-    let mut p = dirs::data_dir()
-        .or_else(dirs::config_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    p.push("karaoke-generator");
-    let _ = std::fs::create_dir_all(&p);
-    p
-}
-
-fn debug_log(message: impl AsRef<str>) {
-    let path = app_data_dir().join("karaoke_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{}", message.as_ref());
-    }
-}
-
-/// Вычисляет рабочую директорию рядом с исполняемым файлом
-fn app_base_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn executable_name(base_name: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{}.exe", base_name)
-    } else {
-        base_name.to_string()
-    }
-}
-
-/// Ищет bundled worker рядом с приложением или Python-скрипт в dev-режиме.
-fn find_worker() -> Option<PathBuf> {
-    let base = app_base_dir();
-    let worker_exe = executable_name("karaoke_worker");
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker/karaoke_worker.py"),
-        base.join(&worker_exe),
-        base.join("worker").join(&worker_exe),
-        base.join("../Resources/worker").join(&worker_exe),
-        base.join("karaoke_worker.py"),
-        base.join("worker/karaoke_worker.py"),
-        base.join("../../../worker/karaoke_worker.py"),
-        base.join("../../../../worker/karaoke_worker.py"),
-        PathBuf::from("/Users/mihailsokolenko/wow_quiz/worker/karaoke_worker.py"),
-    ];
-
-    for candidate in candidates {
-        if candidate.exists() {
-            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
-        }
-    }
-    None
-}
-
-fn find_rust_renderer() -> Option<PathBuf> {
-    let base = app_base_dir();
-    let renderer_exe = executable_name("karaoke_render");
-    let candidates = [
-        base.join(&renderer_exe),
-        base.join("worker").join(&renderer_exe),
-        base.join("../Resources/worker").join(&renderer_exe),
-        base.join("../release").join(&renderer_exe),
-        base.join("../../../target/release").join(&renderer_exe),
-        base.join("../../../desktop_app/target/release")
-            .join(&renderer_exe),
-        base.join("../../../target/debug").join(&renderer_exe),
-        base.join("../../../desktop_app/target/debug")
-            .join(&renderer_exe),
-    ];
-
-    for candidate in candidates {
-        if candidate.exists() {
-            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
-        }
-    }
-    None
-}
-
-fn is_python_worker(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("py"))
-        .unwrap_or(false)
-}
-
-fn bundled_bin_dir() -> Option<PathBuf> {
-    let base = app_base_dir();
-    let candidates = [
-        base.join("bin"),
-        base.join("../Resources/bin"),
-        base.join("../../../packaging/bin"),
-    ];
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.exists() && candidate.is_dir())
-}
-
-fn tool_name(base_name: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{}.exe", base_name)
-    } else {
-        base_name.to_string()
-    }
-}
-
-fn tool_path(base_name: &str) -> PathBuf {
-    let name = tool_name(base_name);
-    bundled_bin_dir()
-        .map(|dir| dir.join(&name))
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from(name))
-}
-
-#[cfg(target_os = "macos")]
-fn clear_quarantine(path: &Path) {
-    if path.exists() {
-        let _ = std::process::Command::new("xattr")
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(path)
-            .status();
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn clear_quarantine(_path: &Path) {}
-
-fn clear_bundled_runtime_quarantine() {
-    if let Some(bin_dir) = bundled_bin_dir() {
-        clear_quarantine(&bin_dir);
-    }
-
-    let base = app_base_dir();
-    clear_quarantine(&base.join("worker"));
-}
-
 fn format_time_ms(ms: i64) -> String {
     let total_seconds = (ms.max(0) as f32 / 1000.0).round() as i64;
     let minutes = total_seconds / 60;
@@ -339,7 +190,7 @@ fn open_in_explorer(path: &std::path::Path) {
 }
 
 fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
-    let mut cmd = std::process::Command::new(tool_path("ffprobe"));
+    let mut cmd = std::process::Command::new(paths::tool_path("ffprobe"));
     hide_subprocess_window(&mut cmd);
     let output = cmd
         .args([
@@ -400,7 +251,7 @@ fn render_trimmed_audio(
         ));
     }
 
-    let mut cmd = std::process::Command::new(tool_path("ffmpeg"));
+    let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
     hide_subprocess_window(&mut cmd);
     cmd.arg("-y")
         .arg("-ss")
@@ -434,7 +285,7 @@ fn render_trimmed_audio(
 }
 
 fn probe_video_size(path: &str) -> Result<(usize, usize), String> {
-    let mut cmd = std::process::Command::new(tool_path("ffprobe"));
+    let mut cmd = std::process::Command::new(paths::tool_path("ffprobe"));
     hide_subprocess_window(&mut cmd);
     let output = cmd
         .args([
@@ -484,7 +335,7 @@ fn preview_video_size(path: &str) -> Result<(usize, usize), String> {
 }
 
 fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(tool_path("ffmpeg"));
+    let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
     hide_subprocess_window(&mut cmd);
     let status = cmd
         .arg("-y")
@@ -508,32 +359,6 @@ fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Resu
     } else {
         Err("ffmpeg не смог подготовить звук для предпросмотра.".to_string())
     }
-}
-
-/// Путь к папке экспорта видео
-fn exports_dir() -> PathBuf {
-    let base = app_base_dir();
-    let portable_exports = base.join("exports");
-    let exports = if base.join("worker").exists() && base.join("bin").exists() {
-        portable_exports
-    } else {
-        app_data_dir().join("exports")
-    };
-    let _ = std::fs::create_dir_all(&exports);
-    exports
-}
-
-/// Путь к папке для временных файлов
-fn temp_dir() -> PathBuf {
-    let temp = app_data_dir().join("tmp");
-    let _ = std::fs::create_dir_all(&temp);
-    temp
-}
-
-fn upload_dir() -> PathBuf {
-    let uploads = app_data_dir().join("uploads");
-    let _ = std::fs::create_dir_all(&uploads);
-    uploads
 }
 
 fn file_extension_lower(path: &Path) -> Option<String> {
@@ -1209,7 +1034,7 @@ impl KaraokeApp {
         cc.egui_ctx.set_fonts(fonts);
 
         // 3. Загрузка сохраненных настроек
-        let settings: AppSettings = std::fs::read_to_string(settings_path())
+        let settings: AppSettings = std::fs::read_to_string(paths::settings_path())
             .ok()
             .and_then(|data| serde_json::from_str(&data).ok())
             .unwrap_or_default();
@@ -1424,7 +1249,7 @@ impl KaraokeApp {
             .clamp(0, self.video_duration_ms.max(0));
 
         let (width, height) = preview_video_size(path)?;
-        let audio_path = temp_dir().join("karaoke_video_preview.wav");
+        let audio_path = paths::temp_dir().join("karaoke_video_preview.wav");
         render_video_preview_audio(path, &audio_path, start_ms)?;
 
         let audio_file = std::fs::File::open(&audio_path)
@@ -1443,7 +1268,7 @@ impl KaraokeApp {
         let path = path.to_string();
 
         std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new(tool_path("ffmpeg"));
+            let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
             hide_subprocess_window(&mut cmd);
             let mut child = match cmd
                 .arg("-v")
@@ -1800,7 +1625,7 @@ impl KaraokeApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.dl_parse_rx = Some(rx);
 
-        let worker_path = match find_worker() {
+        let worker_path = match paths::find_worker() {
             Some(w) => w,
             None => {
                 let _ = tx.send(Err(
@@ -1812,7 +1637,7 @@ impl KaraokeApp {
         };
 
         std::thread::spawn(move || {
-            let mut cmd = if is_python_worker(&worker_path) {
+            let mut cmd = if paths::is_python_worker(&worker_path) {
                 let mut cmd = std::process::Command::new("python3");
                 cmd.arg(&worker_path);
                 cmd
@@ -1946,7 +1771,7 @@ impl KaraokeApp {
             }
         }
 
-        let worker_path = match find_worker() {
+        let worker_path = match paths::find_worker() {
             Some(w) => w,
             None => {
                 self.dl_status_text =
@@ -1967,7 +1792,7 @@ impl KaraokeApp {
         let dl_child_clone = self.dl_child.clone();
 
         std::thread::spawn(move || {
-            let mut cmd = if is_python_worker(&worker_path) {
+            let mut cmd = if paths::is_python_worker(&worker_path) {
                 let mut cmd = std::process::Command::new("python3");
                 cmd.arg(&worker_path);
                 cmd
@@ -2165,7 +1990,7 @@ impl KaraokeApp {
         if self.batch_items.is_empty() || self.is_generating || self.batch_running {
             return;
         }
-        let worker_path = match find_worker() {
+        let worker_path = match paths::find_worker() {
             Some(path) => path,
             None => {
                 self.log_output
@@ -2173,7 +1998,7 @@ impl KaraokeApp {
                 return;
             }
         };
-        let renderer_path = match find_rust_renderer() {
+        let renderer_path = match paths::find_rust_renderer() {
             Some(path) => path,
             None => {
                 self.log_output
@@ -2226,7 +2051,7 @@ impl KaraokeApp {
         let verify_lrc_with_whisper = self.verify_lrc_with_whisper;
         let separate_vocals_for_word_level = self.separate_vocals_for_word_level;
         let cancel = self.batch_cancel.clone();
-        let temp = temp_dir().join("batch");
+        let temp = paths::temp_dir().join("batch");
         let (tx, rx) = channel::<ProgressUpdate>();
         self.rx = Some(rx);
         let ctx = ctx.clone();
@@ -2374,7 +2199,7 @@ impl KaraokeApp {
                     align_queue.len()
                 )));
 
-                let mut cmd = if is_python_worker(&worker_path) {
+                let mut cmd = if paths::is_python_worker(&worker_path) {
                     let mut cmd = std::process::Command::new("python3");
                     cmd.arg(&worker_path);
                     cmd
@@ -2382,7 +2207,7 @@ impl KaraokeApp {
                     std::process::Command::new(&worker_path)
                 };
                 hide_subprocess_window(&mut cmd);
-                if let Some(bin_dir) = bundled_bin_dir() {
+                if let Some(bin_dir) = paths::bundled_bin_dir() {
                     let old_path = std::env::var_os("PATH").unwrap_or_default();
                     let mut paths = vec![bin_dir];
                     paths.extend(std::env::split_paths(&old_path));
@@ -2541,7 +2366,7 @@ impl KaraokeApp {
 
                 let mut render_cmd = std::process::Command::new(&renderer_path);
                 hide_subprocess_window(&mut render_cmd);
-                if let Some(bin_dir) = bundled_bin_dir() {
+                if let Some(bin_dir) = paths::bundled_bin_dir() {
                     let old_path = std::env::var_os("PATH").unwrap_or_default();
                     let mut paths = vec![bin_dir];
                     paths.extend(std::env::split_paths(&old_path));
@@ -2871,7 +2696,7 @@ impl KaraokeApp {
         self.normalize_trim_state();
         let play_start = self.trim_playhead_ms.clamp(start, end.saturating_sub(500));
 
-        let preview_path = temp_dir().join("karaoke_trim_preview.wav");
+        let preview_path = paths::temp_dir().join("karaoke_trim_preview.wav");
         match render_trimmed_audio(
             &audio_path,
             start,
@@ -3202,9 +3027,9 @@ impl KaraokeApp {
             None => return,
         };
         self.stop_video_preview();
-        clear_bundled_runtime_quarantine();
+        paths::clear_bundled_runtime_quarantine();
 
-        let worker_path = match find_worker() {
+        let worker_path = match paths::find_worker() {
             Some(p) => p,
             None => {
                 self.log_output
@@ -3215,7 +3040,7 @@ impl KaraokeApp {
                 return;
             }
         };
-        let rust_renderer_path = find_rust_renderer();
+        let rust_renderer_path = paths::find_rust_renderer();
 
         self.is_generating = true;
         self.progress = 0.0;
@@ -3245,14 +3070,14 @@ impl KaraokeApp {
         let verify_lrc_with_whisper = self.verify_lrc_with_whisper;
         let separate_vocals_for_word_level = self.separate_vocals_for_word_level;
         let trim_bounds = self.clamped_trim_bounds();
-        let temp = temp_dir();
-        let default_exports = exports_dir();
+        let temp = paths::temp_dir();
+        let default_exports = paths::exports_dir();
         let output_dir = self
             .batch_current_index
             .and_then(|index| self.batch_items.get(index))
             .map(|item| item.folder.clone())
             .unwrap_or(default_exports);
-        let uploads = upload_dir();
+        let uploads = paths::upload_dir();
         let worker_path_for_log = worker_path.to_string_lossy().to_string();
         let use_rust_renderer = rust_renderer_path.is_some();
         let renderer_path_for_log = rust_renderer_path
@@ -3301,7 +3126,7 @@ impl KaraokeApp {
                 "📝 Временные файлы подготовлены. Запуск worker: {}\n{}",
                 worker_path_for_log, render_mode
             )));
-            debug_log(format!(
+            paths::debug_log(format!(
                 "[karaoke-ui] worker={} renderer={:?} model={} plain_lines={}",
                 worker_path_for_log, renderer_path_for_log, model, plain_lines
             ));
@@ -3363,7 +3188,7 @@ impl KaraokeApp {
                 return;
             }
 
-            let mut cmd = if is_python_worker(&worker_path) {
+            let mut cmd = if paths::is_python_worker(&worker_path) {
                 let mut cmd = std::process::Command::new("python3");
                 cmd.arg(&worker_path);
                 cmd
@@ -3373,7 +3198,7 @@ impl KaraokeApp {
 
             hide_subprocess_window(&mut cmd);
 
-            if let Some(bin_dir) = bundled_bin_dir() {
+            if let Some(bin_dir) = paths::bundled_bin_dir() {
                 let old_path = std::env::var_os("PATH").unwrap_or_default();
                 let mut paths = vec![bin_dir];
                 paths.extend(std::env::split_paths(&old_path));
@@ -3430,7 +3255,7 @@ impl KaraokeApp {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    debug_log(format!("[karaoke-ui] worker spawn failed: {e}"));
+                    paths::debug_log(format!("[karaoke-ui] worker spawn failed: {e}"));
                     let _ = tx.send(ProgressUpdate::Error(format!(
                         "Ошибка запуска worker: {}",
                         e
@@ -3498,7 +3323,7 @@ impl KaraokeApp {
 
             let status = child.wait();
             let mut success = status.map(|s| s.success()).unwrap_or(false);
-            debug_log(format!("[karaoke-ui] worker finished success={success}"));
+            paths::debug_log(format!("[karaoke-ui] worker finished success={success}"));
 
             if success && let Some(renderer_path) = rust_renderer_path {
                 let _ = tx.send(ProgressUpdate::Progress(CLIProgress {
@@ -3516,7 +3341,7 @@ impl KaraokeApp {
                 let render_duration_ms = probe_audio_duration_ms(&worker_audio_path)
                     .unwrap_or(0)
                     .max(1);
-                debug_log(format!(
+                paths::debug_log(format!(
                     "[karaoke-ui] render start renderer={} output={} plain_lines={}",
                     renderer_path.to_string_lossy(),
                     output_mp4_path.to_string_lossy(),
@@ -3526,7 +3351,7 @@ impl KaraokeApp {
 
                 let mut render_cmd = std::process::Command::new(&renderer_path);
                 hide_subprocess_window(&mut render_cmd);
-                if let Some(bin_dir) = bundled_bin_dir() {
+                if let Some(bin_dir) = paths::bundled_bin_dir() {
                     let old_path = std::env::var_os("PATH").unwrap_or_default();
                     let mut paths = vec![bin_dir];
                     paths.extend(std::env::split_paths(&old_path));
@@ -3627,7 +3452,7 @@ impl KaraokeApp {
                             .wait()
                             .map(|status| status.success())
                             .unwrap_or(false);
-                        debug_log(format!("[karaoke-ui] render finished success={success}"));
+                        paths::debug_log(format!("[karaoke-ui] render finished success={success}"));
                         if success {
                             let _ = tx.send(ProgressUpdate::Progress(CLIProgress {
                                 progress: 1.0,
@@ -3646,7 +3471,7 @@ impl KaraokeApp {
                     }
                     Err(e) => {
                         success = false;
-                        debug_log(format!("[karaoke-ui] render spawn failed: {e}"));
+                        paths::debug_log(format!("[karaoke-ui] render spawn failed: {e}"));
                         let _ = tx.send(ProgressUpdate::Error(format!(
                             "Ошибка запуска Rust-рендера: {}",
                             e
@@ -3763,7 +3588,7 @@ impl eframe::App for KaraokeApp {
                         item.progress = prog.progress;
                     }
                     if let Some(err) = &prog.error {
-                        debug_log(format!("[karaoke-ui] Progress error: {}", err));
+                        paths::debug_log(format!("[karaoke-ui] Progress error: {}", err));
                         self.log_output
                             .push_str(&format!("❌ Ошибка ИИ: {}\n", err));
                     }
@@ -3813,11 +3638,11 @@ impl eframe::App for KaraokeApp {
                     }
                 }
                 ProgressUpdate::RawLog(log) => {
-                    debug_log(format!("[worker-raw] {}", log));
+                    paths::debug_log(format!("[worker-raw] {}", log));
                     self.log_output.push_str(&format!("{}\n", log));
                 }
                 ProgressUpdate::Error(err) => {
-                    debug_log(format!("[worker-error] {}", err));
+                    paths::debug_log(format!("[worker-error] {}", err));
                     if self.batch_current_index.is_some() {
                         self.log_output.push_str(&format!("❌ Ошибка: {}\n", err));
                         self.finish_batch_current(false, Some(err), ctx);
@@ -4302,7 +4127,7 @@ impl eframe::App for KaraokeApp {
                                         let batch_video_dir = self
                                             .batch_root
                                             .clone()
-                                            .unwrap_or_else(exports_dir);
+                                            .unwrap_or_else(paths::exports_dir);
                                         if batch_video_dir.exists() {
                                             if ui.button("📁 Открыть папку с видео").clicked() {
                                                 open_in_explorer(&batch_video_dir);
@@ -6426,7 +6251,7 @@ impl eframe::App for KaraokeApp {
         if old_settings != new_settings
             && let Ok(data) = serde_json::to_string_pretty(&new_settings)
         {
-            let _ = std::fs::write(settings_path(), data);
+            let _ = std::fs::write(paths::settings_path(), data);
         }
     }
 }
