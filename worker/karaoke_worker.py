@@ -2987,3 +2987,13 @@ def run_cli_entrypoint():
         sys.exit(1)
     sys.exit(0)
 
+
+
+if __name__ == '__main__':
+    import sys as _sys
+    if '--cli' in _sys.argv:
+        run_cli_entrypoint()
+
+    if getattr(_sys, "frozen", False):
+        print("This bundled worker is intended to be launched by Karaoke Generator with --cli.", file=_sys.stderr)
+        _sys.exit(2)
