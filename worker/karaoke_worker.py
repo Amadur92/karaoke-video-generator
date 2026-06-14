@@ -22,9 +22,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     RESOURCE_DIR = BASE_DIR
 
-UPLOAD_FOLDER = os.environ.get("KARAOKE_UPLOAD_DIR", os.path.join(BASE_DIR, "web_uploads"))
 EXPORT_FOLDER = os.environ.get("KARAOKE_EXPORT_DIR", os.path.join(BASE_DIR, "web_exports"))
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(EXPORT_FOLDER, exist_ok=True)
 
 

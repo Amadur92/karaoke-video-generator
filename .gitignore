@@ -6,3 +6,7 @@ packaging/dist/
 worker/__pycache__/
 **/__pycache__/
 *.pyc
+
+# Папки вывода worker-а: создаются рантаймом, в репозитории не нужны.
+worker/web_exports/
+worker/web_uploads/
