@@ -1383,7 +1383,7 @@ def align_in_chunks(model, audio_path, lyrics_lines, language,
                 original_split=True,
                 max_word_dur=2.0,
                 vad=True,
-                vad_threshold=0.05
+                vad_threshold=0.35
             )
 
             chunk_words = []
@@ -1670,6 +1670,214 @@ def separate_vocals_with_demucs(audio_path, status_callback=None):
     if status_callback:
         status_callback(f"Вокал сохранен в кэш: {os.path.basename(cache_path)}")
     return cache_path
+
+
+def _word_probability(word):
+    """Достаёт confidence слова из stable-ts; если поле недоступно — None."""
+    for attr in ('probability', 'confidence'):
+        value = getattr(word, attr, None)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _distribute_words_linear(words, start_time, end_time):
+    """Пропорционально раскладывает слова по интервалу [start, end] по длине.
+
+    Используется, когда Whisper не дал надёжных таймингов для группы слов
+    (галлюцинация/пропуск): честнее угадать плавный темп, чем привязывать
+    тайминги чужих слов из текста.
+    """
+    if not words:
+        return []
+    start_time = float(start_time)
+    end_time = max(start_time + 0.08, float(end_time))
+    total_chars = sum(max(len(clean_word(w.get("word", ""))), 1) for w in words) or len(words)
+    span = end_time - start_time
+    cursor = start_time
+    distributed = []
+    for idx, word in enumerate(words):
+        share = max(len(clean_word(word.get("word", ""))), 1) / total_chars
+        slot = span * share
+        word_end = end_time if idx == len(words) - 1 else min(end_time, cursor + max(0.08, slot * 0.88))
+        updated = dict(word)
+        updated["start"] = round(cursor, 3)
+        updated["end"] = round(max(cursor + 0.05, word_end), 3)
+        distributed.append(updated)
+        cursor = min(end_time, cursor + max(0.08, slot))
+    return distributed
+
+
+def _interp_gaps(line_words, anchors):
+    """Линейно интерполирует тайминги незаматченных слов между якорями.
+
+    anchors: список индексов (в line_words), для которых уже есть надёжный
+    тайминг (start/end). Группы незаматченных слов до первого, между и после
+    последнего якоря раскладываются пропорционально длине.
+    """
+    if not anchors:
+        return
+    n = len(line_words)
+
+    # Кусок до первого якоря: от примерного начала строки до якоря.
+    first = anchors[0]
+    anchor_start = line_words[first]["start"]
+    if first > 0:
+        seg = _distribute_words_linear(line_words[:first], max(0.0, anchor_start - 0.5), anchor_start)
+        for i, w in enumerate(seg):
+            line_words[i]["start"] = w["start"]
+            line_words[i]["end"] = w["end"]
+
+    # Куски между соседними якорями.
+    for ai in range(len(anchors) - 1):
+        a = anchors[ai]
+        b = anchors[ai + 1]
+        if b - a <= 1:
+            continue
+        seg_start = line_words[a]["end"]
+        seg_end = line_words[b]["start"]
+        seg = _distribute_words_linear(line_words[a + 1:b], seg_start, seg_end)
+        for i, w in enumerate(seg):
+            line_words[a + 1 + i]["start"] = w["start"]
+            line_words[a + 1 + i]["end"] = w["end"]
+
+    # Кусок после последнего якоря: до примерного конца строки.
+    last = anchors[-1]
+    if last < n - 1:
+        anchor_end = line_words[last]["end"]
+        seg_end = anchor_end + 0.5 * (n - 1 - last)
+        seg = _distribute_words_linear(line_words[last + 1:], anchor_end, seg_end)
+        for i, w in enumerate(seg):
+            line_words[last + 1 + i]["start"] = w["start"]
+            line_words[last + 1 + i]["end"] = w["end"]
+
+
+def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, lookahead=5):
+    """Сопоставляет текст песни со словами Whisper и строит караоке-тайминги.
+
+    Ключевые отличия от прежнего инлайн-матчинга:
+    - Низкоуверенные слова Whisper (ниже confidence_threshold) не используются
+      как точные якоря — это убирает галлюцинации в инструментальных паузах.
+    - Слова текста, которым не нашлось совпадения в Whisper, НЕ привязываются
+      к таймингу чужого Whisper-слова (прежний безусловный fallback). Вместо
+      этого их тайминги честно интерполируются между соседними найденными
+      словами внутри той же строки.
+    - Лишние вставки Whisper аккуратно перепрыгиваются.
+
+    Аргументы:
+      raw_lines: строки текста песни (без LRC-меток).
+      whisper_words: объекты слов stable-ts с .word/.start/.end/.probability.
+      confidence_threshold: минимальный confidence для слова-якоря.
+      lookahead: сколько слов вперёд искать при неточном совпадении.
+
+    Возвращает: (lyrics_karaoke, stats) где stats описывает качество матчинга.
+    """
+    num_whisper_words = len(whisper_words or [])
+
+    def w_word_clean(idx):
+        return clean_word(getattr(whisper_words[idx], 'word', '') or '')
+
+    def w_time(idx):
+        w = whisper_words[idx]
+        return round(float(w.start), 3), round(float(w.end), 3)
+
+    def w_confident(idx):
+        prob = _word_probability(whisper_words[idx])
+        # Если confidence недоступен (старая модель/формат) — принимаем слово.
+        return prob is None or prob >= confidence_threshold
+
+    lyrics_karaoke = []
+    whisper_idx = 0
+    matched_total = 0
+    interpolated_total = 0
+    total_words = 0
+
+    for raw_line in raw_lines or []:
+        line_cleaned = (raw_line or '').strip()
+        if not line_cleaned:
+            continue
+        orig_words = [w for w in line_cleaned.split() if clean_word(w)]
+        if not orig_words:
+            continue
+        total_words += len(orig_words)
+
+        line_words = []
+        anchors = []
+
+        for orig_pos, orig_w in enumerate(orig_words):
+            orig_w_clean = clean_word(orig_w)
+
+            matched_whisper_idx = None
+
+            # 1. Точное совпадение с текущим словом Whisper (с учётом confidence).
+            if whisper_idx < num_whisper_words and w_word_clean(whisper_idx) == orig_w_clean and w_confident(whisper_idx):
+                matched_whisper_idx = whisper_idx
+
+            # 2. Lookahead: ищем совпадение, перепрыгивая низкоуверенные/лишние слова Whisper.
+            if matched_whisper_idx is None:
+                search_to = min(whisper_idx + lookahead, num_whisper_words)
+                for k in range(whisper_idx, search_to):
+                    cand_clean = w_word_clean(k)
+                    if not cand_clean:
+                        continue
+                    if orig_w_clean == cand_clean or (
+                        len(orig_w_clean) >= 4
+                        and len(cand_clean) >= 4
+                        and (orig_w_clean in cand_clean or cand_clean in orig_w_clean)
+                    ):
+                        if w_confident(k):
+                            matched_whisper_idx = k
+                            break
+
+            if matched_whisper_idx is not None:
+                start, end = w_time(matched_whisper_idx)
+                line_words.append({"word": orig_w, "start": start, "end": end})
+                anchors.append(orig_pos)
+                whisper_idx = matched_whisper_idx + 1
+                matched_total += 1
+            else:
+                line_words.append({"word": orig_w, "start": None, "end": None})
+
+        # Интерполяция незаматченных слов.
+        if anchors:
+            _interp_gaps(line_words, anchors)
+            interpolated_total += len(line_words) - len(anchors)
+        else:
+            # Ни одного якоря: раскладываем по позиции курсора Whisper.
+            est_start = 0.0
+            if whisper_idx < num_whisper_words:
+                est_start = w_time(whisper_idx)[0]
+            est_end = est_start + 0.6 * len(line_words)
+            seg = _distribute_words_linear(line_words, est_start, est_end)
+            for i, w in enumerate(seg):
+                line_words[i]["start"] = w["start"]
+                line_words[i]["end"] = w["end"]
+            interpolated_total += len(line_words)
+
+        # Страховка от None/инвертированных таймингов.
+        for w in line_words:
+            if w["start"] is None or w["end"] is None or w["end"] <= w["start"]:
+                base = w["start"] if w["start"] is not None else 0.0
+                w["start"] = round(base, 3)
+                w["end"] = round(base + 0.08, 3)
+
+        lyrics_karaoke.append({
+            "text": line_cleaned,
+            "start": line_words[0]["start"],
+            "end": line_words[-1]["end"],
+            "words": line_words,
+        })
+
+    stats = {
+        "matched_words": matched_total,
+        "interpolated_words": interpolated_total,
+        "total_words": total_words,
+    }
+    return lyrics_karaoke, stats
+
 
 # ----------------- РЕНДЕРИНГ (ФОНОВЫЙ ПОТОК) -----------------
 def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False, inactive_opacity=0.65, verify_lrc_with_whisper=False, separate_vocals_for_alignment=False):
@@ -1993,68 +2201,19 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     jobs[job_id]["status"] = f"⚠️ LRC не совпал с Whisper: {lrc_decision['reason']}. Используем тайминги Whisper."
 
             if not used_timestamped_hybrid:
+                # Сопоставление текста со словами Whisper: confidence-фильтрация
+                # низкоуверенных слов (борьба с галлюцинациями в проигрышах) и
+                # честная интерполяция пропущенных слов вместо привязки к чужим
+                # таймингам. Логика вынесена в match_lyrics_to_whisper и покрыта
+                # юнит-тестами.
                 raw_lines = alignment_lyrics.split('\n')
-                lyrics_karaoke = []
-                whisper_idx = 0
-                LOOKAHEAD = 5
-
-                for line in raw_lines:
-                    line_cleaned = line.strip()
-                    if not line_cleaned:
-                        continue
-
-                    orig_words = line_cleaned.split()
-                    line_words_timing = []
-
-                    for orig_w in orig_words:
-                        orig_w_clean = clean_word(orig_w)
-                        if not orig_w_clean:
-                            continue
-
-                        matched = False
-                        if whisper_idx < num_whisper_words:
-                            w_word_clean = clean_word(whisper_words[whisper_idx].word)
-                            if orig_w_clean == w_word_clean:
-                                line_words_timing.append({
-                                    "word": orig_w,
-                                    "start": round(whisper_words[whisper_idx].start, 3),
-                                    "end": round(whisper_words[whisper_idx].end, 3),
-                                })
-                                whisper_idx += 1
-                                matched = True
-
-                        if not matched:
-                            best_k = -1
-                            for k in range(whisper_idx, min(whisper_idx + LOOKAHEAD, num_whisper_words)):
-                                w_word_clean = clean_word(whisper_words[k].word)
-                                if orig_w_clean == w_word_clean or orig_w_clean in w_word_clean or w_word_clean in orig_w_clean:
-                                    best_k = k
-                                    break
-
-                            if best_k >= 0:
-                                line_words_timing.append({
-                                    "word": orig_w,
-                                    "start": round(whisper_words[best_k].start, 3),
-                                    "end": round(whisper_words[best_k].end, 3),
-                                })
-                                whisper_idx = best_k + 1
-                                matched = True
-
-                        if not matched and whisper_idx < num_whisper_words:
-                            line_words_timing.append({
-                                "word": orig_w,
-                                "start": round(whisper_words[whisper_idx].start, 3),
-                                "end": round(whisper_words[whisper_idx].end, 3),
-                            })
-                            whisper_idx += 1
-
-                    if line_words_timing:
-                        lyrics_karaoke.append({
-                            "text": line_cleaned,
-                            "start": line_words_timing[0]["start"],
-                            "end": line_words_timing[-1]["end"],
-                            "words": line_words_timing,
-                        })
+                lyrics_karaoke, _match_stats = match_lyrics_to_whisper(
+                    raw_lines, whisper_words, confidence_threshold=0.5, lookahead=5,
+                )
+                jobs[job_id]["status"] = (
+                    f"Обработано {_match_stats['matched_words']}/{_match_stats['total_words']} "
+                    f"слов ({_match_stats['interpolated_words']} интерполировано)."
+                )
 
             # ЗАЩИТА МОНОТОННОСТИ: каждая строка должна начинаться после предыдущей
             for i in range(1, len(lyrics_karaoke)):
@@ -2584,7 +2743,7 @@ if __name__ == '__main__':
         parser.add_argument('--artist', default='Исполнитель')
         parser.add_argument('--title', default='Песня')
         parser.add_argument('--lyrics-file')
-        parser.add_argument('--model', default='base')
+        parser.add_argument('--model', default='small')
         parser.add_argument('--quality', default='medium')
         parser.add_argument('--font', default='montserrat')
         parser.add_argument('--color-active', default='#000000')
@@ -2706,7 +2865,7 @@ def run_cli_entrypoint():
     parser.add_argument('--artist', default='Исполнитель')
     parser.add_argument('--title', default='Песня')
     parser.add_argument('--lyrics-file')
-    parser.add_argument('--model', default='base')
+    parser.add_argument('--model', default='small')
     parser.add_argument('--quality', default='medium')
     parser.add_argument('--font', default='montserrat')
     parser.add_argument('--color-active', default='#000000')
