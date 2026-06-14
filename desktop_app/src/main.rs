@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Скрывает консоль на Windows в релиз-сборке
 
+mod ffmpeg;
 mod lyrics;
 mod paths;
 
@@ -14,24 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
 // Шрифты Montserrat вкомпилированы прямо в бинарник — нулевая зависимость от внешних файлов
 const MONTSERRAT_REGULAR: &[u8] = include_bytes!("../assets/Montserrat-Regular.ttf");
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../assets/Montserrat-Bold.ttf");
 const MONTSERRAT_BLACK: &[u8] = include_bytes!("../assets/Montserrat-Black.ttf");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-#[cfg(windows)]
-fn hide_subprocess_window(cmd: &mut std::process::Command) {
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn hide_subprocess_window(_cmd: &mut std::process::Command) {}
 
 fn app_icon() -> egui::IconData {
     let size = 256usize;
@@ -110,59 +98,6 @@ fn app_icon() -> egui::IconData {
     }
 }
 
-fn format_time_ms(ms: i64) -> String {
-    let total_seconds = (ms.max(0) as f32 / 1000.0).round() as i64;
-    let minutes = total_seconds / 60;
-    let seconds = total_seconds % 60;
-    format!("{:02}:{:02}", minutes, seconds)
-}
-
-fn parse_ffmpeg_hms_ms(value: &str) -> Option<i64> {
-    let parts: Vec<&str> = value.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let hours = parts[0].parse::<f64>().ok()?;
-    let minutes = parts[1].parse::<f64>().ok()?;
-    let seconds = parts[2].parse::<f64>().ok()?;
-    Some(((hours * 3600.0 + minutes * 60.0 + seconds) * 1000.0).round() as i64)
-}
-
-fn parse_ffmpeg_time_ms(line: &str) -> Option<i64> {
-    if let Some(value) = line.strip_prefix("out_time_us=") {
-        return value.trim().parse::<i64>().ok().map(|v| v / 1000);
-    }
-
-    if let Some(value) = line.strip_prefix("out_time_ms=") {
-        return value.trim().parse::<i64>().ok().map(|v| v / 1000);
-    }
-
-    if let Some(value) = line.strip_prefix("out_time=") {
-        return parse_ffmpeg_hms_ms(value.trim());
-    }
-
-    let start = line.find("time=")? + "time=".len();
-    let value = line[start..].split_whitespace().next()?;
-    parse_ffmpeg_hms_ms(value)
-}
-
-fn is_ffmpeg_progress_key(line: &str) -> bool {
-    let Some((key, _)) = line.split_once('=') else {
-        return false;
-    };
-    matches!(
-        key,
-        "frame"
-            | "fps"
-            | "bitrate"
-            | "total_size"
-            | "dup_frames"
-            | "drop_frames"
-            | "speed"
-            | "progress"
-    ) || key.starts_with("stream_")
-}
-
 fn open_in_explorer(path: &std::path::Path) {
     let path_to_open = if path.is_file() {
         path.parent().unwrap_or(path)
@@ -187,178 +122,6 @@ fn open_in_explorer(path: &std::path::Path) {
         let _ = std::process::Command::new("xdg-open")
             .arg(path_to_open)
             .status();
-    }
-}
-
-fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
-    let mut cmd = std::process::Command::new(paths::tool_path("ffprobe"));
-    hide_subprocess_window(&mut cmd);
-    let output = cmd
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ])
-        .output()
-        .map_err(|e| format!("Не удалось запустить ffprobe: {}", e))?;
-
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffprobe не смог прочитать файл: {}", err.trim()));
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let seconds = raw
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| format!("Не удалось прочитать длительность аудио: {}", e))?;
-    Ok((seconds * 1000.0).round() as i64)
-}
-
-fn render_trimmed_audio(
-    input: &str,
-    start_ms: i64,
-    end_ms: i64,
-    fade_in_ms: i64,
-    fade_out_ms: i64,
-    output: &Path,
-) -> Result<(), String> {
-    let duration_ms = end_ms - start_ms;
-    if duration_ms < 1000 {
-        return Err("Оставьте хотя бы 1 секунду аудио после обрезки.".to_string());
-    }
-
-    let max_fade_ms = (duration_ms / 2).max(0);
-    let fade_in_ms = fade_in_ms.clamp(0, max_fade_ms);
-    let fade_out_ms = fade_out_ms.clamp(0, max_fade_ms);
-    let mut audio_filters = Vec::new();
-
-    if fade_in_ms > 0 {
-        audio_filters.push(format!(
-            "afade=t=in:st=0:d={:.3}",
-            fade_in_ms as f64 / 1000.0
-        ));
-    }
-    if fade_out_ms > 0 {
-        let fade_out_start_ms = (duration_ms - fade_out_ms).max(0);
-        audio_filters.push(format!(
-            "afade=t=out:st={:.3}:d={:.3}",
-            fade_out_start_ms as f64 / 1000.0,
-            fade_out_ms as f64 / 1000.0
-        ));
-    }
-
-    let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
-    hide_subprocess_window(&mut cmd);
-    cmd.arg("-y")
-        .arg("-ss")
-        .arg(format!("{:.3}", start_ms as f64 / 1000.0))
-        .arg("-t")
-        .arg(format!("{:.3}", duration_ms as f64 / 1000.0))
-        .arg("-i")
-        .arg(input)
-        .arg("-vn");
-
-    if !audio_filters.is_empty() {
-        cmd.arg("-af").arg(audio_filters.join(","));
-    }
-
-    let status = cmd
-        .arg("-acodec")
-        .arg("pcm_s16le")
-        .arg("-ar")
-        .arg("44100")
-        .arg("-ac")
-        .arg("2")
-        .arg(output)
-        .status()
-        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ffmpeg не смог создать обрезанный аудиофайл.".to_string())
-    }
-}
-
-fn probe_video_size(path: &str) -> Result<(usize, usize), String> {
-    let mut cmd = std::process::Command::new(paths::tool_path("ffprobe"));
-    hide_subprocess_window(&mut cmd);
-    let output = cmd
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=s=x:p=0",
-            path,
-        ])
-        .output()
-        .map_err(|e| format!("Не удалось запустить ffprobe: {}", e))?;
-
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffprobe не смог прочитать видео: {}", err.trim()));
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let mut parts = raw.trim().split('x');
-    let width = parts
-        .next()
-        .and_then(|part| part.parse::<usize>().ok())
-        .ok_or_else(|| "Не удалось прочитать ширину видео.".to_string())?;
-    let height = parts
-        .next()
-        .and_then(|part| part.parse::<usize>().ok())
-        .ok_or_else(|| "Не удалось прочитать высоту видео.".to_string())?;
-
-    Ok((width.max(1), height.max(1)))
-}
-
-fn preview_video_size(path: &str) -> Result<(usize, usize), String> {
-    let (width, height) = probe_video_size(path)?;
-    let target_width = width.clamp(2, 720);
-    if target_width == width {
-        return Ok((width, height));
-    }
-
-    let scaled_height = ((height as f32 * target_width as f32 / width as f32).round() as usize)
-        .max(2)
-        .next_multiple_of(2);
-    Ok((target_width, scaled_height))
-}
-
-fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
-    hide_subprocess_window(&mut cmd);
-    let status = cmd
-        .arg("-y")
-        .arg("-ss")
-        .arg(format!("{:.3}", start_ms.max(0) as f64 / 1000.0))
-        .arg("-i")
-        .arg(input)
-        .arg("-vn")
-        .arg("-acodec")
-        .arg("pcm_s16le")
-        .arg("-ar")
-        .arg("44100")
-        .arg("-ac")
-        .arg("2")
-        .arg(output)
-        .status()
-        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ffmpeg не смог подготовить звук для предпросмотра.".to_string())
     }
 }
 
@@ -404,7 +167,7 @@ fn scan_batch_folder(
         }
 
         for audio_path in audio_files {
-            let duration_ms = match probe_audio_duration_ms(&audio_path.to_string_lossy()) {
+            let duration_ms = match ffmpeg::probe_audio_duration_ms(&audio_path.to_string_lossy()) {
                 Ok(duration) => duration,
                 Err(err) => {
                     warnings.push(format!(
@@ -675,13 +438,13 @@ fn batch_trim_timeline_static_ui(
     draw_label(
         start_x,
         track_rect.top() - 14.0,
-        format_time_ms(start_ms),
+        ffmpeg::format_time_ms(start_ms),
         success,
     );
     draw_label(
         end_x,
         track_rect.top() - 14.0,
-        format_time_ms(end_ms),
+        ffmpeg::format_time_ms(end_ms),
         success,
     );
 
@@ -1090,7 +853,7 @@ impl KaraokeApp {
         self.halt_video_preview();
         self.video_status = format!(
             "Пауза на {}.",
-            format_time_ms(self.video_position_ms.min(self.video_duration_ms))
+            ffmpeg::format_time_ms(self.video_position_ms.min(self.video_duration_ms))
         );
     }
 
@@ -1099,7 +862,7 @@ impl KaraokeApp {
         self.video_status = "Готовим встроенный предпросмотр...".to_string();
 
         if self.video_duration_ms <= 0 {
-            self.video_duration_ms = probe_audio_duration_ms(path).unwrap_or(0);
+            self.video_duration_ms = ffmpeg::probe_audio_duration_ms(path).unwrap_or(0);
         }
         if self.video_duration_ms > 0 && self.video_position_ms >= self.video_duration_ms - 250 {
             self.video_position_ms = 0;
@@ -1108,9 +871,9 @@ impl KaraokeApp {
             .video_position_ms
             .clamp(0, self.video_duration_ms.max(0));
 
-        let (width, height) = preview_video_size(path)?;
+        let (width, height) = ffmpeg::preview_video_size(path)?;
         let audio_path = paths::temp_dir().join("karaoke_video_preview.wav");
-        render_video_preview_audio(path, &audio_path, start_ms)?;
+        ffmpeg::render_video_preview_audio(path, &audio_path, start_ms)?;
 
         let audio_file = std::fs::File::open(&audio_path)
             .map_err(|e| format!("Не удалось открыть звук видео: {}", e))?;
@@ -1129,7 +892,7 @@ impl KaraokeApp {
 
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
-            hide_subprocess_window(&mut cmd);
+            ffmpeg::hide_subprocess_window(&mut cmd);
             let mut child = match cmd
                 .arg("-v")
                 .arg("error")
@@ -1312,7 +1075,7 @@ impl KaraokeApp {
         self.audio_rx = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = probe_audio_duration_ms(&path_str);
+            let result = ffmpeg::probe_audio_duration_ms(&path_str);
             let _ = tx.send(AudioLoadUpdate {
                 path: path_str,
                 result,
@@ -1469,7 +1232,7 @@ impl KaraokeApp {
         self.trim_playhead_ms = self.trim_start_ms;
         self.fade_in_ms = item.fade_in_ms;
         self.fade_out_ms = item.fade_out_ms;
-        self.trim_status = format!("Длительность: {}", format_time_ms(item.duration_ms));
+        self.trim_status = format!("Длительность: {}", ffmpeg::format_time_ms(item.duration_ms));
         self.artist = item.artist;
         self.title = item.title;
         self.lyrics = lyrics;
@@ -1508,8 +1271,7 @@ impl KaraokeApp {
             cmd.env("PYTHONUTF8", "1");
             cmd.arg("parse-sheet").arg(&path);
 
-            #[cfg(windows)]
-            cmd.creation_flags(0x08000000);
+            ffmpeg::hide_subprocess_window(&mut cmd);
 
             let output = match cmd.output() {
                 Ok(out) => out,
@@ -1722,8 +1484,7 @@ impl KaraokeApp {
                 ));
             }
 
-            #[cfg(windows)]
-            cmd.creation_flags(0x08000000);
+            ffmpeg::hide_subprocess_window(&mut cmd);
 
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -1970,7 +1731,7 @@ impl KaraokeApp {
 
                 if should_trim {
                     let trimmed_path = item_temp.join("audio.wav");
-                    match render_trimmed_audio(
+                    match ffmpeg::render_trimmed_audio(
                         &item.audio_path.to_string_lossy(),
                         start,
                         end,
@@ -2069,7 +1830,7 @@ impl KaraokeApp {
                 } else {
                     std::process::Command::new(&worker_path)
                 };
-                hide_subprocess_window(&mut cmd);
+                ffmpeg::hide_subprocess_window(&mut cmd);
                 if let Some(bin_dir) = paths::bundled_bin_dir() {
                     let old_path = std::env::var_os("PATH").unwrap_or_default();
                     let mut paths = vec![bin_dir];
@@ -2228,7 +1989,7 @@ impl KaraokeApp {
                 });
 
                 let mut render_cmd = std::process::Command::new(&renderer_path);
-                hide_subprocess_window(&mut render_cmd);
+                ffmpeg::hide_subprocess_window(&mut render_cmd);
                 if let Some(bin_dir) = paths::bundled_bin_dir() {
                     let old_path = std::env::var_os("PATH").unwrap_or_default();
                     let mut paths = vec![bin_dir];
@@ -2278,7 +2039,7 @@ impl KaraokeApp {
                                     break;
                                 }
                                 let trimmed = line.trim();
-                                let progress = parse_ffmpeg_time_ms(trimmed)
+                                let progress = ffmpeg::parse_ffmpeg_time_ms(trimmed)
                                     .map(|time_ms| {
                                         (time_ms as f32 / task.duration_ms as f32).clamp(0.0, 0.98)
                                     })
@@ -2305,7 +2066,7 @@ impl KaraokeApp {
                                     ctx.request_repaint();
                                     continue;
                                 }
-                                if is_ffmpeg_progress_key(trimmed) {
+                                if ffmpeg::is_ffmpeg_progress_key(trimmed) {
                                     continue;
                                 }
                                 if !trimmed.is_empty() {
@@ -2560,7 +2321,7 @@ impl KaraokeApp {
         let play_start = self.trim_playhead_ms.clamp(start, end.saturating_sub(500));
 
         let preview_path = paths::temp_dir().join("karaoke_trim_preview.wav");
-        match render_trimmed_audio(
+        match ffmpeg::render_trimmed_audio(
             &audio_path,
             start,
             end,
@@ -2573,8 +2334,8 @@ impl KaraokeApp {
             Ok(()) => {
                 self.trim_status = format!(
                     "Проигрывается предпросмотр: {} - {}",
-                    format_time_ms(play_start),
-                    format_time_ms(end)
+                    ffmpeg::format_time_ms(play_start),
+                    ffmpeg::format_time_ms(end)
                 );
             }
             Err(err) => {
@@ -2813,7 +2574,7 @@ impl KaraokeApp {
             draw_label(
                 x,
                 selected_rect.top() - 12.0,
-                format!("{} {}", label, format_time_ms(ms as i64)),
+                format!("{} {}", label, ffmpeg::format_time_ms(ms as i64)),
                 egui::Color32::from_rgb(220, 230, 232),
             );
         };
@@ -2863,14 +2624,14 @@ impl KaraokeApp {
             start_x,
             success,
             "S",
-            Some(format_time_ms(self.trim_start_ms)),
+            Some(ffmpeg::format_time_ms(self.trim_start_ms)),
             true,
         );
         draw_pin(
             end_x,
             success,
             "E",
-            Some(format_time_ms(self.trim_end_ms)),
+            Some(ffmpeg::format_time_ms(self.trim_end_ms)),
             true,
         );
         draw_pin(play_x, accent, "▶", None, false);
@@ -2998,7 +2759,7 @@ impl KaraokeApp {
             let mut trim_for_lyrics: Option<(i64, i64)> = None;
             let worker_audio_path = if let Some((start, end)) = trim_bounds {
                 let should_trim = start > 0
-                    || probe_audio_duration_ms(&audio_path)
+                    || ffmpeg::probe_audio_duration_ms(&audio_path)
                         .map(|duration| end < duration - 250)
                         .unwrap_or(false)
                     || fade_in_ms > 0
@@ -3008,14 +2769,14 @@ impl KaraokeApp {
                     let trimmed_path = temp.join("karaoke_trimmed_generation.wav");
                     let _ = tx.send(ProgressUpdate::RawLog(format!(
                         "✂️ Подготовка аудио: {} - {}, восхождение {}, затухание {}",
-                        format_time_ms(start),
-                        format_time_ms(end),
-                        format_time_ms(fade_in_ms as i64),
-                        format_time_ms(fade_out_ms as i64)
+                        ffmpeg::format_time_ms(start),
+                        ffmpeg::format_time_ms(end),
+                        ffmpeg::format_time_ms(fade_in_ms as i64),
+                        ffmpeg::format_time_ms(fade_out_ms as i64)
                     )));
                     ctx.request_repaint();
 
-                    match render_trimmed_audio(
+                    match ffmpeg::render_trimmed_audio(
                         &audio_path,
                         start,
                         end,
@@ -3059,7 +2820,7 @@ impl KaraokeApp {
                 std::process::Command::new(&worker_path)
             };
 
-            hide_subprocess_window(&mut cmd);
+            ffmpeg::hide_subprocess_window(&mut cmd);
 
             if let Some(bin_dir) = paths::bundled_bin_dir() {
                 let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -3201,7 +2962,7 @@ impl KaraokeApp {
                     "🎬 Rust-рендер: {}",
                     output_mp4_path.to_string_lossy()
                 )));
-                let render_duration_ms = probe_audio_duration_ms(&worker_audio_path)
+                let render_duration_ms = ffmpeg::probe_audio_duration_ms(&worker_audio_path)
                     .unwrap_or(0)
                     .max(1);
                 paths::debug_log(format!(
@@ -3213,7 +2974,7 @@ impl KaraokeApp {
                 ctx.request_repaint();
 
                 let mut render_cmd = std::process::Command::new(&renderer_path);
-                hide_subprocess_window(&mut render_cmd);
+                ffmpeg::hide_subprocess_window(&mut render_cmd);
                 if let Some(bin_dir) = paths::bundled_bin_dir() {
                     let old_path = std::env::var_os("PATH").unwrap_or_default();
                     let mut paths = vec![bin_dir];
@@ -3261,7 +3022,7 @@ impl KaraokeApp {
                             let reader = BufReader::new(stderr);
                             for line in reader.lines().map_while(Result::ok) {
                                 let trimmed = line.trim();
-                                if let Some(time_ms) = parse_ffmpeg_time_ms(trimmed) {
+                                if let Some(time_ms) = ffmpeg::parse_ffmpeg_time_ms(trimmed) {
                                     let value = (time_ms as f32 / render_duration_ms as f32)
                                         .clamp(0.0, 1.0);
                                     let mapped = 0.55 + value * 0.43;
@@ -3298,7 +3059,7 @@ impl KaraokeApp {
                                         continue;
                                     }
                                 }
-                                if is_ffmpeg_progress_key(trimmed) {
+                                if ffmpeg::is_ffmpeg_progress_key(trimmed) {
                                     continue;
                                 }
                                 if !trimmed.is_empty() {
@@ -3419,7 +3180,8 @@ impl eframe::App for KaraokeApp {
                         self.trim_start_ms = 0;
                         self.trim_end_ms = duration_ms;
                         self.trim_playhead_ms = 0;
-                        self.trim_status = format!("Длительность: {}", format_time_ms(duration_ms));
+                        self.trim_status =
+                            format!("Длительность: {}", ffmpeg::format_time_ms(duration_ms));
                     }
                     Err(err) => {
                         self.audio_duration_ms = None;
@@ -3461,7 +3223,8 @@ impl eframe::App for KaraokeApp {
                         self.stop_video_preview();
                         self.video_texture = None;
                         self.video_status = String::new();
-                        self.video_duration_ms = probe_audio_duration_ms(&full_path).unwrap_or(0);
+                        self.video_duration_ms =
+                            ffmpeg::probe_audio_duration_ms(&full_path).unwrap_or(0);
                         self.video_position_ms = 0;
                         self.generated_file = Some(full_path);
                         if let Some(index) = self.batch_current_index
@@ -4742,7 +4505,7 @@ impl eframe::App for KaraokeApp {
                                                                                         self.fade_out_ms = 0;
                                                                                         self.trim_status = format!(
                                                                                             "Обрезка сброшена: {}",
-                                                                                            format_time_ms(duration_ms)
+                                                                                            ffmpeg::format_time_ms(duration_ms)
                                                                                         );
                                                                                     }
                                                                                 },
@@ -5518,7 +5281,7 @@ impl eframe::App for KaraokeApp {
                                                             self.fade_out_ms = 0;
                                                             self.trim_status = format!(
                                                                 "Обрезка сброшена: {}",
-                                                                format_time_ms(duration_ms)
+                                                                ffmpeg::format_time_ms(duration_ms)
                                                             );
                                                         }
                                                     },
@@ -6063,16 +5826,16 @@ impl eframe::App for KaraokeApp {
                                         }
                                         self.video_status = format!(
                                             "Позиция: {}.",
-                                            format_time_ms(self.video_position_ms)
+                                            ffmpeg::format_time_ms(self.video_position_ms)
                                         );
                                     }
 
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "{} / {}",
-                                            format_time_ms(self.video_position_ms),
+                                            ffmpeg::format_time_ms(self.video_position_ms),
                                             if self.video_duration_ms > 0 {
-                                                format_time_ms(self.video_duration_ms)
+                                                ffmpeg::format_time_ms(self.video_duration_ms)
                                             } else {
                                                 "--:--".to_string()
                                             }
