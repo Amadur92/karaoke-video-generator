@@ -1881,7 +1881,7 @@ impl KaraokeApp {
                                 let reader = BufReader::new(stderr);
                                 for line in reader.lines().map_while(Result::ok) {
                                     let trimmed = line.trim();
-                                    if !trimmed.is_empty() {
+                                    if !trimmed.is_empty() && !ffmpeg::is_ffmpeg_noise(trimmed) {
                                         let _ = tx_err.send(ProgressUpdate::RawLog(format!(
                                             "[LOG] {}",
                                             trimmed
@@ -2898,7 +2898,7 @@ impl KaraokeApp {
                     let reader = BufReader::new(stderr);
                     for line_str in reader.lines().map_while(Result::ok) {
                         let trimmed = line_str.trim();
-                        if !trimmed.is_empty() {
+                        if !trimmed.is_empty() && !ffmpeg::is_ffmpeg_noise(trimmed) {
                             let _ =
                                 tx_err.send(ProgressUpdate::RawLog(format!("[LOG] {}", trimmed)));
                             ctx_err.request_repaint();

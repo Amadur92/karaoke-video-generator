@@ -71,6 +71,40 @@ pub fn is_ffmpeg_progress_key(line: &str) -> bool {
     ) || key.starts_with("stream_")
 }
 
+/// Шум ffmpeg/Whisper, который не несёт пользы для пользователя и засоряет
+/// статус генерации. Такие строки stderr приглушаются и не показываются в UI.
+///
+/// Сюда относятся:
+/// - progress-bars выравнивания (`Align: 12%|...`, `Adjustment: ...`)
+/// - обрывы пайпа при досрочном завершении чтения аудио (`Broken pipe`,
+///   `Error muxing a packet`, `Error writing trailer`, ...) — это норма,
+///   Whisper закрывает чтение раньше, чем ffmpeg допишет поток
+/// - дублирующие сообщения (`Last message repeated ...`)
+pub fn is_ffmpeg_noise(line: &str) -> bool {
+    let l = line.trim();
+    if l.is_empty() {
+        return true;
+    }
+    if (l.starts_with("Align:")
+        || l.starts_with("Adjustment:")
+        || l.starts_with("Transcribe:")
+        || l.starts_with("Detect:"))
+        && l.contains('|')
+    {
+        return true;
+    }
+    matches!(
+        l,
+        "Broken pipe" | "Last message repeated 1 times" | "Last message repeated"
+    ) || l.starts_with("Error submitting a packet")
+        || l.starts_with("Error muxing a packet")
+        || l.starts_with("Error writing trailer")
+        || l.starts_with("Error closing file")
+        || l.starts_with("Task finished with error code: -32")
+        || l.starts_with("Terminating thread with return code: -32")
+        || l.starts_with("Error during demuxing: Immediate exit requested")
+}
+
 pub fn probe_audio_duration_ms(path: &str) -> Result<i64, String> {
     let mut cmd = std::process::Command::new(paths::tool_path("ffprobe"));
     hide_subprocess_window(&mut cmd);
