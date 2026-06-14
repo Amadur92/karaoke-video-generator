@@ -1968,7 +1968,10 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     )
                 except Exception as exc:
                     align_audio_path = audio_path
-                    jobs[job_id]["status"] = f"Demucs недоступен, word-level идет по исходному миксу: {exc}"
+                    jobs[job_id]["status"] = (
+                        "Выделение вокала недоступно (нет demucs), выравнивание "
+                        f"идёт по исходному миксу. {exc}"
+                    )
 
             model = loaded_models[model_name]
             jobs[job_id]["progress"] = 0.2

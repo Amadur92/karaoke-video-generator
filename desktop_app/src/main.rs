@@ -3972,7 +3972,7 @@ impl eframe::App for KaraokeApp {
                                             );
                                             ui.checkbox(
                                                 &mut self.separate_vocals_for_word_level,
-                                                "Вокал для слов (Demucs)",
+                                                "Вокал для слов (Demucs, точнее, но дольше)",
                                             );
                                         });
                                     },
@@ -5428,7 +5428,7 @@ impl eframe::App for KaraokeApp {
                                     );
                                     ui.checkbox(
                                         &mut self.separate_vocals_for_word_level,
-                                        "Выделять вокал для word-level через Demucs (медленно, нужен внешний demucs)",
+                                        "Выделять вокал для word-level через Demucs (точнее, но дольше)",
                                     );
                                 });
                             });

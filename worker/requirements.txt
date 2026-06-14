@@ -6,3 +6,4 @@ llvmlite==0.45.1
 yt-dlp
 openpyxl
 lxml
+demucs>=4.0,<5
