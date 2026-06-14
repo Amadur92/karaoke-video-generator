@@ -144,3 +144,82 @@ pub fn find_matching_lyrics(audio_path: &Path, files: &[PathBuf]) -> Option<Path
     });
     text_files.into_iter().next()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lrc_timestamp() {
+        assert_eq!(parse_lrc_timestamp_ms("01:23.45"), Some(83_450));
+        assert_eq!(parse_lrc_timestamp_ms("0:00.00"), Some(0));
+        assert_eq!(parse_lrc_timestamp_ms("2:5.5"), Some(125_500));
+    }
+
+    #[test]
+    fn rejects_malformed_timestamp() {
+        assert_eq!(parse_lrc_timestamp_ms("abc"), None);
+        assert_eq!(parse_lrc_timestamp_ms("just text"), None);
+        // "1:2" валиден для LRC (1 мин 2 сек) — это 62000 мс, см. parses_lrc_timestamp
+    }
+
+    #[test]
+    fn formats_lrc_timestamp() {
+        assert_eq!(format_lrc_timestamp_ms(0), "00:00.00");
+        assert_eq!(format_lrc_timestamp_ms(83_450), "01:23.45");
+        // отрицательные тайминги безопасно прижимаются к нулю
+        assert_eq!(format_lrc_timestamp_ms(-100), "00:00.00");
+    }
+
+    #[test]
+    fn shift_moves_timestamps_by_trim_start() {
+        let lrc = "[00:10.00]line one\n[00:20.00]line two\n[01:00.00]line three";
+        // обрезаем первые 5 секунд: метки сдвигаются на -5000 мс
+        let shifted = shift_lrc_for_trim(lrc, 5_000, 120_000);
+        assert!(shifted.contains("[00:05.00]line one"));
+        assert!(shifted.contains("[00:15.00]line two"));
+        assert!(shifted.contains("[00:55.00]line three"));
+    }
+
+    #[test]
+    fn shift_drops_lines_outside_trim_window() {
+        // строка до начала обрезки исчезает, последующие остаются
+        let lrc = "[00:01.00]early\n[00:10.00]kept";
+        let shifted = shift_lrc_for_trim(lrc, 5_000, 120_000);
+        assert!(!shifted.contains("early"));
+        assert!(shifted.contains("[00:05.00]kept"));
+    }
+
+    #[test]
+    fn plain_text_without_timestamps_passes_through() {
+        let text = "hello\nworld";
+        assert_eq!(shift_lrc_for_trim(text, 1_000, 10_000), text);
+    }
+
+    #[test]
+    fn parses_artist_and_title_from_stem() {
+        assert_eq!(
+            parse_artist_title_from_stem("Queen - Bohemian Rhapsody"),
+            ("Queen".to_string(), "Bohemian Rhapsody".to_string())
+        );
+        // числовой префикс списка отбрасывается
+        assert_eq!(
+            parse_artist_title_from_stem("03. AC/DC - Thunderstruck"),
+            ("AC/DC".to_string(), "Thunderstruck".to_string())
+        );
+        // без разделителя — всё уходит в title
+        assert_eq!(
+            parse_artist_title_from_stem("JustATitle"),
+            (String::new(), "JustATitle".to_string())
+        );
+    }
+
+    #[test]
+    fn classifies_files_by_extension() {
+        assert!(is_audio_file(Path::new("song.mp3")));
+        assert!(!is_audio_file(Path::new("song.wav")));
+        assert!(is_lyrics_file(Path::new("song.lrc")));
+        assert!(is_lyrics_file(Path::new("song.txt")));
+        assert!(!is_lyrics_file(Path::new("song.mp3")));
+    }
+}

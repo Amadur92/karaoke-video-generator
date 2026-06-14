@@ -44,5 +44,11 @@ jobs:
       - name: Clippy (warnings as errors)
         run: cargo clippy --manifest-path desktop_app/Cargo.toml --all-targets -- -D warnings
 
+      - name: Rust unit tests
+        run: cargo test --manifest-path desktop_app/Cargo.toml
+
       - name: Compile worker
         run: python3 -m py_compile worker/karaoke_worker.py
+
+      - name: Worker logic tests
+        run: python3 worker/test_karaoke_logic.py

@@ -242,3 +242,50 @@ pub fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> 
         Err("ffmpeg не смог подготовить звук для предпросмотра.".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_milliseconds_as_mm_ss() {
+        assert_eq!(format_time_ms(0), "00:00");
+        assert_eq!(format_time_ms(65_000), "01:05");
+        assert_eq!(format_time_ms(3_661_000), "61:01");
+    }
+
+    #[test]
+    fn negative_time_clamps_to_zero() {
+        assert_eq!(format_time_ms(-5_000), "00:00");
+    }
+
+    #[test]
+    fn parses_hms_progress_time() {
+        assert_eq!(parse_ffmpeg_hms_ms("00:01:23.456"), Some(83_456));
+        assert_eq!(parse_ffmpeg_hms_ms("1:02:03"), Some(3_723_000));
+        assert_eq!(parse_ffmpeg_hms_ms("1:2"), None); // нужно ровно 3 части
+        assert_eq!(parse_ffmpeg_hms_ms("abc"), None);
+    }
+
+    #[test]
+    fn parses_ffmpeg_time_keys() {
+        assert_eq!(parse_ffmpeg_time_ms("out_time_us=83456000"), Some(83_456));
+        assert_eq!(parse_ffmpeg_time_ms("out_time_ms=83456000"), Some(83_456));
+        assert_eq!(parse_ffmpeg_time_ms("out_time=00:01:23.456"), Some(83_456));
+        // свободная форма time=...
+        assert_eq!(
+            parse_ffmpeg_time_ms("frame=10 fps=5 time=00:00:05.00"),
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn detects_progress_keys() {
+        assert!(is_ffmpeg_progress_key("frame=42"));
+        assert!(is_ffmpeg_progress_key("fps=24.0"));
+        assert!(is_ffmpeg_progress_key("speed=1.5x"));
+        assert!(is_ffmpeg_progress_key("stream_0_0_q=23.0"));
+        assert!(!is_ffmpeg_progress_key("nonsense"));
+        assert!(!is_ffmpeg_progress_key("no_equals_sign"));
+    }
+}
