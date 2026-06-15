@@ -4,6 +4,8 @@ use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{ImageBuffer, Rgba, RgbaImage, imageops};
 use imageproc::drawing::draw_text_mut;
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -333,14 +335,6 @@ fn paste_alpha_onto_opaque(dst: &mut RgbaImage, src: &RgbaImage, x: i32, y: i32,
     }
 }
 
-fn frame_to_rgb24(frame: &RgbaImage, out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(frame.width() as usize * frame.height() as usize * 3);
-    for pixel in frame.pixels() {
-        out.extend_from_slice(&pixel.0[0..3]);
-    }
-}
-
 // TODO: объединить параметры отрисовки в структуру Theme/RenderConfig при распиле рендерера.
 #[allow(clippy::too_many_arguments)]
 fn build_line_cache(
@@ -465,7 +459,7 @@ fn build_line_cache(
         .collect()
 }
 
-fn transition_times(lines: &[KaraokeLine]) -> Vec<f64> {
+fn transition_times(lines: &[KaraokeLine], visual_lead: f64) -> Vec<f64> {
     lines
         .iter()
         .enumerate()
@@ -474,8 +468,8 @@ fn transition_times(lines: &[KaraokeLine]) -> Vec<f64> {
                 f64::NEG_INFINITY
             } else {
                 let prev = &lines[idx - 1];
-                if line.start > prev.end {
-                    prev.end
+                if line.start > prev.end + 0.25 {
+                    line.start + visual_lead
                 } else {
                     line.start
                 }
@@ -1047,7 +1041,7 @@ fn render_ass(
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
-        .arg("192k")
+        .arg("160k")
         .arg("-movflags")
         .arg("+faststart")
         .arg("-t")
@@ -1087,6 +1081,38 @@ fn ffmpeg_supports_ass_filter(ffmpeg: &Path) -> bool {
     })
 }
 
+/// Проверяет, доступен ли аппаратный энкодер h264_videotoolbox (macOS).
+/// Используется для ускорения энкода в ~3-5× относительно libx264 на CPU.
+fn ffmpeg_supports_h264_videotoolbox(ffmpeg: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    // Проверяем не только наличие энкодера, но и реальную работоспособность.
+    // В ffmpeg 8.x h264_videotoolbox может быть в списке, но не работать
+    // с quality-based (-q:v) режимом — используем bitrate-based (-b:v).
+    let test = Command::new(ffmpeg)
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=320x240:d=0.04:r=30",
+            "-c:v",
+            "h264_videotoolbox",
+            "-b:v",
+            "1M",
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    test.is_ok_and(|o| o.status.success())
+}
+
 fn tail_text(value: &str, max_chars: usize) -> String {
     let mut chars: Vec<char> = value.chars().rev().take(max_chars).collect();
     chars.reverse();
@@ -1107,8 +1133,8 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let duration = audio_duration_seconds(&config.audio)?;
 
     let (size_scale, crf, preset) = match config.quality.as_str() {
-        "high" => (1.0_f32, "17", "medium"),
-        "ultra" => (2.0_f32, "12", "slow"),
+        "high" => (1.0_f32, "19", "medium"),
+        "ultra" => (2.0_f32, "16", "slow"),
         _ => (1.0_f32, "23", "fast"),
     };
 
@@ -1131,9 +1157,10 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let use_ass_renderer = config.engine == "ass" && ffmpeg_supports_ass_filter(&ffmpeg);
     let fps = if use_ass_renderer { 60.0_f64 } else { 30.0_f64 };
     let total_frames = ((duration * fps).ceil() as usize).max(1);
-    let transitions = transition_times(&lines);
-    let display_delay = config.audio_delay - visual_lead_seconds();
+    let visual_lead = visual_lead_seconds();
+    let display_delay = config.audio_delay - visual_lead;
     let highlight_delay = config.audio_delay + visual_lag_seconds();
+    let transitions = transition_times(&lines, visual_lead);
 
     if use_ass_renderer {
         return render_ass(
@@ -1184,6 +1211,17 @@ fn render(config: RenderConfig) -> Result<(), String> {
         line_spacing,
     );
 
+    // Кэш квантованных ресайзов: ключ (line_idx, new_w, new_h), значение — RgbaImage.
+    // Используем RefCell, т.к. замыкание захватывает по ссылке, а кадры рендерятся последовательно.
+    // Кэшируем только статичные варианты (inactive / active_plain), highlight меняется каждый кадр.
+    let resize_cache: RefCell<HashMap<(usize, u32, u32), RgbaImage>> = RefCell::new(HashMap::new());
+    // Шаг квантования: 2px. Визуально неотличимо, но резко повышает hit-rate при мелких
+    // колебаниях scale в scrolling-режиме.
+    const QUANTUM: u32 = 2;
+    fn quantize(v: u32, q: u32) -> u32 {
+        (v + q / 2) / q * q
+    }
+
     let render_frame = |frame_idx: usize, scroll_y: f32| -> RgbaImage {
         let display_t = frame_idx as f64 / fps - display_delay;
         let highlight_t = frame_idx as f64 / fps - highlight_delay;
@@ -1218,6 +1256,8 @@ fn render(config: RenderConfig) -> Result<(), String> {
             let is_highlight_live = !config.plain_lines
                 && (is_display_active || line_highlight_is_live(&line_cache.words, highlight_t));
 
+            let is_cacheable = !(is_highlight_live || config.plain_lines && is_display_active);
+
             let mut line_img = if config.plain_lines && is_display_active {
                 line_cache.active_plain.clone()
             } else if is_highlight_live {
@@ -1232,9 +1272,27 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max;
             let fit_scale = (safe_line_w / line_cache.width as f32).min(1.0);
             let scale = target_scale.min(fit_scale);
-            let new_w = ((line_cache.width as f32 * scale).round() as u32).max(1);
-            let new_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
-            line_img = imageops::resize(&line_img, new_w, new_h, imageops::FilterType::Triangle);
+            let raw_w = ((line_cache.width as f32 * scale).round() as u32).max(1);
+            let raw_h = ((line_cache.height as f32 * scale).round() as u32).max(1);
+
+            if is_cacheable {
+                let qw = quantize(raw_w, QUANTUM).max(1);
+                let qh = quantize(raw_h, QUANTUM).max(1);
+                let key = (idx, qw, qh);
+                let cache = resize_cache.borrow();
+                if let Some(cached) = cache.get(&key) {
+                    line_img = cached.clone();
+                } else {
+                    drop(cache);
+                    let resized =
+                        imageops::resize(&line_img, qw, qh, imageops::FilterType::Triangle);
+                    resize_cache.borrow_mut().insert(key, resized.clone());
+                    line_img = resized;
+                }
+            } else {
+                line_img =
+                    imageops::resize(&line_img, raw_w, raw_h, imageops::FilterType::Triangle);
+            }
 
             let mut opacity = if config.scrolling {
                 (1.0 - dist / dist_cutoff).clamp(0.0, 1.0)
@@ -1245,7 +1303,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 opacity *= config.inactive_opacity;
             }
 
-            let x = width as i32 / 2 - new_w as i32 / 2;
+            let x = width as i32 / 2 - raw_w as i32 / 2;
             let y_center_resized = y_text_center * scale;
             let y = (line_y - y_center_resized).floor() as i32;
             paste_alpha_onto_opaque(&mut frame, &line_img, x, y, opacity);
@@ -1266,14 +1324,29 @@ fn render(config: RenderConfig) -> Result<(), String> {
         return Ok(());
     }
 
+    let hardware_encoder_enabled = std::env::var("KARAOKE_USE_HARDWARE_ENCODER")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true);
+    let use_hardware_encoder =
+        hardware_encoder_enabled && ffmpeg_supports_h264_videotoolbox(&ffmpeg);
+    // h264_videotoolbox в ffmpeg 8.x не поддерживает quality-based (-q:v).
+    // Для нашего узкого текстового видео высокий битрейт только раздувает файл,
+    // поэтому держим аппаратный энкодер быстрым, но ограничиваем средний поток.
+    let (hw_bitrate, hw_bufsize) = match config.quality.as_str() {
+        "ultra" => ("3M", "6M"),
+        "high" => ("1500k", "3M"),
+        _ => ("900k", "1800k"),
+    };
+
     let mut ffmpeg_cmd = Command::new(ffmpeg);
     hide_subprocess_window(&mut ffmpeg_cmd);
-    let mut child = ffmpeg_cmd
+    let child = ffmpeg_cmd
         .arg("-y")
         .arg("-f")
         .arg("rawvideo")
+        // Подаём кадры напрямую в RGBA (нативный формат RgbaImage), без конверсии в rgb24.
         .arg("-pix_fmt")
-        .arg("rgb24")
+        .arg("rgba")
         .arg("-s")
         .arg(format!("{width}x{height}"))
         .arg("-r")
@@ -1287,15 +1360,31 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .arg("-map")
         .arg("1:a:0")
         .arg("-c:v")
-        .arg("libx264")
+        .arg(if use_hardware_encoder {
+            "h264_videotoolbox"
+        } else {
+            "libx264"
+        })
         .arg("-pix_fmt")
-        .arg("yuv420p")
-        .arg("-preset")
-        .arg(preset)
-        .arg("-crf")
-        .arg(crf)
-        .arg("-bf")
-        .arg("0")
+        .arg("yuv420p");
+    if use_hardware_encoder {
+        child
+            .arg("-b:v")
+            .arg(hw_bitrate)
+            .arg("-maxrate")
+            .arg(hw_bitrate)
+            .arg("-bufsize")
+            .arg(hw_bufsize);
+    } else {
+        child
+            .arg("-preset")
+            .arg(preset)
+            .arg("-crf")
+            .arg(crf)
+            .arg("-bf")
+            .arg("0");
+    }
+    let mut child = child
         .arg("-vsync")
         .arg("cfr")
         .arg("-avoid_negative_ts")
@@ -1303,7 +1392,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
-        .arg("192k")
+        .arg("160k")
         .arg("-movflags")
         .arg("+faststart")
         .arg("-t")
@@ -1314,6 +1403,11 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Не удалось запустить ffmpeg: {e}"))?;
+    if use_hardware_encoder {
+        eprintln!("[Rust] Энкодер: h264_videotoolbox (аппаратный, b:v={hw_bitrate})");
+    } else {
+        eprintln!("[Rust] Энкодер: libx264 (CPU, preset={preset}, crf={crf})");
+    }
 
     let mut stderr = child.stderr.take();
     let stderr_handle = std::thread::spawn(move || {
@@ -1328,7 +1422,6 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .stdin
         .take()
         .ok_or_else(|| "Не удалось открыть stdin ffmpeg".to_string())?;
-    let mut rgb_frame = Vec::with_capacity(width as usize * height as usize * 3);
     let mut last_active_idx = None;
     let mut cached_frame: Option<RgbaImage> = None;
 
@@ -1359,8 +1452,9 @@ fn render(config: RenderConfig) -> Result<(), String> {
             rendered
         };
 
-        frame_to_rgb24(&frame, &mut rgb_frame);
-        if let Err(err) = stdin.write_all(&rgb_frame) {
+        // Подаём сырые RGBA-байты кадра напрямую в ffmpeg (pix_fmt rgba),
+        // минуя конверсию в rgb24.
+        if let Err(err) = stdin.write_all(frame.as_raw()) {
             drop(stdin);
             let _ = child.wait();
             let stderr_text = stderr_handle.join().unwrap_or_default();

@@ -30,126 +30,73 @@ os.makedirs(EXPORT_FOLDER, exist_ok=True)
 # Формат: { job_id: { "progress": float, "status": str, "done": bool, "error": str, "file": str } }
 jobs = {}
 
+from karaoke_alignment import (
+    align_timestamped_lrc_words,
+    build_karaoke_from_timestamped_lyrics,
+    clean_word,
+    clamp_word_timing,
+    distribute_words_between_anchors,
+    estimate_line_duration,
+    fuzzy_word_match,
+    lyric_text_score,
+    normalize_lyrics_text,
+    normalize_mixed_cyrillic_text,
+    normalize_mixed_cyrillic_word,
+    parse_lrc_timestamp,
+    parse_timestamped_lyrics,
+    refine_timestamped_words_with_whisper,
+    replace_special_spaces,
+    shift_karaoke_timings,
+    strip_lrc_timestamps,
+    timestamped_matches_whisper_probe,
+    timestamped_whisper_probe_decision,
+)
+
 def subprocess_no_window_kwargs():
     if os.name == "nt":
         return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
     return {}
 
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
-def replace_special_spaces(text):
-    if not isinstance(text, str):
+def split_plain_lyrics_phrases(text):
+    """Дробит plain text на более короткие вокальные фразы.
+
+    Stable Whisper хуже выравнивает строки, где через запятую склеены две
+    самостоятельные фразы с паузой в аудио. Для LRC это не применяется:
+    там разбиение строк уже является пользовательской разметкой.
+    """
+    if not text or parse_timestamped_lyrics(text):
         return text
-    # Заменяем все виды Unicode-пробелов на обычный пробел \u0020
-    special_spaces = [
-        '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', 
-        '\u2006', '\u2007', '\u2008', '\u2009', '\u200a', '\u200b', 
-        '\u202f', '\u205f', '\u3000', '\u00a0'
-    ]
-    for sp in special_spaces:
-        text = text.replace(sp, ' ')
-    # Также убираем нулевой ширины пробелы и другие мусорные символы
-    text = text.replace('\u200b', '').replace('\u200e', '').replace('\u200f', '')
-    return text
 
-def normalize_lyrics_text(text):
-    text = replace_special_spaces(text)
-    if not isinstance(text, str):
-        return text
-    # Users often paste lyrics where repeated phrases are glued together:
-    # "denial...A denial". Whisper alignment treats that as one bad word.
-    text = re.sub(r'([A-Za-zА-Яа-яЁё]{2,})([.!?…]{2,})(?=([A-ZА-ЯЁ]))', r'\1\2\n', text)
-    # Repeated "A denial" phrases work much better as separate karaoke lines.
-    text = re.sub(r'(?i)(\bA\s+denial[.!?…]*)(?:\s+|(?=A\s+denial))', r'\1\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-
-    grouped_lines = []
-    denial_run = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if re.fullmatch(r'(?i)A\s+denial[.!?…]*', stripped):
-            denial_run.append(stripped)
-            continue
-        for idx in range(0, len(denial_run), 2):
-            grouped_lines.append(" ".join(denial_run[idx:idx + 2]))
-        denial_run = []
-        grouped_lines.append(line.rstrip())
-    for idx in range(0, len(denial_run), 2):
-        grouped_lines.append(" ".join(denial_run[idx:idx + 2]))
-
-    return "\n".join(grouped_lines).strip()
-
-def clean_word(w):
-    return re.sub(r'[^\w\s]', '', replace_special_spaces(w).strip().lower())
-
-def parse_lrc_timestamp(raw):
-    match = re.match(r'^\s*(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\s*$', raw or '')
-    if not match:
-        return None
-    minutes = int(match.group(1))
-    seconds = int(match.group(2))
-    fraction = match.group(3) or '0'
-    fraction_seconds = int(fraction.ljust(3, '0')[:3]) / 1000.0
-    return minutes * 60.0 + seconds + fraction_seconds
-
-def parse_timestamped_lyrics(lyrics):
-    entries = []
-    has_timestamps = False
-    for raw_line in (lyrics or '').splitlines():
-        line = replace_special_spaces(raw_line).strip()
+    result = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line:
+            result.append(raw_line)
             continue
-        matches = list(re.finditer(r'\[([0-9]{1,2}:[0-9]{2}(?:[.:][0-9]{1,3})?)\]', line))
-        if not matches:
+
+        parts = [part.strip() for part in re.split(r"\s*[,;]\s*", line) if part.strip()]
+        if len(parts) <= 1:
+            result.append(raw_line.rstrip())
             continue
-        text = re.sub(r'\[[0-9]{1,2}:[0-9]{2}(?:[.:][0-9]{1,3})?\]', '', line).strip()
-        for match in matches:
-            timestamp = parse_lrc_timestamp(match.group(1))
-            if timestamp is not None:
-                entries.append({"time": timestamp, "text": text})
-                has_timestamps = True
-    if not has_timestamps:
-        return None
-    return sorted(entries, key=lambda item: item["time"])
 
-def strip_lrc_timestamps(lyrics):
-    cleaned_lines = []
-    for raw_line in (lyrics or '').splitlines():
-        line = replace_special_spaces(raw_line)
-        line = re.sub(r'\[[0-9]{1,2}:[0-9]{2}(?:[.:][0-9]{1,3})?\]', '', line).strip()
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
+        split_parts = []
+        for part in parts:
+            words = [word for word in part.split() if clean_word(word)]
+            if len(words) < 2:
+                split_parts = []
+                break
+            if split_parts and clean_word(words[0]) in {"что", "чем", "как", "где", "кто"}:
+                split_parts = []
+                break
+            split_parts.append(part)
 
-def estimate_line_duration(words, available):
-    if not words:
-        return 0.0
-    total_chars = sum(max(len(clean_word(word)), 1) for word in words)
-    estimated = 0.34 * len(words) + 0.045 * total_chars
-    estimated = min(5.2, max(0.75, estimated))
-    if available is not None:
-        estimated = min(estimated, max(0.25, available - 0.12))
-    return estimated
+        if split_parts:
+            result.extend(split_parts)
+        else:
+            result.append(raw_line.rstrip())
 
-def fuzzy_word_match(a, b):
-    a = clean_word(a)
-    b = clean_word(b)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    if len(a) >= 4 and len(b) >= 4:
-        return a in b or b in a
-    return False
-
-def lyric_text_score(expected_text, heard_text):
-    expected = [w for w in re.split(r'\s+', expected_text or '') if clean_word(w)]
-    heard = [w for w in re.split(r'\s+', heard_text or '') if clean_word(w)]
-    if not expected or not heard:
-        return 0.0
-    score = 0.0
-    for ew in expected:
-        if any(fuzzy_word_match(ew, hw) for hw in heard):
-            score += 1.0
-    return score / max(1, len(expected))
+    return "\n".join(result).strip()
 
 def line_internal_max_gap(line_data):
     words = line_data.get("words") or []
@@ -377,10 +324,13 @@ def repair_stretched_short_lines(lyrics_karaoke):
     return repaired
 
 VOCALIZATION_SYLLABLES = (
-    "на", "ла", "ля", "да", "ра",
-    "na", "la", "lya", "da", "ra",
+    "на", "ня", "ну", "ла", "ля", "лу", "да", "ра", "уа", "оу", "уо",
+    "еа", "иа", "ай", "ой", "эй", "ей", "ах", "ох", "ух", "хэй", "мм",
+    "na", "nah", "la", "lya", "da", "ra", "ah", "oh", "ooh", "oo", "uh",
+    "woo", "whoa", "woah", "yeah", "yea", "yah", "ya", "yo", "yu", "hey",
+    "ha", "ay", "ey", "eh", "mm", "hm", "hmm",
 )
-OPEN_VOCALIZATION_SYLLABLES = ("а", "о", "ah", "oh")
+OPEN_VOCALIZATION_SYLLABLES = ("а", "о", "у", "э", "е", "и", "a", "o", "u", "e", "i")
 
 def split_vocalization_syllables(value):
     text = (value or "").strip().lower()
@@ -414,13 +364,131 @@ def is_vocalization_text(value):
         return True
     return sum(part in VOCALIZATION_SYLLABLES for part in parts) >= 3
 
+def is_vocalization_word(value):
+    text_key = re.sub(r'[^a-zа-яё]+', '', (value or "").strip().lower())
+    if not text_key:
+        return False
+    if re.fullmatch(r'(?:[aeiouyаеёиоуыэюяh]+|m+|м+)', text_key):
+        return True
+    if text_key in VOCALIZATION_SYLLABLES or text_key in OPEN_VOCALIZATION_SYLLABLES:
+        return True
+    if split_vocalization_syllables(text_key):
+        return True
+    normalized = re.sub(r'(.)\1{2,}', r'\1\1', text_key)
+    normalized = re.sub(r'h+$', '', normalized)
+    if not normalized:
+        return True
+    if normalized in VOCALIZATION_SYLLABLES or normalized in OPEN_VOCALIZATION_SYLLABLES:
+        return True
+    return bool(split_vocalization_syllables(normalized))
+
+def is_vocalization_line(line):
+    words = line.get("words") or []
+    if is_vocalization_text(line.get("text", "")):
+        return True
+    word_values = [w.get("word", "") for w in words]
+    meaningful = [w for w in word_values if clean_word(w)]
+    return bool(meaningful) and all(is_vocalization_word(w) for w in meaningful)
+
+def repair_vocalization_lines(lyrics_karaoke):
+    repaired = []
+    for line in lyrics_karaoke:
+        words = line.get("words") or []
+        if len(words) < 2 or not is_vocalization_line(line):
+            repaired.append(line)
+            continue
+
+        try:
+            line_start = float(line.get("start", words[0].get("start", 0.0)))
+            line_end = float(line.get("end", words[-1].get("end", line_start + 0.5)))
+        except Exception:
+            repaired.append(line)
+            continue
+
+        durations = []
+        gaps = []
+        invalid = False
+        for idx, word in enumerate(words):
+            try:
+                start = float(word.get("start", line_start))
+                end = float(word.get("end", start))
+            except Exception:
+                invalid = True
+                start, end = line_start, line_start
+            if end <= start + 0.03:
+                invalid = True
+            durations.append(max(0.0, end - start))
+            if idx > 0:
+                try:
+                    prev_end = float(words[idx - 1].get("end", line_start))
+                    gaps.append(max(0.0, start - prev_end))
+                except Exception:
+                    invalid = True
+
+        span = max(0.12, line_end - line_start)
+        longest = max(durations or [0.0])
+        max_gap = max(gaps or [0.0])
+        stretched = longest > max(1.25, span * 0.58)
+        broken = invalid or max_gap > 1.25
+        if not (stretched or broken):
+            repaired.append(line)
+            continue
+
+        fixed_words = distribute_words_between_anchors(
+            [dict(word) for word in words],
+            line_start,
+            line_end,
+        )
+        fixed = dict(line)
+        fixed["words"] = fixed_words
+        fixed["start"] = fixed_words[0]["start"]
+        fixed["end"] = fixed_words[-1]["end"]
+        repaired.append(fixed)
+    return repaired
+
+def sanitize_word_timings(lyrics_karaoke):
+    sanitized = []
+    for line in lyrics_karaoke:
+        words = [dict(word) for word in (line.get("words") or [])]
+        if not words:
+            sanitized.append(line)
+            continue
+        try:
+            line_start = float(line.get("start", words[0].get("start", 0.0)))
+            line_end = float(line.get("end", words[-1].get("end", line_start + 0.1)))
+        except Exception:
+            sanitized.append(line)
+            continue
+        line_end = max(line_start + 0.05, line_end)
+        for idx, word in enumerate(words):
+            try:
+                start = float(word.get("start", line_start))
+                end = float(word.get("end", start + 0.08))
+            except Exception:
+                start, end = line_start, line_start + 0.08
+            if idx > 0:
+                prev_end = float(words[idx - 1]["end"])
+                start = max(start, prev_end + 0.01)
+            start = max(line_start, min(start, line_end - 0.01))
+            end = max(start + 0.05, end)
+            end = min(end, line_end)
+            if end <= start:
+                start = max(line_start, min(start, line_end - 0.05))
+                end = min(line_end, start + 0.05)
+            word["start"] = round(start, 3)
+            word["end"] = round(end, 3)
+        fixed = dict(line)
+        fixed["words"] = words
+        fixed["start"] = round(min(line_start, float(words[0]["start"])), 3)
+        fixed["end"] = round(max(line_start + 0.05, float(words[-1]["end"])), 3)
+        sanitized.append(fixed)
+    return sanitized
+
 def lead_vocalization_lines(lyrics_karaoke, lead_seconds=1.35):
     repaired = []
     for line in lyrics_karaoke:
         words = line.get("words") or []
-        is_vocalization = is_vocalization_text(line.get("text", "")) or (
-            words and all(is_vocalization_text((w.get("word", "") or "").strip()) for w in words)
-        )
+        is_vocalization = is_vocalization_line(line)
 
         if not is_vocalization:
             repaired.append(line)
@@ -678,444 +746,14 @@ def build_karaoke_from_aligned_segments(segments, fallback_lines, offset=0.0):
             })
     return lyrics_karaoke
 
-def build_karaoke_from_timestamped_lyrics(lyrics, audio_duration=None):
-    entries = parse_timestamped_lyrics(lyrics)
-    if not entries:
-        return None
 
-    lyrics_karaoke = []
-    for idx, entry in enumerate(entries):
-        text = entry["text"].strip()
-        if not text:
-            continue
-        start = float(entry["time"])
-        next_time = None
-        for next_entry in entries[idx + 1:]:
-            if next_entry["time"] > start + 0.05:
-                next_time = float(next_entry["time"])
-                break
-        if next_time is None and audio_duration:
-            next_time = float(audio_duration)
 
-        words = text.split()
-        if not words:
-            continue
-        available = None if next_time is None else next_time - start
-        duration = estimate_line_duration(words, available)
-        if duration <= 0:
-            continue
 
-        total_chars = sum(max(len(clean_word(word)), 1) for word in words) or len(words)
-        cursor = start
-        line_words = []
-        for word in words:
-            char_len = max(len(clean_word(word)), 1)
-            share = char_len / total_chars
-            word_slot = max(0.16, duration * share)
-            word_end = min(start + duration, cursor + word_slot * 0.88)
-            line_words.append({
-                "word": word,
-                "start": round(cursor, 3),
-                "end": round(max(cursor + 0.08, word_end), 3),
-            })
-            cursor += word_slot
 
-        if line_words:
-            lyrics_karaoke.append({
-                "text": text,
-                "start": line_words[0]["start"],
-                "end": line_words[-1]["end"],
-                "words": line_words,
-            })
-    return lyrics_karaoke
 
-def shift_karaoke_timings(karaoke, shift_seconds):
-    shifted = []
-    for line in karaoke or []:
-        new_line = dict(line)
-        new_line["start"] = round(max(0.0, float(new_line.get("start", 0.0)) + shift_seconds), 3)
-        new_line["end"] = round(max(new_line["start"] + 0.05, float(new_line.get("end", 0.0)) + shift_seconds), 3)
-        new_words = []
-        for word in new_line.get("words", []) or []:
-            new_word = dict(word)
-            new_word["start"] = round(max(0.0, float(new_word.get("start", 0.0)) + shift_seconds), 3)
-            new_word["end"] = round(max(new_word["start"] + 0.05, float(new_word.get("end", 0.0)) + shift_seconds), 3)
-            new_words.append(new_word)
-        new_line["words"] = new_words
-        if new_words:
-            new_line["start"] = new_words[0]["start"]
-            new_line["end"] = new_words[-1]["end"]
-        shifted.append(new_line)
-    return shifted
 
-def timestamped_whisper_probe_decision(timestamped_karaoke, whisper_words, close_avg_limit=0.35, close_max_limit=0.65, shift_spread_limit=0.45, max_shift=3.0):
-    if not timestamped_karaoke or not whisper_words:
-        return {"action": "whisper", "shift": 0.0, "reason": "нет данных для сравнения"}
 
-    lrc_words = []
-    for line in timestamped_karaoke:
-        for word in line.get("words", []) or []:
-            clean = clean_word(word.get("word", ""))
-            if clean:
-                lrc_words.append((clean, float(line.get("start", word.get("start", 0.0)))))
-                break
-        if len(lrc_words) >= 8:
-            break
 
-    whisper_probe = []
-    for word in whisper_words[:45]:
-        clean = clean_word(getattr(word, "word", "") or "")
-        if clean and hasattr(word, "start"):
-            try:
-                whisper_probe.append((clean, float(word.start)))
-            except Exception:
-                pass
-        if len(whisper_probe) >= 18:
-            break
-
-    if not lrc_words or not whisper_probe:
-        return {"action": "whisper", "shift": 0.0, "reason": "нет первых слов для сравнения"}
-
-    diffs = []
-    signed_diffs = []
-    whisper_idx = 0
-    for lrc_word, lrc_start in lrc_words:
-        matched = False
-        for probe_idx in range(whisper_idx, min(whisper_idx + 8, len(whisper_probe))):
-            whisper_word, whisper_start = whisper_probe[probe_idx]
-            if fuzzy_word_match(lrc_word, whisper_word):
-                signed = lrc_start - whisper_start
-                signed_diffs.append(signed)
-                diffs.append(abs(signed))
-                whisper_idx = probe_idx + 1
-                matched = True
-                break
-        if len(diffs) >= 5:
-            break
-        if not matched and diffs:
-            break
-
-    if len(diffs) < 3:
-        return {"action": "whisper", "shift": 0.0, "reason": "первые слова не совпали по тексту"}
-
-    avg_diff = sum(diffs) / len(diffs)
-    max_seen = max(diffs)
-    avg_signed = sum(signed_diffs) / len(signed_diffs)
-    direction = "LRC раньше Whisper" if avg_signed < -0.05 else "LRC позже Whisper" if avg_signed > 0.05 else "без сдвига"
-    base_reason = f"совпало {len(diffs)} первых строк, среднее {avg_diff:.2f}с, максимум {max_seen:.2f}с, сдвиг {avg_signed:+.2f}с ({direction})"
-
-    if avg_diff <= close_avg_limit and max_seen <= close_max_limit:
-        return {"action": "lrc", "shift": 0.0, "reason": base_reason}
-
-    if avg_diff <= 1.25 and max_seen <= 2.0:
-        return {
-            "action": "lrc_confined",
-            "shift": 0.0,
-            "reason": f"{base_reason}, LRC достаточно близок для выравнивания слов внутри строк",
-        }
-
-    sorted_signed = sorted(signed_diffs)
-    median_signed = sorted_signed[len(sorted_signed) // 2]
-    spread = max(abs(signed - median_signed) for signed in signed_diffs)
-    if abs(median_signed) <= max_shift and spread <= shift_spread_limit:
-        # signed = lrc_start - whisper_start, so applying -signed moves LRC to Whisper.
-        return {
-            "action": "shift_lrc",
-            "shift": round(-median_signed, 3),
-            "reason": f"{base_reason}, стабильный сдвиг {median_signed:+.2f}с",
-        }
-
-    return {"action": "whisper", "shift": 0.0, "reason": f"{base_reason}, сдвиг нестабилен"}
-
-def timestamped_matches_whisper_probe(timestamped_karaoke, whisper_words, avg_limit=0.35, max_limit=0.65):
-    decision = timestamped_whisper_probe_decision(
-        timestamped_karaoke,
-        whisper_words,
-        close_avg_limit=avg_limit,
-        close_max_limit=max_limit,
-    )
-    return decision["action"] == "lrc", decision["reason"]
-
-def clamp_word_timing(start, end, line_start, line_end):
-    start = max(line_start, min(line_end - 0.05, float(start)))
-    end = max(start + 0.05, min(line_end, float(end)))
-    return round(start, 3), round(end, 3)
-
-def distribute_words_between_anchors(words, start_time, end_time):
-    if not words:
-        return []
-    start_time = float(start_time)
-    end_time = max(start_time + 0.08, float(end_time))
-    total_chars = sum(max(len(clean_word(word.get("word", ""))), 1) for word in words) or len(words)
-    span = end_time - start_time
-    cursor = start_time
-    distributed = []
-    for idx, word in enumerate(words):
-        updated = dict(word)
-        share = max(len(clean_word(word.get("word", ""))), 1) / total_chars
-        slot = span * share
-        if idx == len(words) - 1:
-            word_end = end_time
-        else:
-            word_end = min(end_time, cursor + max(0.08, slot * 0.88))
-        updated["start"] = round(cursor, 3)
-        updated["end"] = round(max(cursor + 0.05, word_end), 3)
-        distributed.append(updated)
-        cursor = min(end_time, cursor + max(0.08, slot))
-    return distributed
-
-def refine_timestamped_words_with_whisper(timestamped_karaoke, whisper_words, whisper_time_offset=0.0):
-    if not timestamped_karaoke or not whisper_words:
-        return timestamped_karaoke, {"refined_lines": 0, "matched_words": 0, "total_words": 0}
-
-    refined = []
-    whisper_cursor = 0
-    refined_lines = 0
-    matched_total = 0
-    total_words = 0
-
-    whisper_data = []
-    for word in whisper_words:
-        clean = clean_word(getattr(word, "word", "") or "")
-        if not clean or not hasattr(word, "start") or not hasattr(word, "end"):
-            continue
-        try:
-            start = float(word.start) + float(whisper_time_offset or 0.0)
-            end = float(word.end) + float(whisper_time_offset or 0.0)
-        except Exception:
-            continue
-        if end <= start:
-            continue
-        whisper_data.append({"clean": clean, "start": start, "end": end})
-
-    for line_idx, line in enumerate(timestamped_karaoke):
-        new_line = dict(line)
-        base_words = [dict(word) for word in line.get("words", []) or []]
-        if not base_words:
-            refined.append(new_line)
-            continue
-
-        line_start = float(new_line.get("start", base_words[0].get("start", 0.0)) or 0.0)
-        if line_idx + 1 < len(timestamped_karaoke):
-            next_start = float(timestamped_karaoke[line_idx + 1].get("start", line.get("end", line_start + 1.0)) or line_start + 1.0)
-            line_end = max(line_start + 0.2, next_start - 0.05)
-        else:
-            line_end = max(line_start + 0.2, float(new_line.get("end", line_start + 1.0) or line_start + 1.0))
-
-        if is_vocalization_text(new_line.get("text", "")):
-            new_line["words"] = base_words
-            refined.append(new_line)
-            total_words += len(base_words)
-            continue
-
-        window_start = max(0.0, line_start - 0.45)
-        window_end = line_end + 0.45
-        while whisper_cursor < len(whisper_data) and whisper_data[whisper_cursor]["end"] < window_start:
-            whisper_cursor += 1
-
-        search_start = whisper_cursor
-        matched_indices = {}
-        used_whisper = set()
-        for word_idx, base_word in enumerate(base_words):
-            target = clean_word(base_word.get("word", "") or "")
-            if not target:
-                continue
-            best_idx = None
-            for probe_idx in range(search_start, min(search_start + 24, len(whisper_data))):
-                if probe_idx in used_whisper:
-                    continue
-                candidate = whisper_data[probe_idx]
-                if candidate["start"] > window_end:
-                    break
-                if fuzzy_word_match(target, candidate["clean"]):
-                    best_idx = probe_idx
-                    break
-            if best_idx is not None:
-                matched_indices[word_idx] = best_idx
-                used_whisper.add(best_idx)
-                search_start = best_idx + 1
-
-        matched_count = len(matched_indices)
-        total_words += len(base_words)
-        matched_total += matched_count
-
-        min_matches = 1 if len(base_words) <= 2 else max(2, int(len(base_words) * 0.45))
-        if matched_count < min_matches:
-            new_line["words"] = base_words
-            refined.append(new_line)
-            continue
-
-        new_words = []
-        for word_idx, base_word in enumerate(base_words):
-            updated = dict(base_word)
-            if word_idx in matched_indices:
-                match = whisper_data[matched_indices[word_idx]]
-                start, end = clamp_word_timing(match["start"], match["end"], line_start, line_end)
-                updated["start"] = start
-                updated["end"] = end
-            else:
-                start, end = clamp_word_timing(
-                    base_word.get("start", line_start),
-                    base_word.get("end", line_end),
-                    line_start,
-                    line_end,
-                )
-                updated["start"] = start
-                updated["end"] = end
-            new_words.append(updated)
-
-        matched_word_indices = sorted(matched_indices)
-        if matched_word_indices:
-            first_matched_word = matched_word_indices[0]
-            first_match_start = float(new_words[first_matched_word]["start"])
-            if first_matched_word == 0:
-                if first_match_start > line_start + 0.18 or first_match_start < line_start:
-                    new_words[0]["start"] = round(line_start, 3)
-                    new_words[0]["end"] = round(max(line_start + 0.08, float(new_words[0]["end"])), 3)
-            elif first_match_start > line_start + 0.08:
-                lead_end = max(line_start + 0.08, min(first_match_start - 0.03, line_end))
-                new_words[:first_matched_word] = distribute_words_between_anchors(
-                    new_words[:first_matched_word],
-                    line_start,
-                    lead_end,
-                )
-        elif new_words:
-            new_words = distribute_words_between_anchors(new_words, line_start, line_end)
-
-        if new_words and float(new_words[0]["start"]) != line_start:
-            new_words[0]["start"] = round(line_start, 3)
-            new_words[0]["end"] = round(max(line_start + 0.08, float(new_words[0]["end"])), 3)
-
-        for word_idx in range(1, len(new_words)):
-            prev = new_words[word_idx - 1]
-            curr = new_words[word_idx]
-            if curr["start"] < prev["end"]:
-                curr["start"] = round(prev["end"] + 0.01, 3)
-            if curr["end"] <= curr["start"]:
-                curr["end"] = round(min(line_end, curr["start"] + 0.12), 3)
-
-        new_line["words"] = new_words
-        new_line["start"] = round(line_start, 3)
-        new_line["end"] = round(max(line_start + 0.05, min(line_end, float(new_words[-1]["end"]))), 3)
-        refined_lines += 1
-        refined.append(new_line)
-
-        if used_whisper:
-            whisper_cursor = max(whisper_cursor, max(used_whisper) + 1)
-
-    return refined, {
-        "refined_lines": refined_lines,
-        "matched_words": matched_total,
-        "total_words": total_words,
-    }
-
-def align_timestamped_lrc_words(model, audio_path, timestamped_karaoke, language):
-    segments = []
-    segment_line_indices = []
-    for line_idx, line in enumerate(timestamped_karaoke or []):
-        base_words = line.get("words", []) or []
-        text = (line.get("text", "") or "").strip()
-        if not text or not base_words:
-            continue
-
-        line_start = float(line.get("start", base_words[0].get("start", 0.0)) or 0.0)
-        if line_idx + 1 < len(timestamped_karaoke):
-            next_start = float(timestamped_karaoke[line_idx + 1].get("start", line.get("end", line_start + 1.0)) or line_start + 1.0)
-            line_end = max(line_start + 0.2, next_start - 0.05)
-        else:
-            line_end = max(line_start + 0.2, float(line.get("end", line_start + 1.0) or line_start + 1.0))
-
-        segments.append({
-            "start": round(line_start, 3),
-            "end": round(line_end, 3),
-            "text": text,
-        })
-        segment_line_indices.append(line_idx)
-
-    if not segments:
-        return timestamped_karaoke, {"refined_lines": 0, "matched_words": 0, "total_words": 0}
-
-    result = model.align_words(
-        audio_path,
-        segments,
-        language=language,
-        inplace=False,
-        verbose=None,
-        regroup=False,
-        suppress_silence=False,
-    )
-
-    aligned_segments = list(getattr(result, "segments", []) or [])
-    refined = [dict(line) for line in timestamped_karaoke]
-    refined_lines = 0
-    matched_total = 0
-    total_words = 0
-
-    for segment_idx, line_idx in enumerate(segment_line_indices):
-        if segment_idx >= len(aligned_segments):
-            break
-
-        line = dict(refined[line_idx])
-        base_words = [dict(word) for word in line.get("words", []) or []]
-        total_words += len(base_words)
-
-        aligned_words = list(getattr(aligned_segments[segment_idx], "words", []) or [])
-        if not aligned_words:
-            continue
-
-        line_start = float(line.get("start", base_words[0].get("start", 0.0)) or 0.0)
-        if line_idx + 1 < len(timestamped_karaoke):
-            next_start = float(timestamped_karaoke[line_idx + 1].get("start", line.get("end", line_start + 1.0)) or line_start + 1.0)
-            line_end = max(line_start + 0.2, next_start - 0.05)
-        else:
-            line_end = max(line_start + 0.2, float(line.get("end", line_start + 1.0) or line_start + 1.0))
-
-        new_words = []
-        used_aligned = set()
-        search_from = 0
-        line_matched = 0
-        for base_word in base_words:
-            updated = dict(base_word)
-            target = clean_word(base_word.get("word", "") or "")
-            match_idx = None
-            if target:
-                for idx in range(search_from, len(aligned_words)):
-                    if idx in used_aligned:
-                        continue
-                    candidate = aligned_words[idx]
-                    if fuzzy_word_match(target, clean_word(getattr(candidate, "word", "") or "")):
-                        match_idx = idx
-                        break
-            if match_idx is not None:
-                candidate = aligned_words[match_idx]
-                start, end = clamp_word_timing(candidate.start, candidate.end, line_start, line_end)
-                updated["start"] = start
-                updated["end"] = end
-                used_aligned.add(match_idx)
-                search_from = match_idx + 1
-                matched_total += 1
-                line_matched += 1
-            new_words.append(updated)
-
-        if line_matched >= max(1, min(len(base_words), len(aligned_words)) // 2):
-            for word_idx in range(1, len(new_words)):
-                prev = new_words[word_idx - 1]
-                curr = new_words[word_idx]
-                if curr["start"] < prev["end"]:
-                    curr["start"] = round(prev["end"] + 0.01, 3)
-                if curr["end"] <= curr["start"]:
-                    curr["end"] = round(min(line_end, curr["start"] + 0.12), 3)
-            line["words"] = new_words
-            line["start"] = round(line_start, 3)
-            line["end"] = round(max(line_start + 0.05, min(line_end, float(new_words[-1]["end"]))), 3)
-            refined[line_idx] = line
-            refined_lines += 1
-
-    return refined, {
-        "refined_lines": refined_lines,
-        "matched_words": matched_total,
-        "total_words": total_words,
-    }
 
 def infer_lyrics_language(text):
     return 'ru' if re.search(r'[А-Яа-яЁё]', text or '') else 'en'
@@ -1789,6 +1427,46 @@ def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, 
         # Если confidence недоступен (старая модель/формат) — принимаем слово.
         return prob is None or prob >= confidence_threshold
 
+    def find_probable_line_start(orig_words, start_idx):
+        targets = [clean_word(word) for word in orig_words if clean_word(word)]
+        if not targets or start_idx >= num_whisper_words:
+            return start_idx
+
+        min_hits = 1 if len(targets) <= 2 else min(3, len(targets))
+        min_ratio = 0.55 if len(targets) <= 4 else 0.45
+        search_limit = min(num_whisper_words, start_idx + 120)
+        best_idx = start_idx
+        best_score = -1.0
+
+        for candidate_idx in range(start_idx, search_limit):
+            local_idx = candidate_idx
+            hits = 0
+            for target in targets:
+                found_idx = None
+                local_limit = min(num_whisper_words, local_idx + max(lookahead, 6))
+                for probe_idx in range(local_idx, local_limit):
+                    if not w_confident(probe_idx):
+                        continue
+                    if fuzzy_word_match(target, w_word_clean(probe_idx)):
+                        found_idx = probe_idx
+                        break
+                if found_idx is None:
+                    continue
+                hits += 1
+                local_idx = found_idx + 1
+
+            ratio = hits / max(1, len(targets))
+            if hits < min_hits or ratio < min_ratio:
+                continue
+
+            # Дальний прыжок допустим, но при равном качестве предпочитаем ближайший.
+            score = hits + ratio - 0.01 * (candidate_idx - start_idx)
+            if score > best_score:
+                best_score = score
+                best_idx = candidate_idx
+
+        return best_idx
+
     lyrics_karaoke = []
     whisper_idx = 0
     matched_total = 0
@@ -1806,6 +1484,7 @@ def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, 
 
         line_words = []
         anchors = []
+        whisper_idx = find_probable_line_start(orig_words, whisper_idx)
 
         for orig_pos, orig_w in enumerate(orig_words):
             orig_w_clean = clean_word(orig_w)
@@ -1813,7 +1492,7 @@ def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, 
             matched_whisper_idx = None
 
             # 1. Точное совпадение с текущим словом Whisper (с учётом confidence).
-            if whisper_idx < num_whisper_words and w_word_clean(whisper_idx) == orig_w_clean and w_confident(whisper_idx):
+            if whisper_idx < num_whisper_words and fuzzy_word_match(orig_w_clean, w_word_clean(whisper_idx)) and w_confident(whisper_idx):
                 matched_whisper_idx = whisper_idx
 
             # 2. Lookahead: ищем совпадение, перепрыгивая низкоуверенные/лишние слова Whisper.
@@ -1823,11 +1502,7 @@ def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, 
                     cand_clean = w_word_clean(k)
                     if not cand_clean:
                         continue
-                    if orig_w_clean == cand_clean or (
-                        len(orig_w_clean) >= 4
-                        and len(cand_clean) >= 4
-                        and (orig_w_clean in cand_clean or cand_clean in orig_w_clean)
-                    ):
+                    if fuzzy_word_match(orig_w_clean, cand_clean):
                         if w_confident(k):
                             matched_whisper_idx = k
                             break
@@ -1911,6 +1586,9 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         except Exception:
             timestamped_karaoke = None
 
+        if not timestamped_karaoke:
+            lyrics = split_plain_lyrics_phrases(lyrics)
+
         probe_timestamped_with_whisper = bool(
             timestamped_karaoke and (verify_lrc_with_whisper or not plain_lines)
         )
@@ -1966,12 +1644,15 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         audio_path,
                         status_callback=lambda message: jobs[job_id].update({"status": message}),
                     )
+                    print(f"[LOG] Demucs vocals ready: {align_audio_path}", flush=True)
                 except Exception as exc:
-                    align_audio_path = audio_path
-                    jobs[job_id]["status"] = (
-                        "Выделение вокала недоступно (нет demucs), выравнивание "
-                        f"идёт по исходному миксу. {exc}"
+                    message = (
+                        "Demucs включен, но вокал не был выделен. "
+                        f"Останавливаем задачу, чтобы не делать word-level по исходному миксу. {exc}"
                     )
+                    jobs[job_id]["status"] = message
+                    print(f"[LOG] {message}", flush=True)
+                    raise RuntimeError(message) from exc
 
             model = loaded_models[model_name]
             jobs[job_id]["progress"] = 0.2
@@ -2140,16 +1821,23 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 )
                 if lrc_decision["action"] in ("lrc", "lrc_confined"):
                     try:
-                        lyrics_karaoke, refine_stats = align_timestamped_lrc_words(
-                            model,
-                            align_audio_path,
+                        lyrics_karaoke, refine_stats = refine_timestamped_words_with_whisper(
                             timestamped_karaoke,
-                            lyrics_language,
+                            whisper_words,
+                            line_left_pad=1.5 if lrc_decision["action"] == "lrc_confined" else 0.45,
                         )
+                        if refine_stats["matched_words"] < max(1, int(refine_stats["total_words"] * 0.45)):
+                            lyrics_karaoke, refine_stats = align_timestamped_lrc_words(
+                                model,
+                                align_audio_path,
+                                timestamped_karaoke,
+                                lyrics_language,
+                            )
                     except Exception:
                         lyrics_karaoke, refine_stats = refine_timestamped_words_with_whisper(
                             timestamped_karaoke,
                             whisper_words,
+                            line_left_pad=1.5 if lrc_decision["action"] == "lrc_confined" else 0.45,
                         )
                     jobs[job_id]["status"] = (
                         f"✅ LRC совпал с Whisper: {lrc_decision['reason']}. "
@@ -2171,17 +1859,25 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 elif lrc_decision["action"] == "shift_lrc":
                     shift = float(lrc_decision.get("shift") or 0.0)
                     try:
-                        lyrics_karaoke, refine_stats = align_timestamped_lrc_words(
-                            model,
-                            align_audio_path,
+                        lyrics_karaoke, refine_stats = refine_timestamped_words_with_whisper(
                             timestamped_karaoke,
-                            lyrics_language,
+                            whisper_words,
+                            whisper_time_offset=-shift,
+                            line_left_pad=0.45,
                         )
+                        if refine_stats["matched_words"] < max(1, int(refine_stats["total_words"] * 0.45)):
+                            lyrics_karaoke, refine_stats = align_timestamped_lrc_words(
+                                model,
+                                align_audio_path,
+                                timestamped_karaoke,
+                                lyrics_language,
+                            )
                     except Exception:
                         lyrics_karaoke, refine_stats = refine_timestamped_words_with_whisper(
                             timestamped_karaoke,
                             whisper_words,
                             whisper_time_offset=-shift,
+                            line_left_pad=0.45,
                         )
                     jobs[job_id]["status"] = (
                         f"✅ LRC сверено с Whisper: {lrc_decision['reason']}. "
@@ -2368,7 +2064,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
 
             lyrics_karaoke = redistribute_repeated_tail_lines(lyrics_karaoke)
             lyrics_karaoke = repair_stretched_short_lines(lyrics_karaoke)
-            lyrics_karaoke = lead_vocalization_lines(lyrics_karaoke)
+            lyrics_karaoke = repair_vocalization_lines(lyrics_karaoke)
+            lyrics_karaoke = sanitize_word_timings(lyrics_karaoke)
 
         # ДАМП ФИНАЛЬНЫХ ТАЙМИНГОВ для отладки и будущего Rust-рендера.
         # Важно писать его после всех smoothing/overlap фильтров: renderer должен получать
@@ -2457,7 +2154,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         font_path_bold = get_system_font(font_name=font_family, bold=True)
         font_path_black = font_path_bold
 
-        clean_filename = f"{artist} - {title} (karaoke).mp4".replace("/", "_").replace("\\", "_")
+        mode_suffix = "karaoke-lines" if plain_lines else "karaoke-word"
+        clean_filename = f"{artist} - {title} ({mode_suffix}).mp4".replace("/", "_").replace("\\", "_")
         output_mp4_path = os.path.join(EXPORT_FOLDER, clean_filename)
 
         ffmpeg_cmd = [
@@ -2574,24 +2272,18 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             })
 
         # Моменты, когда скролл переключается на следующую строку.
-        line_advance = float(os.environ.get("KARAOKE_LINE_ADVANCE_SECONDS", "0.5") or 0.5)
-        line_advance = max(0.0, min(2.0, line_advance))
+        visual_lag = float(os.environ.get("KARAOKE_VISUAL_LAG_SECONDS", "0.25") or 0.25)
+        visual_lag = max(0.0, min(2.0, visual_lag))
         transition_times = []
         for idx, line_data in enumerate(lyrics_karaoke):
                 if idx == 0:
                     transition_times.append(float("-inf"))
                 else:
-                    prev_line = lyrics_karaoke[idx - 1]
-                    if line_data["start"] > prev_line["end"]:
-                        transition_times.append(max(prev_line["end"], line_data["start"] - line_advance))
-                    else:
-                        transition_times.append(line_data["start"])
+                    transition_times.append(line_data["start"])
 
         bg_template = Image.new('RGB', (width, height), (rgba_bg[0], rgba_bg[1], rgba_bg[2]))
         non_active_cache = {}
 
-        visual_lag = float(os.environ.get("KARAOKE_VISUAL_LAG_SECONDS", "0.25") or 0.25)
-        visual_lag = max(0.0, min(2.0, visual_lag))
         scroll_alpha = float(os.environ.get("KARAOKE_SCROLL_SMOOTHING", "0.065") or 0.065)
         scroll_alpha = max(0.01, min(0.25, scroll_alpha))
         for frame_idx in range(total_frames):

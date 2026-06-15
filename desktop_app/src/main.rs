@@ -228,7 +228,24 @@ fn batch_timings_path(audio_path: &Path) -> PathBuf {
     audio_path.with_file_name(format!("{}_timings.json", stem))
 }
 
-fn batch_output_path(item: &BatchItem) -> PathBuf {
+fn karaoke_output_suffix(plain_lines: bool) -> &'static str {
+    if plain_lines {
+        "karaoke-lines"
+    } else {
+        "karaoke-word"
+    }
+}
+
+fn karaoke_output_filename(artist: &str, title: &str, plain_lines: bool) -> String {
+    safe_output_filename(&format!(
+        "{} - {} ({}).mp4",
+        artist,
+        title,
+        karaoke_output_suffix(plain_lines)
+    ))
+}
+
+fn batch_output_path(item: &BatchItem, plain_lines: bool) -> PathBuf {
     let artist = if item.artist.trim().is_empty() {
         "Исполнитель"
     } else {
@@ -239,10 +256,8 @@ fn batch_output_path(item: &BatchItem) -> PathBuf {
     } else {
         item.title.trim()
     };
-    item.folder.join(safe_output_filename(&format!(
-        "{} - {} (karaoke).mp4",
-        artist, title
-    )))
+    item.folder
+        .join(karaoke_output_filename(artist, title, plain_lines))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1796,7 +1811,7 @@ impl KaraokeApp {
                     index: idx,
                     audio_path: render_audio_path,
                     timings_path,
-                    output_path: batch_output_path(item),
+                    output_path: batch_output_path(item, plain_lines),
                     duration_ms: (end - start).max(1),
                 });
             }
@@ -2734,9 +2749,8 @@ impl KaraokeApp {
             } else {
                 title.clone()
             };
-            let clean_filename = format!("{} - {} (karaoke).mp4", output_artist, output_title)
-                .replace("/", "_")
-                .replace("\\", "_");
+            let clean_filename =
+                karaoke_output_filename(&output_artist, &output_title, plain_lines);
             let _ = std::fs::create_dir_all(&output_dir);
             let output_mp4_path = output_dir.join(&clean_filename);
             let timings_output_path = temp.join("karaoke_timings_final.json");
@@ -5345,15 +5359,15 @@ impl eframe::App for KaraokeApp {
                                             ui.label(egui::RichText::new("Качество").color(muted));
                                             egui::ComboBox::from_id_salt("quality_combo")
                                                 .selected_text(match self.quality.as_str() {
-                                                    "ultra" => "Ультра HD (CRF 12)",
-                                                    "high" => "Высокое (CRF 17)",
-                                                    _ => "Стандартное (CRF 23)",
+                                                    "ultra" => "Ультра HD",
+                                                    "high" => "Высокое",
+                                                    _ => "Стандартное",
                                                 })
                                                 .width(ui.available_width() - 10.0)
                                                 .show_ui(ui, |ui| {
-                                                    ui.selectable_value(&mut self.quality, "medium".to_string(), "Стандартное (CRF 23)");
-                                                    ui.selectable_value(&mut self.quality, "high".to_string(), "Высокое (CRF 17)");
-                                                    ui.selectable_value(&mut self.quality, "ultra".to_string(), "Ультра HD (CRF 12)");
+                                                    ui.selectable_value(&mut self.quality, "medium".to_string(), "Стандартное");
+                                                    ui.selectable_value(&mut self.quality, "high".to_string(), "Высокое");
+                                                    ui.selectable_value(&mut self.quality, "ultra".to_string(), "Ультра HD");
                                                 });
                                             ui.end_row();
 
@@ -5608,8 +5622,10 @@ impl eframe::App for KaraokeApp {
 
                                             if ui.add(save_btn).clicked() {
                                                 let default_name = format!(
-                                                    "{} - {} (karaoke).mp4",
-                                                    self.artist, self.title
+                                                    "{} - {} ({}).mp4",
+                                                    self.artist,
+                                                    self.title,
+                                                    karaoke_output_suffix(self.plain_lines)
                                                 )
                                                 .replace("/", "_")
                                                 .replace("\\", "_");
