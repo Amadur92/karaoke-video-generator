@@ -28,6 +28,21 @@ cp "$ROOT_DIR/desktop_app/assets/Montserrat-Bold.ttf" "$BOX_DIR/assets/Montserra
 cp "$FFMPEG_BIN" "$BOX_DIR/bin/ffmpeg"
 cp "$FFPROBE_BIN" "$BOX_DIR/bin/ffprobe"
 
+# PyInstaller кладёт worker/_internal/Python как симлинк на
+# Python.framework/Versions/3.11/Python. Симлинки хрупки: сторонние обёртки,
+# cp без -R и часть архиваторов при копировании/распаковке ломают их, и тогда
+# воркер падает с "[PYI] Failed to load Python shared library: no such file".
+# Заменяем симлинк реальным файлом — надёжнее для любого downstream-потребителя.
+PY_LINK="$BOX_DIR/worker/_internal/Python"
+if [[ -L "$PY_LINK" ]]; then
+  PY_REAL="$(readlink -f "$PY_LINK")"
+  if [[ -f "$PY_REAL" ]]; then
+    rm "$PY_LINK"
+    cp "$PY_REAL" "$PY_LINK"
+    chmod +x "$PY_LINK"
+  fi
+fi
+
 chmod +x "$BOX_DIR/Karaoke Generator" "$BOX_DIR/worker/karaoke_worker" "$BOX_DIR/worker/karaoke_render" "$BOX_DIR/bin/ffmpeg" "$BOX_DIR/bin/ffprobe"
 
 is_system_dylib() {
