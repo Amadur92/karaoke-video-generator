@@ -1554,6 +1554,86 @@ def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, 
     return lyrics_karaoke, stats
 
 
+def build_karaoke_from_align_result(raw_lines, align_result):
+    """Строит караоке-тайминги напрямую из результата model.align().
+
+    Когда модель делает forced alignment по точному тексту песни (с
+    original_split=True), каждый сегмент результата уже соответствует одной строке
+    текста, а слова внутри — в порядке 1-в-1. Это идеальный, глобально-монотонный
+    результат: повторы припева разведены по своим появлениям в аудио, куплеты
+    не схлопываются.
+
+    Использовать этот путь вместо match_lyrics_to_whisper предпочтительно: матчер
+    делает повторное нечёткое сопоставление и на повторяющихся припевах теряет
+    синхронизацию (прыгает к более позднему появлению и схлопывает куплет между
+    ними). match_lyrics_to_whisper остаётся фолбэком на случай, когда align()
+    частично провалился и слов меньше, чем в тексте.
+
+    Аргументы:
+      raw_lines: строки исходного текста (нужны для подсчёта ожидаемого числа слов).
+      align_result: stable_whisper.WhisperResult (или None) от model.align(...).
+
+    Возвращает: (lyrics_karaoke, coverage_ratio) или (None, 0.0), если построить
+    нельзя (нет слов / сегментов). coverage_ratio = доля строк текста, для которых
+    найден сегмент с словами.
+    """
+    if align_result is None:
+        return None, 0.0
+
+    segments = list(getattr(align_result, 'segments', []) or [])
+    non_empty_lines = [l for l in raw_lines if l.strip()]
+
+    # Берём только сегменты, в которых есть слова с валидными (или исправимыми)
+    # временны́ми метками. align() с original_split даёт сегмент на строку, но
+    # отдельные слова могут прийти с нулевой длительностью — это нормально и
+    # чинится локально.
+    karaoke = []
+    seg_idx = 0
+    for line in non_empty_lines:
+        # Пропускаем пустые сегменты, чтобы выровнять текст по реальным данным.
+        while seg_idx < len(segments) and not (getattr(segments[seg_idx], 'words', None)):
+            seg_idx += 1
+        if seg_idx >= len(segments):
+            break
+        seg = segments[seg_idx]
+        seg_idx += 1
+
+        words = []
+        for w in getattr(seg, 'words', []) or []:
+            try:
+                start = float(getattr(w, 'start', 0.0) or 0.0)
+                end = float(getattr(w, 'end', start) or start)
+            except (TypeError, ValueError):
+                continue
+            if end <= start + 0.01:
+                # Нулевую/сингулярную длительность даём минимальную — это слово,
+                # которое align не смог локализовать точнее, но оно на своём месте.
+                end = round(start + 0.3, 3)
+            words.append({
+                "word": getattr(w, 'word', '') or '',
+                "start": round(start, 3),
+                "end": round(end, 3),
+            })
+        if not words:
+            seg_idx -= 1
+            continue
+
+        line_start = words[0]["start"]
+        line_end = words[-1]["end"]
+        karaoke.append({
+            "text": line.strip(),
+            "start": line_start,
+            "end": line_end,
+            "words": words,
+        })
+
+    if not karaoke:
+        return None, 0.0
+
+    coverage = len(karaoke) / max(1, len(non_empty_lines))
+    return karaoke, coverage
+
+
 # ----------------- РЕНДЕРИНГ (ФОНОВЫЙ ПОТОК) -----------------
 def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False, inactive_opacity=0.65, verify_lrc_with_whisper=False, separate_vocals_for_alignment=False):
     cleanup_align_audio_path = None
@@ -1675,6 +1755,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             _use_chunked = False  # Отключаем экспериментальное деление по чанкам
 
             whisper_words = None
+            result = None  # WhisperResult от model.align(); нужен для прямого пути
 
             if _use_chunked:
                 jobs[job_id]["status"] = "Длинный трек: выравниваем по фрагментам (защита от drift Whisper)..."
@@ -1694,7 +1775,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     whisper_words = None
 
             if whisper_words is None:
-                # Однопроходное выравнивание (короткий трек или фолбэк после ошибки)
+                # Принудительное пословное выравнивание (forced alignment) по точному
+                # тексту песни. original_split=True даёт сегмент на строку текста —
+                # результат глобально-монотонный и 1-в-1 по словам, повторы припева
+                # разведены по своим появлениям в аудио.
+                # fast_mode НЕ включаем: он хоть и уменьшает количество нулевых слов,
+                # но растягивает отдельные слова по инструментальным паузам (слово
+                # «поёт» пол-минуты под проигрыш), что визуально хуже для караоке.
                 jobs[job_id]["status"] = "Запуск пословного выравнивания ИИ по аудио..."
                 result = model.align(
                     align_audio_path,
@@ -1900,19 +1987,44 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     jobs[job_id]["status"] = f"⚠️ LRC не совпал с Whisper: {lrc_decision['reason']}. Используем тайминги Whisper."
 
             if not used_timestamped_hybrid:
-                # Сопоставление текста со словами Whisper: confidence-фильтрация
-                # низкоуверенных слов (борьба с галлюцинациями в проигрышах) и
-                # честная интерполяция пропущенных слов вместо привязки к чужим
-                # таймингам. Логика вынесена в match_lyrics_to_whisper и покрыта
-                # юнит-тестами.
                 raw_lines = alignment_lyrics.split('\n')
-                lyrics_karaoke, _match_stats = match_lyrics_to_whisper(
-                    raw_lines, whisper_words, confidence_threshold=0.5, lookahead=5,
-                )
-                jobs[job_id]["status"] = (
-                    f"Обработано {_match_stats['matched_words']}/{_match_stats['total_words']} "
-                    f"слов ({_match_stats['interpolated_words']} интерполировано)."
-                )
+                # ПРЯМОЙ ПУТЬ: результат model.align() уже глобально-монотонный —
+                # сегменты соответствуют строкам текста 1-в-1, повторы припева
+                # разведены по своим появлениям в аудио. Строим караоке напрямую,
+                # минуя матчер, который на повторяющихся припевах теряет
+                # синхронизацию (схлопывает куплеты). Матчер — фолбэк, когда align
+                # провалился (слов существенно меньше, чем в тексте).
+                lyrics_karaoke = None
+                _align_coverage = 0.0
+                if result is not None:
+                    lyrics_karaoke, _align_coverage = build_karaoke_from_align_result(
+                        raw_lines, result
+                    )
+                if lyrics_karaoke is None or _align_coverage < 0.85:
+                    # Фолбэк: align не покрыл текст (мало слов/сегментов). Сначала
+                    # пробуем прямой путь с тем, что есть, только если он в принципе
+                    # построился; иначе — нечёткий матчер.
+                    _matched = 0
+                    _total = 0
+                    _interp = 0
+                    if lyrics_karaoke is None:
+                        lyrics_karaoke, _fb_stats = match_lyrics_to_whisper(
+                            raw_lines, whisper_words, confidence_threshold=0.5, lookahead=5,
+                        )
+                        _matched = _fb_stats.get('matched_words', 0)
+                        _total = _fb_stats.get('total_words', 0)
+                        _interp = _fb_stats.get('interpolated_words', 0)
+                    else:
+                        _total = sum(len(w['words']) for w in lyrics_karaoke)
+                    jobs[job_id]["status"] = (
+                        f"Выравнивание через фолбэк-матчер: {_matched}/{_total} слов "
+                        f"({_interp} интерполировано). Покрытие строк align: {_align_coverage:.0%}."
+                    )
+                else:
+                    jobs[job_id]["status"] = (
+                        f"Точное пословное выравнивание: {len(lyrics_karaoke)} строк, "
+                        f"покрытие {_align_coverage:.0%}."
+                    )
 
             # ЗАЩИТА МОНОТОННОСТИ: каждая строка должна начинаться после предыдущей
             for i in range(1, len(lyrics_karaoke)):

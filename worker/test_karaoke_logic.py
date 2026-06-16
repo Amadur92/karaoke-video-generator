@@ -12,6 +12,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from karaoke_worker import (  # noqa: E402
+    build_karaoke_from_align_result,
     clean_word,
     clamp_word_timing,
     distribute_words_between_anchors,
@@ -255,6 +256,104 @@ def test_match_stats_reflect_quality():
     _, stats = match_lyrics_to_whisper(lyrics, whisper, confidence_threshold=0.5)
     assert stats["total_words"] == 5
     assert stats["matched_words"] == 2  # только 'a' и 'e'
+
+
+def test_match_repeated_chorus_keeps_chronological_order():
+    """Повторяющийся припев: каждая строка текста привязывается к своему по времени
+    появлению в аудио, а не «съедается» с потерей синхронизации.
+
+    Регрессия: при подаче на вход свободной транскрипции (с пропусками в проигрышах)
+    нечёткий матчинг ломался на повторах — перескакивал к более позднему появлению,
+    и середина песни схлопывалась. Forced alignment по точному тексту песни даёт
+    слова в хронологическом порядке, поэтому каждое текстовое вождение должно
+    получить тайминги своего, более раннего, появления.
+    """
+    chorus = "i love you"
+    lyrics = ["verse one", chorus, chorus]
+    whisper = [
+        # verse one
+        _w("verse", 10.0, 10.4, 0.9), _w("one", 10.4, 10.8, 0.9),
+        # первое появление припева (~20с)
+        _w("i", 20.0, 20.2, 0.9), _w("love", 20.2, 20.5, 0.9), _w("you", 20.5, 20.9, 0.9),
+        # второе появление припева (~40с)
+        _w("i", 40.0, 40.2, 0.9), _w("love", 40.2, 40.5, 0.9), _w("you", 40.5, 40.9, 0.9),
+    ]
+    karaoke, _ = match_lyrics_to_whisper(lyrics, whisper)
+    assert len(karaoke) == 3
+    # verse — до 11с
+    assert karaoke[0]["end"] <= 11.0
+    # ПЕРВЫЙ припев должен попасть на ~20с, а не «съехать» на второй (40с)
+    first_chorus = karaoke[1]
+    assert 19.0 <= first_chorus["start"] <= 21.0, (
+        f"первый припев должен быть у 20с, а попал на {first_chorus['start']:.1f}"
+    )
+    # ВТОРОЙ припев — у 40с, то есть строки идут в хронологическом порядке
+    second_chorus = karaoke[2]
+    assert 39.0 <= second_chorus["start"] <= 41.0, (
+        f"второй припев должен быть у 40с, а попал на {second_chorus['start']:.1f}"
+    )
+    assert first_chorus["end"] < second_chorus["start"]
+
+
+def _seg(text, word_tuples):
+    """Имитация сегмента WhisperResult для тестов прямого пути."""
+    return SimpleNamespace(
+        text=text,
+        words=[SimpleNamespace(word=w[0], start=w[1], end=w[2]) for w in word_tuples],
+    )
+
+
+def test_build_karaoke_from_align_direct():
+    """Прямой путь: сегменты align() 1-в-1 по строкам дают готовые тайминги."""
+    raw_lines = ["hello world", "foo bar"]
+    result = SimpleNamespace(segments=[
+        _seg("hello world", [("hello", 1.0, 1.4), ("world", 1.4, 1.9)]),
+        _seg("foo bar", [("foo", 3.0, 3.3), ("bar", 3.3, 3.6)]),
+    ])
+    kara, coverage = build_karaoke_from_align_result(raw_lines, result)
+    assert coverage == 1.0
+    assert len(kara) == 2
+    assert kara[0]["start"] == 1.0 and kara[0]["end"] == 1.9
+    assert kara[1]["start"] == 3.0
+    assert [w["word"] for w in kara[0]["words"]] == ["hello", "world"]
+
+
+def test_build_karaoke_from_align_keeps_repeated_chorus_order():
+    """Глобальная монотонность: повтор припева берёт своё появление в аудио.
+
+    Это ключевое преимущество прямого пути над match_lyrics_to_whisper: align()
+    выравнивает именно второй экземпляр текста на второе появление вокала,
+    а матчер схлопнул бы оба вхождения на одно.
+    """
+    chorus = "i love you"
+    raw_lines = ["intro line", chorus, chorus]
+    result = SimpleNamespace(segments=[
+        _seg("intro line", [("intro", 5.0, 5.5), ("line", 5.5, 6.0)]),
+        _seg("i love you", [("i", 20.0, 20.2), ("love", 20.2, 20.5), ("you", 20.5, 20.9)]),
+        _seg("i love you", [("i", 40.0, 40.2), ("love", 40.2, 40.5), ("you", 40.5, 40.9)]),
+    ])
+    kara, coverage = build_karaoke_from_align_result(raw_lines, result)
+    assert coverage == 1.0
+    # ПЕРВЫЙ припев — у 20с, ВТОРОЙ — у 40с. порядок хронологический.
+    assert 19.0 <= kara[1]["start"] <= 21.0
+    assert 39.0 <= kara[2]["start"] <= 41.0
+    assert kara[1]["end"] < kara[2]["start"]
+
+
+def test_build_karaoke_from_align_fixes_zero_duration():
+    """Слово с нулевой длительностью получает минимальный тайминг, не теряется."""
+    result = SimpleNamespace(segments=[
+        _seg("x", [("x", 5.0, 5.0)]),
+    ])
+    kara, coverage = build_karaoke_from_align_result(["x"], result)
+    assert coverage == 1.0
+    assert kara[0]["words"][0]["end"] > kara[0]["words"][0]["start"]
+
+
+def test_build_karaoke_from_align_none_result():
+    """None-результат → нельзя построить, возвращается (None, 0.0) для фолбэка."""
+    kara, coverage = build_karaoke_from_align_result(["x"], None)
+    assert kara is None and coverage == 0.0
 
 
 def _run():
