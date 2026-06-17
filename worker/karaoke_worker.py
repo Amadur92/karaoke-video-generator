@@ -1554,7 +1554,129 @@ def match_lyrics_to_whisper(raw_lines, whisper_words, confidence_threshold=0.5, 
     return lyrics_karaoke, stats
 
 
-def build_karaoke_from_align_result(raw_lines, align_result):
+def _redistribute_words_in_line(line, max_word_dur=0.9, min_word_dur=0.18):
+    """Перераспределяет слова внутри строки, исправляя растянутые/микро-слова.
+
+    Проблема: Whisper (cross-attention + DTW, обученный на речи) плохо сегментирует
+    отдельные ноты в пении. На затянутых гласных он «приклеивает» соседнее слово
+    к той же области вокала, и слово растягивается на 2-3 секунды. Тюнинг
+    параметров align() (max_word_dur, fast_mode) либо не помогает, либо ломает
+    позиции строк (MAE vs ground truth). Demucs-разделение вокала только worsens
+    сегментацию (артефакты).
+
+    Решение: границы строк надёжны (MAE ~0.9с от эталона), а слова внутри строки
+    идёт в правильном порядке 1-в-1. Поэтому перераспределяем слова по длине
+    (в символах) внутри span строки, клампя длительность каждого в
+    [min_word_dur, max_word_dur], а остаток времени раскладываем равномерно как
+    межсловные паузы. Начало/конец строки не меняются (якоря), меняются только
+    внутренние границы слов.
+
+    Аргументы:
+      line: dict караоке-строки с ключами start/end/words (мутируется in-place).
+      max_word_dur: верхний предел длительности одного слова (сек).
+      min_word_dur: нижний предел длительности одного слова (сек).
+
+    Возвращает тот же line (для удобства чейнинга).
+    """
+    words = line.get("words") or []
+    n = len(words)
+    if n == 0:
+        return line
+
+    ls = float(line["start"])
+    le = float(line["end"])
+    span = le - ls
+    if span <= 0:
+        # Вырожденный span — всем словам даём минимальную длительность от ls.
+        cur = ls
+        for w in words:
+            w["start"] = round(cur, 3)
+            w["end"] = round(cur + min_word_dur, 3)
+            cur += min_word_dur
+        line["end"] = round(cur, 3)
+        return line
+
+    # Одно слово — оно заполняет весь span строки целиком (клампить не к чему).
+    if n == 1:
+        words[0]["start"] = round(ls, 3)
+        words[0]["end"] = round(le, 3)
+        return line
+
+    # Вес слова — по длине в символах (без пробелов/пунктуации не чистим,
+    # т.к. для пропорции важен видимый размер слова в караоке).
+    weights = [max(len((w.get("word") or "").strip()), 1) for w in words]
+    total_w = sum(weights)
+
+    # Пропорциональная длительность, клампнутая в [min, max].
+    durations = []
+    for i in range(n):
+        prop = span * weights[i] / total_w
+        durations.append(max(min_word_dur, min(max_word_dur, prop)))
+
+    # Абсолютный приоритет: НИ ОДНО слово не должно стать короче min_word_dur
+    # (микро-слово в караоке выглядит как рывок подсветки). Поэтому если сумма
+    # min_word_dur-длительностей превышает span строки (переполненная строка —
+    # Whisper сжал её слишком сильно), мы НЕ ужимаем слова, а продлеваем конец
+    # строки. Это смещает только границу строки (что заметно меньше, чем рваная
+    # подсветка), и сохраняет monotonicность относительно следующей строки: если
+    # новое line.end заедет на следующую строку, защитный монотонный постпроцесс
+    # сдвинет её.
+    total_d = sum(durations)
+    if total_d > span:
+        # Пробуем сжать пропорционально, но держим min_word_dur как пол.
+        scale = span / total_d
+        scaled = [max(min_word_dur, d * scale) for d in durations]
+        if sum(scaled) <= span + 1e-6:
+            durations = scaled
+            total_d = sum(durations)
+        else:
+            # Сжаться до span не выходит без микро-слов — оставляем слова как
+            # есть (>= min_word_dur каждое) и продлеваем line.end.
+            durations = [max(min_word_dur, d) for d in durations]
+            total_d = sum(durations)
+
+    # Slack (свободное время) — это ЕСТЕСТВЕННЫЕ паузы между словами в пении.
+    # Кладём его только в n-1 межсловных промежутков: первое слово начинается
+    # ровно в ls, последнее кончается ровно в le. Растягивать слова сверх
+    # max_word_dur этим slack'ом нельзя (вернёт растянутость, ради которой всё
+    # и затевалось).
+    actual_span = max(span, total_d)
+    slack = actual_span - total_d
+    gap = slack / (n - 1) if n > 1 else 0.0
+
+    cur = ls
+    for i in range(n):
+        words[i]["start"] = round(cur, 3)
+        words[i]["end"] = round(cur + durations[i], 3)
+        cur += durations[i] + gap
+
+    # Точная стыковка якорей: первое слово в ls. Конец строки = конец последнего
+    # слова. Если слова переполнили исходный span (строка была переполнена), line.end
+    # продлевается вслед за словами — это лучше, чем микро-слова. Если под line.end
+    # остался slack — последнее слово аккуратно продлеваем до line.end, но не сверх
+    # max_word_dur.
+    words[0]["start"] = round(ls, 3)
+    natural_last_end = words[-1]["end"]
+    if natural_last_end < le - 0.02:
+        # Можно продлить последнее слово до le, не нарушая max_word_dur.
+        if le - words[-1]["start"] <= max_word_dur + 0.02:
+            words[-1]["end"] = round(le, 3)
+        else:
+            line["end"] = round(natural_last_end, 3)
+    elif natural_last_end > le + 0.02:
+        # Слова переполнили span — продлеваем границу строки.
+        line["end"] = round(natural_last_end, 3)
+    # Гарантия монотонности и ненулевых длительностей.
+    for i in range(n):
+        if words[i]["end"] <= words[i]["start"]:
+            words[i]["end"] = round(words[i]["start"] + min_word_dur, 3)
+        if i > 0 and words[i]["start"] < words[i - 1]["end"] - 0.005:
+            words[i]["start"] = round(words[i - 1]["end"] + 0.005, 3)
+            words[i]["end"] = round(max(words[i]["start"] + min_word_dur, words[i]["end"]), 3)
+    return line
+
+
+def build_karaoke_from_align_result(raw_lines, align_result, redistribute=True):
     """Строит караоке-тайминги напрямую из результата model.align().
 
     Когда модель делает forced alignment по точному тексту песни (с
@@ -1569,9 +1691,14 @@ def build_karaoke_from_align_result(raw_lines, align_result):
     ними). match_lyrics_to_whisper остаётся фолбэком на случай, когда align()
     частично провалился и слов меньше, чем в тексте.
 
+    После сборки применяется перераспределение слов внутри строки
+    (_redistribute_words_in_line): это убирает растянутые/микро-слова (Whisper
+    плохо сегментирует ноты в пении), не сдвигая позиции строк.
+
     Аргументы:
       raw_lines: строки исходного текста (нужны для подсчёта ожидаемого числа слов).
       align_result: stable_whisper.WhisperResult (или None) от model.align(...).
+      redistribute: применять ли перераспределение слов (по умолчанию True).
 
     Возвращает: (lyrics_karaoke, coverage_ratio) или (None, 0.0), если построить
     нельзя (нет слов / сегментов). coverage_ratio = доля строк текста, для которых
@@ -1618,14 +1745,15 @@ def build_karaoke_from_align_result(raw_lines, align_result):
             seg_idx -= 1
             continue
 
-        line_start = words[0]["start"]
-        line_end = words[-1]["end"]
-        karaoke.append({
+        line_obj = {
             "text": line.strip(),
-            "start": line_start,
-            "end": line_end,
+            "start": words[0]["start"],
+            "end": words[-1]["end"],
             "words": words,
-        })
+        }
+        if redistribute:
+            _redistribute_words_in_line(line_obj)
+        karaoke.append(line_obj)
 
     if not karaoke:
         return None, 0.0

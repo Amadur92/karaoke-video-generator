@@ -23,6 +23,7 @@ from karaoke_worker import (  # noqa: E402
     parse_timestamped_lyrics,
     shift_karaoke_timings,
     strip_lrc_timestamps,
+    _redistribute_words_in_line,
 )
 
 
@@ -354,6 +355,127 @@ def test_build_karaoke_from_align_none_result():
     """None-результат → нельзя построить, возвращается (None, 0.0) для фолбэка."""
     kara, coverage = build_karaoke_from_align_result(["x"], None)
     assert kara is None and coverage == 0.0
+
+
+def _redistribute_invariants(line):
+    """Проверяет инварианты перераспределённой строки. Возвращает list ошибок."""
+    errs = []
+    ls, le = line["start"], line["end"]
+    words = line["words"]
+    if not words:
+        return errs
+    # 1. Якоря строки сохранены (начало первого, конец последнего).
+    if abs(words[0]["start"] - ls) > 0.02:
+        errs.append(f"first word start {words[0]['start']} != line start {ls}")
+    if abs(words[-1]["end"] - le) > 0.02:
+        errs.append(f"last word end {words[-1]['end']} != line end {le}")
+    # 2. Монотонность и ненулевые длительности.
+    for i, w in enumerate(words):
+        if w["end"] <= w["start"]:
+            errs.append(f"word {i} '{w['word']}' zero/negative duration")
+        if i > 0 and w["start"] < words[i - 1]["end"] - 0.01:
+            errs.append(f"word {i} '{w['word']}' overlaps previous")
+    return errs
+
+
+def test_redistribute_fixes_stretched_word():
+    """Растянутое слово (>1.8с) после перераспределения становится <= max_word_dur."""
+    # Whisper «приклеил» 'sustained' на 3 секунды к одной ноте.
+    line = {
+        "text": "one sustained three",
+        "start": 10.0, "end": 14.0,
+        "words": [
+            {"word": "one", "start": 10.0, "end": 10.4},
+            {"word": "sustained", "start": 10.4, "end": 13.6},  # 3.2с — растянуто
+            {"word": "three", "start": 13.6, "end": 14.0},
+        ],
+    }
+    _redistribute_words_in_line(line)
+    errs = _redistribute_invariants(line)
+    assert not errs, errs
+    # Ни одно слово не должно быть растянуто (>0.9с по умолчанию).
+    for w in line["words"]:
+        assert w["end"] - w["start"] <= 0.9 + 0.01, (
+            f"'{w['word']}' остался растянут: {w['end']-w['start']:.2f}s"
+        )
+    # 'sustained' (длиннее) должен получить больше времени, чем 'one'.
+    d = {w["word"]: w["end"] - w["start"] for w in line["words"]}
+    assert d["sustained"] > d["one"]
+
+
+def test_redistribute_fixes_tiny_word():
+    """Микро-слово (<0.12с) после перераспределения получает >= min_word_dur."""
+    line = {
+        "text": "alpha beta gamma",
+        "start": 5.0, "end": 7.0,
+        "words": [
+            {"word": "alpha", "start": 5.0, "end": 5.8},
+            {"word": "beta", "start": 5.8, "end": 5.85},  # 0.05с — микро
+            {"word": "gamma", "start": 5.85, "end": 7.0},
+        ],
+    }
+    _redistribute_words_in_line(line)
+    errs = _redistribute_invariants(line)
+    assert not errs, errs
+    for w in line["words"]:
+        assert w["end"] - w["start"] >= 0.15, (
+            f"'{w['word']}' остался микро: {w['end']-w['start']:.3f}s"
+        )
+
+
+def test_redistribute_single_word_line():
+    """Строка из одного слова: оно заполняет весь span, без разрывов."""
+    line = {
+        "text": "solo", "start": 20.0, "end": 24.0,
+        "words": [{"word": "solo", "start": 20.0, "end": 24.0}],
+    }
+    _redistribute_words_in_line(line)
+    assert line["words"][0]["start"] == 20.0
+    assert line["words"][0]["end"] == 24.0
+
+
+def test_redistribute_preserves_line_anchors_many_words():
+    """На длинной строке: начало/конец строки не сдвигаются, всё монотонно."""
+    line = {
+        "text": "a b c d e f g h",
+        "start": 0.0, "end": 3.0,
+        "words": [{"word": c, "start": 0.0 if i == 0 else 3.0, "end": 3.0}
+                  for i, c in enumerate("abcdefgh")],
+    }
+    _redistribute_words_in_line(line)
+    errs = _redistribute_invariants(line)
+    assert not errs, errs
+
+
+def test_redistribute_zero_span_line():
+    """Вырожденный случай: span строки <= 0 — слова разворачиваются от line.start."""
+    line = {
+        "text": "collapsed here", "start": 5.0, "end": 5.0,
+        "words": [
+            {"word": "collapsed", "start": 5.0, "end": 5.0},
+            {"word": "here", "start": 5.0, "end": 5.0},
+        ],
+    }
+    _redistribute_words_in_line(line)
+    # Каждое слово получило минимальную длительность, конец строки сдвинут.
+    for w in line["words"]:
+        assert w["end"] > w["start"]
+    assert line["end"] >= line["start"]
+
+
+def test_build_karaoke_applies_redistribution_by_default():
+    """Прямой путь применяет перераспределение: на выходе нет растянутых слов."""
+    result = SimpleNamespace(segments=[
+        _seg("big stretched word", [
+            ("big", 1.0, 1.3),
+            ("stretched", 1.3, 4.5),   # 3.2с растянуто
+            ("word", 4.5, 5.0),
+        ]),
+    ])
+    kara, _ = build_karaoke_from_align_result(["big stretched word"], result)
+    assert kara[0]["start"] == 1.0 and kara[0]["end"] == 5.0
+    for w in kara[0]["words"]:
+        assert w["end"] - w["start"] <= 0.9 + 0.01
 
 
 def _run():
