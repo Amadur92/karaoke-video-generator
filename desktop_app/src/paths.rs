@@ -155,7 +155,93 @@ pub fn clear_bundled_runtime_quarantine() {
 
     let base = app_base_dir();
     clear_quarantine(&base.join("worker"));
+
+    // Самовосстановление worker/_internal/Python: PyInstaller кладёт туда
+    // симлинк на Python.framework/Versions/3.x/Python. Симлинк хрупок и ломается
+    // при пересылке бокса через zip / Finder-копию / FAT-диск / облако, после
+    // чего воркер падает с "Failed to load Python shared library: no such file".
+    // Если файла нет или это сломанный симлинк — восстанавливаем из framework,
+    // который лежит рядом и пересылку переживает.
+    repair_python_shared_library();
 }
+
+/// Восстанавливает worker/_internal/Python из bundled Python.framework.
+/// Безопасно для dev-режима (там worker — это .py скрипт, папки _internal нет).
+#[cfg(target_os = "macos")]
+fn repair_python_shared_library() {
+    let base = app_base_dir();
+    let internal = base.join("worker").join("_internal");
+    let py_link = internal.join("Python");
+
+    // Если Python уже существует как обычный читаемый файл — чинить нечего.
+    let needs_repair = if let Ok(meta) = std::fs::symlink_metadata(&py_link) {
+        if meta.is_symlink() {
+            // Симлинк (должен был быть заменён ещё при сборке, но перепроверим).
+            std::fs::metadata(&py_link).is_err()
+        } else {
+            // Обычный файл: проверим, что он не нулевого размера (битые архивы
+            // иногда оставляют пустышку).
+            meta.len() == 0
+        }
+    } else {
+        // Файла/ссылки нет совсем.
+        true
+    };
+
+    if !needs_repair {
+        return;
+    }
+
+    // Ищем настоящий Python внутри Python.framework в нескольких вариантах
+    // расположения (PyInstaller может класть framework в _internal или рядом).
+    let mut search_dirs = vec![internal.clone(), base.join("worker")];
+    // Сканируем поддиректории _internal на случай вложенного framework.
+    if let Ok(entries) = std::fs::read_dir(&internal) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                search_dirs.push(p);
+            }
+        }
+    }
+
+    for dir in &search_dirs {
+        let framework_dir = dir.join("Python.framework");
+        if !framework_dir.is_dir() {
+            continue;
+        }
+        // Framework: .../Python.framework/Versions/<ver>/Python
+        let versions = framework_dir.join("Versions");
+        let version_dirs = std::fs::read_dir(&versions).into_iter().flatten();
+        for vent in version_dirs.flatten() {
+            let real = vent.path().join("Python");
+            if real.is_file() {
+                if let Err(e) = std::fs::copy(&real, &py_link) {
+                    debug_log(format!(
+                        "repair_python: copy failed from {}: {}",
+                        real.display(),
+                        e
+                    ));
+                } else {
+                    let _ = std::fs::set_permissions(
+                        &py_link,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                    );
+                    debug_log(format!(
+                        "repair_python: restored from {}",
+                        real.display()
+                    ));
+                }
+                return;
+            }
+        }
+    }
+
+    debug_log("repair_python: Python.framework not found, cannot restore");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn repair_python_shared_library() {}
 
 pub fn exports_dir() -> PathBuf {
     let base = app_base_dir();
