@@ -237,11 +237,90 @@ class YouTubeSearchProvider(Provider):
         return candidates
 
 
+class SoundCloudSearchProvider(Provider):
+    """
+    Поиск треков на SoundCloud через yt-dlp (extractor «soundcloud:search»).
+
+    SoundCloud ценен для русскоязычного каталога: много хип-хопа/инди и
+    эксклюзивов, которых нет на Qobuz/JioSaavn. Публичные треки скачиваются
+    yt-dlp без токена.
+    """
+
+    name = "soundcloud"
+
+    def search(self, track: TrackMetadata, limit: int = 5) -> list[Candidate]:
+        try:
+            try:
+                from yt_dlp import YoutubeDL
+            except ImportError:
+                from youtube_dl import YoutubeDL
+        except Exception:
+            return []
+
+        # Пробуем оригинальный запрос и, при необходимости, транслитерированный
+        # (латиница → кириллица), т.к. SoundCloud-каналы русскоязычных артистов
+        # часто озаглавлены кириллицей.
+        from .text_norm import has_cyrillic, translit_lat_to_cyr
+
+        queries = [track.query_text]
+        if not has_cyrillic(track.query_text):
+            cyr = translit_lat_to_cyr(track.query_text)
+            if cyr and cyr.lower() != track.query_text.lower():
+                queries.append(cyr)
+
+        options = {
+            "quiet": True,
+            "skip_download": True,
+            "extract_flat": True,
+            "noplaylist": True,
+            "ignoreerrors": True,
+            "nocheckcertificate": True,
+        }
+
+        candidates: list[Candidate] = []
+        seen_ids: set[str] = set()
+        with YoutubeDL(options) as ydl:
+            for query in queries:
+                try:
+                    info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+                except Exception:
+                    continue
+                for item in (info or {}).get("entries") or []:
+                    if not item:
+                        continue
+                    eid = item.get("id")
+                    if eid and eid in seen_ids:
+                        continue
+                    if eid:
+                        seen_ids.add(eid)
+                    candidates.append(
+                        Candidate(
+                            source=self.name,
+                            title=item.get("title") or "",
+                            artists=[item.get("uploader") or ""],
+                            duration_sec=round(item.get("duration") or 0) or None,
+                            public_url=item.get("url") or item.get("webpage_url"),
+                            external_id=eid,
+                            quality_hint="lossy SoundCloud candidate (no token needed)",
+                            raw_rank=len(candidates) + 1,
+                            next_step="Would download via yt-dlp soundcloud extractor",
+                            blocked_at="direct SoundCloud media URL resolution",
+                            route_kind="resolvable_blocked",
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(candidates) >= limit:
+                    break
+        return candidates
+
+
 def default_providers() -> Iterable[Provider]:
     return [
         DeezerISRCProvider(),
         QobuzISRCProvider(),
         SonglinkProvider(),
         JioSaavnProvider(),
+        SoundCloudSearchProvider(),
         YouTubeSearchProvider(),
     ]

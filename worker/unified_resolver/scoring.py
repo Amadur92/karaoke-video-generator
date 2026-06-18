@@ -1,75 +1,10 @@
 from __future__ import annotations
 
 import difflib
-import re
 
+from .markers import find_critical_markers, find_soft_markers
 from .models import Candidate, ScoredCandidate, TrackMetadata
-
-
-BAD_TITLE_MARKERS = [
-    "karaoke",
-    "instrumental",
-    "slowed",
-    "sped up",
-    "nightcore",
-    "8d",
-    "lyrics",
-    "cover",
-    "live",
-    "remix",
-    "kaver",
-    "remiks",
-    "layv",
-    "minus",
-    "minusovka",
-]
-
-CYR_TO_LAT = str.maketrans(
-    {
-        "а": "a",
-        "б": "b",
-        "в": "v",
-        "г": "g",
-        "д": "d",
-        "е": "e",
-        "ё": "e",
-        "ж": "zh",
-        "з": "z",
-        "и": "i",
-        "й": "y",
-        "к": "k",
-        "л": "l",
-        "м": "m",
-        "н": "n",
-        "о": "o",
-        "п": "p",
-        "р": "r",
-        "с": "s",
-        "т": "t",
-        "у": "u",
-        "ф": "f",
-        "х": "h",
-        "ц": "ts",
-        "ч": "ch",
-        "ш": "sh",
-        "щ": "sch",
-        "ъ": "",
-        "ы": "y",
-        "ь": "",
-        "э": "e",
-        "ю": "yu",
-        "я": "ya",
-    }
-)
-
-
-def normalize(value: str) -> str:
-    value = value.lower()
-    value = value.translate(CYR_TO_LAT)
-    value = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", value)
-    value = value.replace("&", " and ")
-    value = re.sub(r"[^a-zа-яё0-9]+", " ", value, flags=re.IGNORECASE)
-    return " ".join(value.split())
+from .text_norm import CYR_TO_LAT, normalize  # re-export для обратной совместимости
 
 
 def ratio(a: str, b: str) -> float:
@@ -81,17 +16,48 @@ def ratio(a: str, b: str) -> float:
 
 
 def partial_word_match(needle: str, haystack: str) -> float:
-    words = [w for w in normalize(needle).split() if len(w) > 1]
-    hay = normalize(haystack)
-    if not words or not hay:
+    """
+    Доля слов из needle, присутствующих в haystack (по точному или
+    нечёткому совпадению слово-к-слову).
+
+    Раньше здесь был баг: нечёткое сравнение шло word-vs-весь-haystack,
+    что давало ложные срабатывания для коротких слов. Теперь каждое слово
+    needle сравнивается с каждым словом haystack по отдельности.
+    """
+    needle_words = [w for w in normalize(needle).split() if len(w) > 1]
+    hay_words = set(normalize(haystack).split())
+    if not needle_words or not hay_words:
         return 0.0
-    hits = sum(1 for word in words if word in hay or difflib.SequenceMatcher(None, word, hay).ratio() > 0.8)
-    return (hits / len(words)) * 100.0
+    hits = 0
+    for word in needle_words:
+        if word in hay_words:
+            hits += 1
+            continue
+        # нечёткое слово-к-слову: берём лучшее совпадение по словам haystack
+        best = 0.0
+        for hay_word in hay_words:
+            if abs(len(hay_word) - len(word)) > max(len(word), 3):
+                continue
+            sim = difflib.SequenceMatcher(None, word, hay_word).ratio()
+            if sim > best:
+                best = sim
+        if best > 0.8:
+            hits += 1
+    return (hits / len(needle_words)) * 100.0
 
 
 def duration_score(expected: int | None, actual: int | None) -> float:
-    if not expected or not actual:
+    # Если эталонная длительность неизвестна — нет смысла штрафовать за неё.
+    if not expected:
         return 50.0
+    # Если эталон известен, а у кандидата длительности нет — это подозрительно:
+    # кандидат не может быть проверен на «правильную версию», поэтому даём
+    # умеренный штраф (35), уступающий любому кандидату с близкой длительностью.
+    # Раньше тут было 50 (нейтрально), и источники без длительности (JioSaavn,
+    # Deezer metadata-only) обходили YouTube с реальной, но чуть отличающейся
+    # длительностью — выбиралась не та версия.
+    if not actual:
+        return 35.0
     diff = abs(expected - actual)
     if diff <= 2:
         return 100.0
@@ -116,46 +82,35 @@ def score_candidate(track: TrackMetadata, candidate: Candidate) -> ScoredCandida
     dur_score = duration_score(track.duration_sec, candidate.duration_sec)
     album_score = ratio(track.album or "", candidate.album or "") if track.album and candidate.album else 50.0
 
-    score = title_score * 0.40 + artist_score * 0.30 + dur_score * 0.20 + album_score * 0.10
+    # Длительность — критичный сигнал выбора правильной версии: у популярного
+    # трека на YouTube/SoundCloud есть десятки видео с одинаковым title/artist,
+    # но разной длиной (radio edit, extended, live, mashup). Поэтому вес
+    # длительности поднят с 0.20 до 0.30, а при сильном расхождении (>25с)
+    # дополнительно штрафуем, чтобы версия «правильной длины» всегда побеждала.
+    score = title_score * 0.35 + artist_score * 0.25 + dur_score * 0.30 + album_score * 0.10
     flags: list[str] = []
 
-    cand_title_markers = re.sub(r"[^a-zа-яё0-9]+", " ", candidate.title.lower().translate(CYR_TO_LAT), flags=re.IGNORECASE)
-    track_title_markers = re.sub(r"[^a-zа-яё0-9]+", " ", track.title.lower().translate(CYR_TO_LAT), flags=re.IGNORECASE)
-    
-    # Critical bad markers (karaoke, minus, instrumental, live, cover) that should never be downloaded
-    CRITICAL_BAD_MARKERS = [
-        "karaoke",
-        "instrumental",
-        "minus",
-        "minusovka",
-        "backing track",
-        "live",
-        "layv",
-        "concert",
-        "концерт",
-        "acoustic",
-        "акустика",
-        "cover",
-        "кавер",
-        "kaver",
-    ]
-    
-    for marker in CRITICAL_BAD_MARKERS:
-        if marker in cand_title_markers and marker not in track_title_markers:
-            score -= 80
-            flags.append(f"critical_marker:{marker}")
+    # Критические bad-маркеры (караоке, минус, лайв, ремикс, кавер ...) — берём из единого модуля.
+    critical_hits = find_critical_markers(candidate.title, track.title)
+    for marker in critical_hits:
+        score -= 80
+        flags.append(f"critical_marker:{marker}")
 
-    for marker in BAD_TITLE_MARKERS:
-        if marker in CRITICAL_BAD_MARKERS:
-            continue
-        if marker in cand_title_markers and marker not in track_title_markers:
-            score -= 18
-            flags.append(f"marker:{marker}")
+    soft_hits = find_soft_markers(candidate.title, track.title)
+    for marker in soft_hits:
+        score -= 12
+        flags.append(f"marker:{marker}")
 
     if track.duration_sec and candidate.duration_sec and abs(track.duration_sec - candidate.duration_sec) > 12:
         flags.append(f"duration_diff:{abs(track.duration_sec - candidate.duration_sec)}s")
     if track.duration_sec and candidate.duration_sec and abs(track.duration_sec - candidate.duration_sec) > 20:
         score -= 20
+    # Сильное расхождение (>25с) почти всегда означает другую версию
+    # (extended mix, live, mashup). Дополнительный штраф гарантирует, что
+    # при наличии кандидата правильной длины он победит.
+    if track.duration_sec and candidate.duration_sec and abs(track.duration_sec - candidate.duration_sec) > 25:
+        score -= 30
+        flags.append("large_duration_mismatch")
 
     if artist_score < 42:
         score -= 55  # Critical penalty for completely different artists!

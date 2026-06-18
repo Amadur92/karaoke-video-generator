@@ -272,6 +272,38 @@ def get_audio_duration(path: str) -> Optional[int]:
     return None
 
 
+# Минимальный размер файла, который считаем валидным аудио.
+# Меньше — это, скорее всего, HTML-страница с ошибкой или пустой ответ.
+_MIN_AUDIO_BYTES = 50_000
+
+
+def is_valid_audio_file(path: Optional[str], min_duration_sec: int = 10) -> bool:
+    """
+    Проверяет, что по пути лежит действительно валидный аудиофайл:
+    файл существует, достаточно велик и ffprobe умеет его прочитать
+    с разумной длительностью. Предохраняет от случаев, когда провайдер
+    вернул HTML с ошибкой вместо аудио — тогда ffmpeg падал бы позже.
+    """
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        if os.path.getsize(path) < _MIN_AUDIO_BYTES:
+            return False
+    except OSError:
+        return False
+    duration = get_audio_duration(path)
+    return duration is not None and duration >= min_duration_sec
+
+
+def _safe_remove(path: Optional[str]) -> None:
+    """Удаляет файл, игнорируя ошибки (используется при очистке битых загрузок)."""
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 class Downloader:
     def __init__(self, output_dir: str = ".", format: str = "mp3"):
         self.output_dir = output_dir
@@ -318,11 +350,29 @@ class Downloader:
                     temp_audio = self._download_jiosaavn(candidate.external_id)
                 elif candidate.source == "qobuz-isrc" and candidate.external_id:
                     temp_audio = self._download_qobuz(candidate.external_id)
+                elif candidate.source == "soundcloud" and candidate.public_url:
+                    temp_audio = self._download_soundcloud(candidate.public_url)
                 elif "youtube" in candidate.source:
                     if candidate.public_url:
                         temp_audio = self._download_youtube(candidate.public_url)
                 
                 if temp_audio:
+                    # Постскачивательная проверка длительности: некоторые источники
+                    # (JioSaavn, Deezer metadata) не сообщают duration в кандидате,
+                    # поэтому фильтр по длительности не мог их отсечь заранее. Если
+                    # скачанный файл сильно расходится с эталоном (>25с) — это почти
+                    # наверняка другая версия (radio edit, кавер). Отвергаем и идём
+                    # к следующему кандидату, а не принимаем заведомо не тот трек.
+                    actual_dur = get_audio_duration(temp_audio)
+                    if track.duration_sec and actual_dur and abs(track.duration_sec - actual_dur) > 25:
+                        print(
+                            f"[!] Downloaded duration ({actual_dur}s) differs from reference "
+                            f"({track.duration_sec}s) by {abs(track.duration_sec - actual_dur)}s "
+                            f"— likely wrong version, discarding and trying next candidate."
+                        )
+                        _safe_remove(temp_audio)
+                        temp_audio = None
+                        continue
                     resolved_candidate = candidate
                     print(f"[+] Successfully downloaded stream from '{candidate.source}'!")
                     break
@@ -332,21 +382,51 @@ class Downloader:
         # Fallback to YouTube search if all candidates failed or no candidates were found
         if not temp_audio:
             print(f"[!] Direct candidate downloads failed or unavailable. Falling back to YouTube search...")
-            query = f"{track.title} - {track.primary_artist} audio"
+            # Поиск по «артист - название». Суффикс «audio» раньше тянул
+            # низкокачественные загрузки; теперь правильная версия выбирается
+            # по длительности и официальности канала, а не по запросу.
+            query = f"{track.primary_artist} - {track.title}".strip(" -")
             try:
-                temp_audio = self._download_youtube_search(query)
+                temp_audio = self._download_youtube_search(query, track)
             except Exception as e:
                 print(f"[!] YouTube search download failed: {e}", file=sys.stderr)
-                
+
+        # Второй fallback: SoundCloud-поиск (без токена). Полезен для русского
+        # хип-хопа/инди и эксклюзивов, отсутствующих на YouTube/Qobuz.
+        if not temp_audio:
+            print(f"[!] YouTube unavailable/failed. Trying SoundCloud search...")
+            sc_query = f"{track.primary_artist} {track.title}".strip()
+            try:
+                temp_audio = self._download_soundcloud_search(sc_query, track)
+            except Exception as e:
+                print(f"[!] SoundCloud search download failed: {e}", file=sys.stderr)
+
         if not temp_audio:
             print("[-] Error: Could not download audio stream from any source.", file=sys.stderr)
             return False
+
+        # Финальный guard длительности: даже если какой-то источник сообщил
+        # неверную версию (например, direct-кандидат без duration в списке),
+        # и fallback-поиск тоже промахнулся — не отдаём пользователю файл,
+        # который на >40с расходится с эталоном. Лучше сообщить об ошибке,
+        # чем подсунуть extended/радио-edit другого размера.
+        _ref_dur = track.duration_sec
+        _actual = get_audio_duration(temp_audio)
+        if _ref_dur and _actual and abs(_ref_dur - _actual) > 40:
+            print(
+                f"[-] Final check failed: downloaded {_actual}s vs reference {_ref_dur}s "
+                f"(diff {abs(_ref_dur - _actual)}s). Rejecting likely wrong version."
+            )
+            _safe_remove(temp_audio)
+            return False
             
         try:
-            # Determine downloaded audio duration and enrich track metadata
+            # Determine downloaded audio duration and enrich track metadata.
+            # Сохраняем исходный эталон, чтобы не затереть его реальной
+            # длительностью до окончания выбора (постскачивательная проверка
+            # кандидатов опирается на эталон из enrichment).
             actual_duration = get_audio_duration(temp_audio)
             if actual_duration:
-                track.duration_sec = actual_duration
                 print(f"[*] Actual downloaded audio duration: {actual_duration}s")
                 
             # Fetch and save lyrics
@@ -465,8 +545,12 @@ class Downloader:
                 req_audio = urllib.request.Request(decrypted_url, headers={"User-Agent": DEFAULT_UA})
                 with safe_urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
                     f_out.write(audio_resp.read())
-                    
-                return temp_path
+
+                if is_valid_audio_file(temp_path):
+                    return temp_path
+                print("[!] JioSaavn returned invalid audio data, discarding...")
+                _safe_remove(temp_path)
+                return None
         except Exception as e:
             print(f"[!] JioSaavn download failed: {e}", file=sys.stderr)
             return None
@@ -474,34 +558,81 @@ class Downloader:
     def _download_qobuz(self, track_id: str) -> Optional[str]:
         """
         Fetches Qobuz stream URL via WJHE community API and downloads it.
+
+        Пробует качества по убыванию (hi-res → lossless → lossy), потому что
+        hi-res (quality=1000) доступен не для всех треков, а ошибка часто
+        возвращается как пустой ответ или HTML. Валидирует результат через
+        is_valid_audio_file, чтобы не отдавать ffmpeg битый файл.
+        """
+        # 27 = 320 kbps MP3 (lossy), 6/7 = FLAC lossless, 1000 = hi-res.
+        # Берём 1000 → 320 (надёжнее, чем 27-профиль) как разумный каскад.
+        for quality in (1000, 320, 27):
+            try:
+                url = f"https://music.wjhe.top/api/music/qobuz/url?ID={track_id}&quality={quality}&format=flac"
+                req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+                with safe_urlopen(req, timeout=10) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    stream_url = res.get("url") or res.get("download_url")
+                    if not stream_url and isinstance(res.get("data"), dict):
+                        stream_url = res["data"].get("url") or res["data"].get("download_url")
+
+                    if not stream_url:
+                        continue
+
+                    print(f"[+] Found Qobuz WJHE stream URL (quality={quality}): {stream_url}")
+
+                    temp_file = tempfile.NamedTemporaryFile(dir=self.temp_dir, delete=False, suffix=".flac")
+                    temp_path = temp_file.name
+                    temp_file.close()
+
+                    req_audio = urllib.request.Request(stream_url, headers={"User-Agent": DEFAULT_UA})
+                    with safe_urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
+                        f_out.write(audio_resp.read())
+
+                    if is_valid_audio_file(temp_path):
+                        return temp_path
+                    print(f"[!] Qobuz response at quality={quality} is not valid audio, trying lower quality...")
+                    _safe_remove(temp_path)
+            except Exception as e:
+                print(f"[!] Qobuz download attempt (quality={quality}) failed: {e}", file=sys.stderr)
+        return None
+
+    def _download_soundcloud(self, track_url: str) -> Optional[str]:
+        """
+        Скачивает публичный трек SoundCloud через yt-dlp (extractor «soundcloud»).
+        Токен не требуется. Результат валидируется, битые ответы отбрасываются.
         """
         try:
-            url = f"https://music.wjhe.top/api/music/qobuz/url?ID={track_id}&quality=1000&format=flac"
-            req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-            with safe_urlopen(req, timeout=10) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                stream_url = res.get("url") or res.get("download_url")
-                if not stream_url and "data" in res:
-                    stream_url = res["data"].get("url") or res["data"].get("download_url")
-                
-                if not stream_url:
+            try:
+                from yt_dlp import YoutubeDL
+            except ImportError:
+                from youtube_dl import YoutubeDL
+
+            outtmpl = os.path.join(self.temp_dir, "%(id)s.%(ext)s")
+            options = {
+                "format": "bestaudio/best",
+                "outtmpl": outtmpl,
+                "quiet": True,
+                "nooverwrites": True,
+                "noplaylist": True,
+                "nocheckcertificate": True,
+            }
+
+            print(f"[*] Downloading from SoundCloud: {track_url}...")
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(track_url, download=True)
+                if not info:
                     return None
-                
-                print(f"[+] Found Qobuz WJHE stream URL: {stream_url}")
-                
-                # Download to temp file
-                temp_file = tempfile.NamedTemporaryFile(dir=self.temp_dir, delete=False, suffix=".flac")
-                temp_path = temp_file.name
-                temp_file.close()
-                
-                req_audio = urllib.request.Request(stream_url, headers={"User-Agent": DEFAULT_UA})
-                with safe_urlopen(req_audio, timeout=30) as audio_resp, open(temp_path, "wb") as f_out:
-                    f_out.write(audio_resp.read())
-                    
-                return temp_path
+                track_id = info.get("id")
+                ext = info.get("ext") or "mp3"
+                downloaded_path = os.path.join(self.temp_dir, f"{track_id}.{ext}")
+                if downloaded_path and is_valid_audio_file(downloaded_path):
+                    return downloaded_path
+                print("[!] SoundCloud download produced invalid audio, discarding...")
+                _safe_remove(downloaded_path)
         except Exception as e:
-            print(f"[!] Qobuz download failed: {e}", file=sys.stderr)
-            return None
+            print(f"[!] SoundCloud download failed: {e}", file=sys.stderr)
+        return None
 
     def _download_youtube(self, video_url: str) -> Optional[str]:
         """
@@ -531,26 +662,111 @@ class Downloader:
                 video_id = info.get("id")
                 ext = info.get("ext")
                 downloaded_path = os.path.join(temp_dir, f"{video_id}.{ext}")
-                if os.path.exists(downloaded_path):
+                if downloaded_path and is_valid_audio_file(downloaded_path):
                     return downloaded_path
+                print("[!] YouTube download produced invalid audio, discarding...")
+                _safe_remove(downloaded_path)
         except Exception as e:
             print(f"[!] YouTube download failed: {e}", file=sys.stderr)
         return None
 
-    def _download_youtube_search(self, query: str) -> Optional[str]:
+    def _rank_youtube_entries(
+        self, entries: list, track: TrackMetadata
+    ) -> list[tuple[float, dict]]:
         """
-        Searches YouTube (up to 5 results), filters out karaoke/instrumentals/covers if original search query doesn't have them,
-        and downloads the first suitable result.
+        Ранжирует результаты поиска YouTube по совокупности сигналов:
+          - близость длительности к эталонной (главный сигнал);
+          - сходство названия с «артист - название»;
+          - официальность канала (VEVO / Topic / лейбл);
+          - отсутствие критических bad-маркеров (караоке, минус, ремикс ...).
+
+        Возвращает список (score, entry), отсортированный по убыванию score.
+        Кандидаты с критическими bad-маркерами полностью исключаются
+        (кроме случая, когда искомый трек сам содержит этот маркер).
+        """
+        from .scoring import ratio
+        from .markers import has_critical_marker, find_soft_markers, is_official_channel
+
+        target_title = f"{track.primary_artist} {track.title}".strip()
+        expected_dur = track.duration_sec
+        ranked: list[tuple[float, dict]] = []
+
+        for entry in entries:
+            if not entry:
+                continue
+            title = entry.get("title") or ""
+            # Жёсткий отсев по критическим bad-маркерам.
+            if has_critical_marker(title, track.title):
+                continue
+
+            score = 0.0
+            # 1. Сходство названия.
+            title_sim = max(ratio(target_title, title), ratio(track.title, title))
+            score += title_sim * 0.30
+
+            # 2. Длительность — главный сигнал для выбора правильной версии.
+            dur = entry.get("duration")
+            if expected_dur and dur:
+                diff = abs(expected_dur - dur)
+                if diff <= 4:
+                    score += 40
+                elif diff <= 8:
+                    score += 28
+                elif diff <= 15:
+                    score += 12
+                else:
+                    # Сильно отличающаяся длительность — подозрение на другую версию.
+                    score -= 35
+            elif expected_dur and not dur:
+                score -= 5  # нет длительности — небольшая неуверенность
+
+            # 3. Бонус за официальный канал (VEVO, Topic, лейбл ...).
+            uploader = entry.get("uploader") or entry.get("channel") or entry.get("uploader_id") or ""
+            if is_official_channel(uploader):
+                score += 15
+
+            # 4. Мягкий штраф за «lyrics»/«audio»-видео (часто низкое качество).
+            score -= 4 * len(find_soft_markers(title, track.title))
+
+            ranked.append((score, entry))
+
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        return ranked
+
+    def _youtube_search_queries(self, primary_query: str, track: TrackMetadata) -> list[str]:
+        """
+        Формирует список поисковых запросов для YouTube.
+
+        Если исполнитель указан латиницей, а кириллицы в запросе нет, добавляем
+        транслитерированный вариант — русские треки часто лучше ищутся по
+        оригинальному написанию (Zemfira → Земфира).
+        """
+        from .text_norm import has_cyrillic, translit_lat_to_cyr
+
+        queries = [primary_query]
+        if not has_cyrillic(primary_query):
+            cyr = translit_lat_to_cyr(primary_query)
+            if cyr and cyr.lower() != primary_query.lower():
+                queries.append(cyr)
+        return queries
+
+    def _download_youtube_search(self, query: str, track: TrackMetadata) -> Optional[str]:
+        """
+        Ищет трек на YouTube и скачивает лучший кандидат.
+        Ранжирование учитывает длительность, официальность канала и bad-маркеры,
+        а не просто берёт первый результат — это критично для русскоязычных
+        треков, где у одного произведения бывает 5+ версий (оригинал, ремиксы,
+        лирик-видео, караоке).
         """
         try:
             try:
                 from yt_dlp import YoutubeDL
             except ImportError:
                 from youtube_dl import YoutubeDL
-            
+
             temp_dir = self.temp_dir
             outtmpl = os.path.join(temp_dir, "%(id)s.%(ext)s")
-            
+
             options = {
                 "format": "bestaudio/best",
                 "outtmpl": outtmpl,
@@ -559,53 +775,116 @@ class Downloader:
                 "noplaylist": True,
                 "nocheckcertificate": True,
             }
-            
-            # Simple check for critical words
-            CRITICAL_BAD_MARKERS = [
-                "karaoke", "instrumental", "minus", "minusovka", "backing track",
-                "кавер", "cover", "минус", "караоке", "инструментал"
-            ]
-            
-            print(f"[*] Searching YouTube for: '{query}'...")
-            search_query = f"ytsearch5:{query}"
+
             with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(search_query, download=False)
-                entries = info.get("entries") or []
-                
-                selected_entry = None
-                for entry in entries:
-                    if not entry:
+                # Объединяем кандидатов из нескольких запросов (оригинал +
+                # транслитерация), чтобы ранжирование шло по полной выборке.
+                all_entries: list[dict] = []
+                seen_ids: set[str] = set()
+                for q in self._youtube_search_queries(query, track):
+                    print(f"[*] Searching YouTube for: '{q}'...")
+                    try:
+                        info = ydl.extract_info(f"ytsearch8:{q}", download=False)
+                    except Exception as exc:
+                        print(f"[!] YouTube search '{q}' failed: {exc}", file=sys.stderr)
                         continue
-                    title_lower = (entry.get("title") or "").lower()
-                    
-                    # check if title has critical bad words
-                    has_bad = False
-                    for marker in CRITICAL_BAD_MARKERS:
-                        # only flag as bad if the marker is NOT in the query
-                        if marker in title_lower and marker not in query.lower():
-                            has_bad = True
-                            break
-                    if not has_bad:
-                        selected_entry = entry
-                        break
-                
-                if not selected_entry and entries:
-                    # if all had bad markers, fallback to first anyway
-                    selected_entry = entries[0]
-                
-                if selected_entry:
-                    video_id = selected_entry.get("id")
-                    webpage_url = selected_entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
-                    print(f"[*] Selected fallback YouTube video: '{selected_entry.get('title')}'")
-                    
-                    # Download the selected video
+                    for entry in (info.get("entries") or []):
+                        if not entry:
+                            continue
+                        eid = entry.get("id")
+                        if eid and eid in seen_ids:
+                            continue
+                        if eid:
+                            seen_ids.add(eid)
+                        all_entries.append(entry)
+
+                ranked = self._rank_youtube_entries(all_entries, track)
+                if ranked:
+                    # Отчитываемся о выборе для прозрачности.
+                    best_score, best_entry = ranked[0]
+                    dur = best_entry.get("duration")
+                    uploader = best_entry.get("uploader") or best_entry.get("channel") or ""
+                    print(
+                        f"[*] Selected YouTube video: '{best_entry.get('title')}' "
+                        f"({dur}s, score={best_score:.1f}, channel='{uploader}')"
+                    )
+                    webpage_url = (
+                        best_entry.get("webpage_url")
+                        or f"https://www.youtube.com/watch?v={best_entry.get('id')}"
+                    )
+
                     download_info = ydl.extract_info(webpage_url, download=True)
-                    ext = download_info.get("ext") or "webm"  # fallback
+                    video_id = (download_info or best_entry).get("id")
+                    ext = (download_info or {}).get("ext") or "webm"
                     downloaded_path = os.path.join(temp_dir, f"{video_id}.{ext}")
-                    if os.path.exists(downloaded_path):
+                    if downloaded_path and is_valid_audio_file(downloaded_path):
                         return downloaded_path
+                    print("[!] YouTube search download produced invalid audio, discarding...")
+                    _safe_remove(downloaded_path)
+                else:
+                    print("[-] All YouTube candidates filtered out by bad markers.")
         except Exception as e:
             print(f"[!] YouTube search download failed: {e}", file=sys.stderr)
+        return None
+
+    def _download_soundcloud_search(self, query: str, track: TrackMetadata) -> Optional[str]:
+        """
+        Ищет трек на SoundCloud и скачивает лучший кандидат.
+        Повторно использует _rank_youtube_entries — сигналы ранжирования
+        (длительность, официальность канала, bad-маркеры) универсальны.
+        """
+        try:
+            try:
+                from yt_dlp import YoutubeDL
+            except ImportError:
+                from youtube_dl import YoutubeDL
+
+            outtmpl = os.path.join(self.temp_dir, "%(id)s.%(ext)s")
+            options = {
+                "format": "bestaudio/best",
+                "outtmpl": outtmpl,
+                "quiet": True,
+                "nooverwrites": True,
+                "noplaylist": True,
+                "nocheckcertificate": True,
+            }
+
+            with YoutubeDL(options) as ydl:
+                all_entries: list[dict] = []
+                seen_ids: set[str] = set()
+                for q in self._youtube_search_queries(query, track):
+                    print(f"[*] Searching SoundCloud for: '{q}'...")
+                    try:
+                        info = ydl.extract_info(f"scsearch8:{q}", download=False)
+                    except Exception as exc:
+                        print(f"[!] SoundCloud search '{q}' failed: {exc}", file=sys.stderr)
+                        continue
+                    for entry in (info.get("entries") or []):
+                        if not entry:
+                            continue
+                        eid = entry.get("id")
+                        if eid and eid in seen_ids:
+                            continue
+                        if eid:
+                            seen_ids.add(eid)
+                        all_entries.append(entry)
+
+                ranked = self._rank_youtube_entries(all_entries, track)
+                if ranked:
+                    best_score, best_entry = ranked[0]
+                    dur = best_entry.get("duration")
+                    uploader = best_entry.get("uploader") or best_entry.get("channel") or ""
+                    print(
+                        f"[*] Selected SoundCloud track: '{best_entry.get('title')}' "
+                        f"({dur}s, score={best_score:.1f}, channel='{uploader}')"
+                    )
+                    track_url = best_entry.get("url") or best_entry.get("webpage_url")
+                    if track_url:
+                        return self._download_soundcloud(track_url)
+                else:
+                    print("[-] All SoundCloud candidates filtered out by bad markers.")
+        except Exception as e:
+            print(f"[!] SoundCloud search download failed: {e}", file=sys.stderr)
         return None
 
     def _download_cover(self, track: TrackMetadata) -> Optional[str]:

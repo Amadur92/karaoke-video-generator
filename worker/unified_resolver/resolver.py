@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .http import check_public_url, get_json, urlencode
+from .itunes import enrich_from_itunes
 from .models import ProviderRun, ResolutionReport, ScoredCandidate, TrackMetadata
 from .providers import Provider, default_providers
 from .scoring import score_candidate
@@ -76,6 +77,14 @@ class Resolver:
         # Automatically enrich metadata from Deezer if needed
         if not track.isrc or not track.duration_sec:
             enrich_from_deezer(track)
+
+        # iTunes fallback — хорошо индексирует русскоязычные релизы и закрывает
+        # пробелы (длительность/обложка/альбом), которые Deezer не нашёл.
+        if not track.duration_sec or not track.cover_url or not track.album:
+            try:
+                enrich_from_itunes(track)
+            except Exception as exc:
+                print(f"[-] iTunes enrichment failed for '{track.title}': {exc}")
 
         scored: list[ScoredCandidate] = []
         provider_runs: list[ProviderRun] = []
