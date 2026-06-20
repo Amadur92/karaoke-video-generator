@@ -36,6 +36,7 @@ from karaoke_alignment import (
     clean_word,
     clamp_word_timing,
     distribute_words_between_anchors,
+    evaluate_alignment_quality,
     estimate_line_duration,
     fuzzy_word_match,
     lyric_text_score,
@@ -56,6 +57,33 @@ def subprocess_no_window_kwargs():
     if os.name == "nt":
         return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
     return {}
+
+
+def alignment_report_path_for_timings(timings_path):
+    root, _ = os.path.splitext(timings_path)
+    return f"{root}_alignment_report.json"
+
+
+def write_timings_and_report(job_id, lyrics_karaoke, timings_output=None, audio_duration=None, source="unknown", text_match=None):
+    final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
+    with open(final_dump_path, 'w', encoding='utf-8') as f:
+        json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
+
+    report = evaluate_alignment_quality(
+        lyrics_karaoke,
+        audio_duration=audio_duration,
+        source=source,
+        text_match=text_match,
+    )
+    report_path = alignment_report_path_for_timings(final_dump_path)
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    jobs[job_id]["timings_file"] = final_dump_path
+    jobs[job_id]["alignment_report_file"] = report_path
+    jobs[job_id]["alignment_score"] = report.get("score")
+    jobs[job_id]["alignment_summary"] = report.get("summary")
+    return final_dump_path, report_path, report
 
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def split_plain_lyrics_phrases(text):
@@ -590,6 +618,32 @@ def find_phrase_start_in_audio(model, audio_path, target_text, search_start, sea
     if best and best["score"] >= 0.28 and best["confidence"] >= 0.15:
         return max(0.0, best["start"])
     return None
+
+
+def measure_lyrics_text_match(model, audio_path, lyrics_text, language='en', status_callback=None):
+    expected_text = strip_lrc_timestamps(lyrics_text or "")
+    expected_words = [w for w in re.split(r'\s+', expected_text) if clean_word(w)]
+    if not expected_words:
+        return None
+
+    if status_callback:
+        status_callback("Проверка текста: распознаём вокал и сравниваем с выданным текстом...")
+
+    result = model.transcribe(audio_path, language=language, vad=True, vad_threshold=0.05)
+    heard_parts = []
+    for segment in getattr(result, 'segments', []) or []:
+        text = (getattr(segment, 'text', '') or '').strip()
+        if text:
+            heard_parts.append(text)
+    heard_text = " ".join(heard_parts).strip()
+    heard_words = [w for w in re.split(r'\s+', heard_text) if clean_word(w)]
+    score = lyric_text_score(expected_text, heard_text)
+    return {
+        "score": round(float(score), 3),
+        "expected_words": len(expected_words),
+        "recognized_words": len(heard_words),
+        "recognized_preview": heard_text[:500],
+    }
 
 def repair_large_internal_gaps(lyrics_karaoke, max_allowed_gap=3.5):
     for line in lyrics_karaoke:
@@ -1785,6 +1839,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         lyrics_language = infer_lyrics_language(strip_lrc_timestamps(lyrics) or lyrics)
 
         timestamped_karaoke = None
+        audio_duration_for_lrc = None
         try:
             audio_duration_for_lrc = audio_duration_seconds(audio_path)
             timestamped_karaoke = build_karaoke_from_timestamped_lyrics(
@@ -1801,15 +1856,19 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             timestamped_karaoke and (verify_lrc_with_whisper or not plain_lines)
         )
         alignment_lyrics = strip_lrc_timestamps(lyrics) if timestamped_karaoke else lyrics
+        text_match_report = None
 
         if timestamped_karaoke and not probe_timestamped_with_whisper:
             lyrics_karaoke = timestamped_karaoke
             jobs[job_id]["status"] = "✅ Использована точная разметка из текста. Тайминги подготовлены."
             try:
-                final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
-                with open(final_dump_path, 'w', encoding='utf-8') as f:
-                    json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
-                jobs[job_id]["timings_file"] = final_dump_path
+                write_timings_and_report(
+                    job_id,
+                    lyrics_karaoke,
+                    timings_output=timings_output,
+                    audio_duration=audio_duration_for_lrc,
+                    source="lrc",
+                )
             except Exception:
                 pass
 
@@ -1927,6 +1986,21 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 for segment in getattr(result, 'segments', []) or []:
                     for w in getattr(segment, 'words', []) or []:
                         whisper_words.append(w)
+
+            if not plain_lines or verify_lrc_with_whisper:
+                try:
+                    text_match_report = measure_lyrics_text_match(
+                        model,
+                        align_audio_path,
+                        alignment_lyrics,
+                        language=lyrics_language,
+                        status_callback=lambda message: jobs[job_id].update({"status": message}),
+                    )
+                except Exception as exc:
+                    text_match_report = {
+                        "score": None,
+                        "error": str(exc),
+                    }
 
             # ДАМП СЫРЫХ ДАННЫХ WHISPER для отладки
             try:
@@ -2060,10 +2134,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         f"{refine_stats['matched_words']}/{refine_stats['total_words']}."
                     )
                     try:
-                        final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
-                        with open(final_dump_path, 'w', encoding='utf-8') as f:
-                            json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
-                        jobs[job_id]["timings_file"] = final_dump_path
+                        write_timings_and_report(
+                            job_id,
+                            lyrics_karaoke,
+                            timings_output=timings_output,
+                            audio_duration=audio_duration,
+                            source="lrc_whisper_hybrid",
+                            text_match=text_match_report,
+                        )
                     except Exception:
                         pass
                     used_timestamped_hybrid = True
@@ -2100,10 +2178,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         f"{refine_stats['matched_words']}/{refine_stats['total_words']}."
                     )
                     try:
-                        final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
-                        with open(final_dump_path, 'w', encoding='utf-8') as f:
-                            json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
-                        jobs[job_id]["timings_file"] = final_dump_path
+                        write_timings_and_report(
+                            job_id,
+                            lyrics_karaoke,
+                            timings_output=timings_output,
+                            audio_duration=audio_duration,
+                            source="shifted_lrc_whisper_hybrid",
+                            text_match=text_match_report,
+                        )
                     except Exception:
                         pass
                     used_timestamped_hybrid = True
@@ -2311,11 +2393,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         # Важно писать его после всех smoothing/overlap фильтров: renderer должен получать
         # ровно те же тайминги, которые рисует текущий Python-путь.
         try:
-            final_dump_path = os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
-            if timings_output:
-                final_dump_path = timings_output
-            with open(final_dump_path, 'w', encoding='utf-8') as f:
-                json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
+            write_timings_and_report(
+                job_id,
+                lyrics_karaoke,
+                timings_output=timings_output,
+                audio_duration=locals().get("audio_duration", audio_duration_for_lrc),
+                source="whisper_forced_alignment",
+                text_match=text_match_report,
+            )
         except Exception:
             pass
 
@@ -2323,7 +2408,6 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             jobs[job_id]["progress"] = 1.0
             jobs[job_id]["status"] = "✅ Тайминги подготовлены для Rust-рендера."
             jobs[job_id]["done"] = True
-            jobs[job_id]["timings_file"] = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
             return
 
         jobs[job_id]["progress"] = 0.5

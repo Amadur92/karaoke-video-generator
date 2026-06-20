@@ -40,6 +40,7 @@ pub fn read_lyrics_file(path: &Path) -> Result<String, String> {
         .replace('\r', "\n"))
 }
 
+#[cfg(test)]
 pub fn parse_lrc_timestamp_ms(raw: &str) -> Option<i64> {
     let (minutes, rest) = raw.split_once(':')?;
     let minutes = minutes.trim().parse::<i64>().ok()?;
@@ -47,6 +48,7 @@ pub fn parse_lrc_timestamp_ms(raw: &str) -> Option<i64> {
     Some(minutes * 60_000 + (seconds * 1000.0).round() as i64)
 }
 
+#[cfg(test)]
 pub fn format_lrc_timestamp_ms(ms: i64) -> String {
     let ms = ms.max(0);
     let total_seconds = ms / 1000;
@@ -56,6 +58,7 @@ pub fn format_lrc_timestamp_ms(ms: i64) -> String {
     format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
 }
 
+#[cfg(test)]
 pub fn shift_lrc_for_trim(lyrics: &str, trim_start_ms: i64, trim_duration_ms: i64) -> String {
     if !lyrics.contains('[') {
         return lyrics.to_string();

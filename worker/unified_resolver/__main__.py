@@ -80,6 +80,54 @@ def best_route(scored) -> tuple[int, object] | None:
     return (1, scored[0]) if scored else None
 
 
+def download_quality_summary(scored_candidate) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    candidate = scored_candidate.candidate
+    if scored_candidate.score < 65:
+        reasons.append(f"low_score:{scored_candidate.score}")
+    if scored_candidate.title_score < 72:
+        reasons.append(f"title_match:{scored_candidate.title_score}")
+    if scored_candidate.artist_score < 72:
+        reasons.append(f"artist_match:{scored_candidate.artist_score}")
+    if scored_candidate.duration_score < 70:
+        reasons.append(f"duration_score:{scored_candidate.duration_score}")
+    if candidate.duration_sec is None:
+        reasons.append("duration_unknown")
+    for flag in scored_candidate.flags:
+        if (
+            flag.startswith("marker:")
+            or flag.startswith("critical_marker:")
+            or flag.startswith("duration_diff:")
+            or flag in {"large_duration_mismatch", "weak_artist_match", "weak_title_match"}
+        ):
+            reasons.append(flag)
+    title_lower = (candidate.title or "").lower()
+    source_markers = [
+        "live",
+        "concert",
+        "remix",
+        "cover",
+        "karaoke",
+        "instrumental",
+        "slowed",
+        "sped up",
+        "speed up",
+        "nightcore",
+        "версия",
+        "концерт",
+        "ремикс",
+        "кавер",
+    ]
+    for marker in source_markers:
+        if marker in title_lower and not any(marker in reason for reason in reasons):
+            reasons.append(f"title_marker:{marker}")
+    if reasons and candidate.source:
+        reasons.append(f"source:{candidate.source}")
+    if reasons and candidate.title:
+        reasons.append(f"candidate:{candidate.title[:80]}")
+    return ("suspicious" if reasons else "ok", reasons)
+
+
 def print_report(meta: TrackMetadata, scored) -> None:
     print("TRACK")
     print(json.dumps(meta.__dict__, ensure_ascii=False, indent=2))
@@ -316,6 +364,8 @@ def main(argv: list[str] | None = None) -> int:
     download.add_argument("--output", default=".", help="output directory")
     download.add_argument("--format", default="mp3", choices=["mp3", "m4a", "flac"], help="output format")
     download.add_argument("--no-url-check", action="store_true", help="skip public URL preflight checks")
+    download.add_argument("--cookies-from-browser", help="browser name for yt-dlp cookies, e.g. safari/chrome/firefox")
+    download.add_argument("--duration-tolerance", type=int, help="allowed downloaded/reference duration diff in seconds")
 
     batch = sub.add_parser("batch", help="batch download tracks from a CSV or Excel file")
     batch.add_argument("file_path", help="path to CSV or Excel file")
@@ -327,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--tracks-file", help="path to JSON file containing subset of tracks to download")
     batch.add_argument("--overwrite", action="store_true", help="overwrite already downloaded tracks")
     batch.add_argument("--workers", type=int, default=2, help="maximum parallel download workers")
+    batch.add_argument("--cookies-from-browser", help="browser name for yt-dlp cookies, e.g. safari/chrome/firefox")
+    batch.add_argument("--duration-tolerance", type=int, help="allowed downloaded/reference duration diff in seconds")
 
     parse_sheet = sub.add_parser("parse-sheet", help="parse CSV or Excel file and print tracks as JSON")
     parse_sheet.add_argument("file_path", help="path to CSV or Excel file")
@@ -421,8 +473,17 @@ def main(argv: list[str] | None = None) -> int:
         rank, scored_candidate = selected
         print(f"[+] Selected candidate: Rank {rank}, Score {scored_candidate.score} ({scored_candidate.candidate.source})")
         from .downloader import Downloader
-        dl = Downloader(output_dir=args.output, format=args.format)
+        dl = Downloader(
+            output_dir=args.output,
+            format=args.format,
+            cookies_from_browser=args.cookies_from_browser,
+            duration_tolerance=args.duration_tolerance,
+        )
         success = dl.download(report.track, report.candidates)
+        if success:
+            quality, reasons = download_quality_summary(scored_candidate)
+            detail = ", ".join(reasons) if reasons else "clean_match"
+            print(f"[?] Download quality: {quality}; {detail}")
         return 0 if success else 4
     if args.command == "parse-sheet":
         try:
@@ -455,7 +516,12 @@ def main(argv: list[str] | None = None) -> int:
         from .downloader import Downloader
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        dl = Downloader(output_dir=args.output, format=args.format)
+        dl = Downloader(
+            output_dir=args.output,
+            format=args.format,
+            cookies_from_browser=args.cookies_from_browser,
+            duration_tolerance=args.duration_tolerance,
+        )
         
         def process_track(track_info) -> bool:
             pos, artist, title = track_info
@@ -491,6 +557,9 @@ def main(argv: list[str] | None = None) -> int:
                 success = dl.download(report.track, report.candidates, override_dir=override_dir)
                 if success:
                     print(f"[+] [{pos}] Successfully downloaded and processed '{artist} - {title}'.")
+                    quality, reasons = download_quality_summary(scored_candidate)
+                    detail = ", ".join(reasons) if reasons else "clean_match"
+                    print(f"[?] [{pos}] Download quality: {quality}; {detail}")
                     return True
                 else:
                     print(f"[-] [{pos}] Download failed for '{artist} - {title}'.", file=sys.stderr)

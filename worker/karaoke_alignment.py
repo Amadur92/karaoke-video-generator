@@ -249,6 +249,220 @@ def shift_karaoke_timings(karaoke, shift_seconds):
     return shifted
 
 
+def evaluate_alignment_quality(karaoke, audio_duration=None, source=None, text_match=None):
+    """Builds a machine-readable quality report for generated karaoke timings.
+
+    The report intentionally uses only final timing JSON, so it can be reused by
+    future render-only, import, batch, and manual-editor flows.
+    """
+    lines = karaoke or []
+    report = {
+        "source": source or "unknown",
+        "line_count": len(lines),
+        "word_count": 0,
+        "duration": round(float(audio_duration), 3) if audio_duration else None,
+        "metrics": {
+            "zero_or_tiny_words": 0,
+            "long_words": 0,
+            "line_overlaps": 0,
+            "word_overlaps": 0,
+            "large_internal_gaps": 0,
+            "long_lines": 0,
+            "out_of_bounds": 0,
+            "empty_lines": 0,
+            "max_word_duration": 0.0,
+            "max_line_duration": 0.0,
+            "max_internal_gap": 0.0,
+            "text_match_score": None,
+        },
+        "issues": [],
+        "summary": "ok",
+        "score": 1.0,
+    }
+
+    def issue(kind, severity, message, line_index=None, word_index=None, **extra):
+        item = {
+            "kind": kind,
+            "severity": severity,
+            "message": message,
+        }
+        if line_index is not None:
+            item["line_index"] = line_index
+        if word_index is not None:
+            item["word_index"] = word_index
+        item.update(extra)
+        report["issues"].append(item)
+
+    previous_line_end = None
+    for line_idx, line in enumerate(lines):
+        words = line.get("words") or []
+        if not words:
+            report["metrics"]["empty_lines"] += 1
+            issue("empty_line", "warning", "Line has no words.", line_idx)
+            continue
+
+        report["word_count"] += len(words)
+        try:
+            line_start = float(line.get("start", words[0].get("start", 0.0)))
+            line_end = float(line.get("end", words[-1].get("end", line_start)))
+        except Exception:
+            report["metrics"]["empty_lines"] += 1
+            issue("invalid_line_time", "error", "Line start/end is not numeric.", line_idx)
+            continue
+
+        line_duration = max(0.0, line_end - line_start)
+        report["metrics"]["max_line_duration"] = round(
+            max(report["metrics"]["max_line_duration"], line_duration), 3
+        )
+        if line_duration > 9.0:
+            report["metrics"]["long_lines"] += 1
+            issue(
+                "long_line",
+                "warning",
+                "Line duration is unusually long.",
+                line_idx,
+                duration=round(line_duration, 3),
+            )
+
+        if previous_line_end is not None and line_start < previous_line_end - 0.03:
+            report["metrics"]["line_overlaps"] += 1
+            issue(
+                "line_overlap",
+                "error",
+                "Line starts before the previous line ends.",
+                line_idx,
+                overlap=round(previous_line_end - line_start, 3),
+            )
+        previous_line_end = max(previous_line_end or 0.0, line_end)
+
+        if audio_duration and (line_start < -0.05 or line_end > float(audio_duration) + 0.5):
+            report["metrics"]["out_of_bounds"] += 1
+            issue(
+                "line_out_of_bounds",
+                "warning",
+                "Line extends outside the audio duration.",
+                line_idx,
+                start=round(line_start, 3),
+                end=round(line_end, 3),
+            )
+
+        previous_word_end = None
+        for word_idx, word in enumerate(words):
+            try:
+                start = float(word.get("start", 0.0))
+                end = float(word.get("end", start))
+            except Exception:
+                report["metrics"]["zero_or_tiny_words"] += 1
+                issue("invalid_word_time", "error", "Word start/end is not numeric.", line_idx, word_idx)
+                continue
+
+            duration = end - start
+            report["metrics"]["max_word_duration"] = round(
+                max(report["metrics"]["max_word_duration"], max(0.0, duration)), 3
+            )
+            if duration <= 0.04:
+                report["metrics"]["zero_or_tiny_words"] += 1
+                issue(
+                    "tiny_word",
+                    "warning",
+                    "Word duration is too short for reliable highlighting.",
+                    line_idx,
+                    word_idx,
+                    duration=round(duration, 3),
+                )
+            elif duration > 2.8:
+                report["metrics"]["long_words"] += 1
+                issue(
+                    "long_word",
+                    "warning",
+                    "Word duration is unusually long.",
+                    line_idx,
+                    word_idx,
+                    duration=round(duration, 3),
+                )
+
+            if previous_word_end is not None:
+                gap = start - previous_word_end
+                report["metrics"]["max_internal_gap"] = round(
+                    max(report["metrics"]["max_internal_gap"], max(0.0, gap)), 3
+                )
+                if start < previous_word_end - 0.02:
+                    report["metrics"]["word_overlaps"] += 1
+                    issue(
+                        "word_overlap",
+                        "error",
+                        "Word starts before the previous word ends.",
+                        line_idx,
+                        word_idx,
+                        overlap=round(previous_word_end - start, 3),
+                    )
+                elif gap > 2.5:
+                    report["metrics"]["large_internal_gaps"] += 1
+                    issue(
+                        "large_internal_gap",
+                        "warning",
+                        "Large pause inside one lyric line.",
+                        line_idx,
+                        word_idx,
+                        gap=round(gap, 3),
+                    )
+            previous_word_end = max(previous_word_end or 0.0, end)
+
+    penalty = (
+        report["metrics"]["line_overlaps"] * 0.16
+        + report["metrics"]["word_overlaps"] * 0.10
+        + report["metrics"]["zero_or_tiny_words"] * 0.025
+        + report["metrics"]["long_words"] * 0.025
+        + report["metrics"]["large_internal_gaps"] * 0.04
+        + report["metrics"]["long_lines"] * 0.035
+        + report["metrics"]["out_of_bounds"] * 0.04
+        + report["metrics"]["empty_lines"] * 0.04
+    )
+
+    if text_match is not None:
+        try:
+            text_score = float(text_match.get("score", text_match))
+        except Exception:
+            text_score = None
+        if text_score is not None:
+            text_score = max(0.0, min(1.0, text_score))
+            report["metrics"]["text_match_score"] = round(text_score, 3)
+            report["text_match"] = text_match if isinstance(text_match, dict) else {"score": text_score}
+            if text_score < 0.35:
+                penalty += 0.55
+                issue(
+                    "text_mismatch",
+                    "error",
+                    "Lyrics text poorly matches recognized vocal.",
+                    score=round(text_score, 3),
+                )
+            elif text_score < 0.55:
+                penalty += 0.28
+                issue(
+                    "text_mismatch",
+                    "warning",
+                    "Lyrics text weakly matches recognized vocal.",
+                    score=round(text_score, 3),
+                )
+            elif text_score < 0.72:
+                penalty += 0.12
+                issue(
+                    "text_match_low",
+                    "warning",
+                    "Lyrics text partially matches recognized vocal.",
+                    score=round(text_score, 3),
+                )
+
+    report["score"] = round(max(0.0, 1.0 - penalty), 3)
+    if any(item["severity"] == "error" for item in report["issues"]):
+        report["summary"] = "needs_repair"
+    elif report["score"] < 0.82:
+        report["summary"] = "suspicious"
+    elif report["issues"]:
+        report["summary"] = "minor_warnings"
+    return report
+
+
 def timestamped_whisper_probe_decision(timestamped_karaoke, whisper_words, close_avg_limit=0.35, close_max_limit=0.65, shift_spread_limit=0.45, max_shift=3.0):
     if not timestamped_karaoke or not whisper_words:
         return {"action": "whisper", "shift": 0.0, "reason": "нет данных для сравнения"}

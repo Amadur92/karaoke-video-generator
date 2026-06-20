@@ -798,8 +798,7 @@ fn write_ass_file(
                 1.0
             };
             let is_display_active = idx == active_idx;
-            let is_highlight_live = !plain_lines
-                && (is_display_active || ass_line_highlight_is_live(metric, highlight_t));
+            let is_highlight_live = !plain_lines && ass_line_highlight_is_live(metric, highlight_t);
             let is_active_for_event = if plain_lines {
                 is_display_active
             } else {
@@ -1253,8 +1252,8 @@ fn render(config: RenderConfig) -> Result<(), String> {
                 1.0
             };
             let is_display_active = idx == active_idx;
-            let is_highlight_live = !config.plain_lines
-                && (is_display_active || line_highlight_is_live(&line_cache.words, highlight_t));
+            let is_highlight_live =
+                !config.plain_lines && line_highlight_is_live(&line_cache.words, highlight_t);
 
             let is_cacheable = !(is_highlight_live || config.plain_lines && is_display_active);
 

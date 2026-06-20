@@ -3,6 +3,7 @@
 mod ffmpeg;
 mod lyrics;
 mod paths;
+mod pptx_optimizer;
 
 use eframe::egui;
 use rodio::Source;
@@ -125,10 +126,29 @@ fn open_in_explorer(path: &std::path::Path) {
     }
 }
 
+fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).status();
+    }
+}
+
 fn scan_batch_folder(
     root: &Path,
     fade_in_ms: i32,
     fade_out_ms: i32,
+    plain_lines: bool,
 ) -> (Vec<BatchItem>, Vec<String>) {
     let mut folders = Vec::new();
     let mut warnings = Vec::new();
@@ -194,7 +214,7 @@ fn scan_batch_folder(
                     (PathBuf::new(), BatchStatus::MissingLyrics)
                 }
             };
-            items.push(BatchItem {
+            let mut item = BatchItem {
                 folder: folder.clone(),
                 audio_path,
                 lyrics_path,
@@ -208,11 +228,63 @@ fn scan_batch_folder(
                 status,
                 progress: 0.0,
                 output_path: None,
-            });
+                alignment_quality: None,
+                audit: None,
+            };
+            refresh_batch_item_audit(&mut item, plain_lines);
+            items.push(item);
         }
     }
 
     (items, warnings)
+}
+
+fn alignment_report_path_for_timings(timings_path: &Path) -> PathBuf {
+    let stem = timings_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    timings_path.with_file_name(format!("{}_alignment_report.json", stem))
+}
+
+fn suspicious_source_markers(value: &str) -> Vec<&'static str> {
+    let lower = value.to_lowercase();
+    let markers = [
+        ("live", "live"),
+        ("concert", "concert"),
+        ("remix", "remix"),
+        ("cover", "cover"),
+        ("karaoke", "karaoke"),
+        ("instrumental", "instrumental"),
+        ("slowed", "slowed"),
+        ("speed up", "speed up"),
+        ("sped up", "sped up"),
+        ("nightcore", "nightcore"),
+        ("version", "version"),
+        ("версия", "версия"),
+        ("концерт", "концерт"),
+        ("кавер", "кавер"),
+        ("ремикс", "ремикс"),
+    ];
+    markers
+        .iter()
+        .filter_map(|(needle, label)| lower.contains(needle).then_some(*label))
+        .collect()
+}
+
+fn refresh_batch_item_audit(item: &mut BatchItem, plain_lines: bool) {
+    let audit = PackageAudit::from_item(item, plain_lines);
+    if let Some(path) = audit.detected_output_path.clone() {
+        item.output_path = Some(path.to_string_lossy().to_string());
+        if item.status == BatchStatus::Ready && audit.level != AuditLevel::Error {
+            item.status = BatchStatus::Done;
+        }
+    }
+    if item.alignment_quality.is_none() {
+        item.alignment_quality = audit.detected_alignment.clone();
+    }
+    item.audit = Some(audit);
 }
 
 fn safe_output_filename(value: &str) -> String {
@@ -226,6 +298,41 @@ fn batch_timings_path(audio_path: &Path) -> PathBuf {
         .to_string_lossy()
         .to_string();
     audio_path.with_file_name(format!("{}_timings.json", stem))
+}
+
+fn batch_item_trim_window(item: &BatchItem) -> (i64, i64, bool) {
+    let start = item
+        .trim_start_ms
+        .clamp(0, item.duration_ms.saturating_sub(1000));
+    let end = item.trim_end_ms.clamp(start + 1000, item.duration_ms);
+    let should_trim = start > 0
+        || end < item.duration_ms.saturating_sub(250)
+        || item.fade_in_ms > 0
+        || item.fade_out_ms > 0;
+    (start, end, should_trim)
+}
+
+fn batch_timings_path_for_item(item: &BatchItem) -> PathBuf {
+    let (_, _, should_trim) = batch_item_trim_window(item);
+    if !should_trim {
+        return batch_timings_path(&item.audio_path);
+    }
+
+    let stem = item
+        .audio_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let (start, end, _) = batch_item_trim_window(item);
+    item.audio_path.with_file_name(format!(
+        "{}_trim_{}-{}_fi{}_fo{}_timings.json",
+        stem,
+        start.max(0),
+        end.max(start + 1000),
+        item.fade_in_ms.max(0),
+        item.fade_out_ms.max(0)
+    ))
 }
 
 fn karaoke_output_suffix(plain_lines: bool) -> &'static str {
@@ -279,6 +386,7 @@ struct AppSettings {
     plain_lines: bool,
     verify_lrc_with_whisper: bool,
     separate_vocals_for_word_level: bool,
+    batch_overwrite_timings: bool,
 }
 
 impl Default for AppSettings {
@@ -300,6 +408,7 @@ impl Default for AppSettings {
             plain_lines: false,
             verify_lrc_with_whisper: false,
             separate_vocals_for_word_level: false,
+            batch_overwrite_timings: false,
         }
     }
 }
@@ -314,6 +423,12 @@ struct CLIProgress {
     file: Option<String>,
     #[serde(default)]
     batch_align_index: Option<usize>,
+    #[serde(default)]
+    alignment_report_file: Option<String>,
+    #[serde(default)]
+    alignment_score: Option<f32>,
+    #[serde(default)]
+    alignment_summary: Option<String>,
 }
 
 enum ProgressUpdate {
@@ -324,11 +439,32 @@ enum ProgressUpdate {
         progress: f32,
         message: String,
         output_path: Option<String>,
+        alignment: Option<AlignmentQuality>,
     },
     RawLog(String),
     Error(String),
     Finished(bool),
     BatchFinished,
+}
+
+enum PptxOptimizeUpdate {
+    Log(String),
+    Plan {
+        total: usize,
+        remaining: usize,
+    },
+    Done {
+        index: usize,
+        total: usize,
+        message: String,
+    },
+    Summary {
+        output_mb: f32,
+        mp4_mb: f32,
+        mp4_count: usize,
+        bad: Option<String>,
+    },
+    Finished(Result<(), String>),
 }
 
 struct VideoFrame {
@@ -354,6 +490,287 @@ enum BatchStatus {
 }
 
 #[derive(Clone, Debug)]
+struct AlignmentQuality {
+    summary: String,
+    score: Option<f32>,
+    report_path: Option<String>,
+}
+
+impl AlignmentQuality {
+    fn from_progress(progress: &CLIProgress) -> Option<Self> {
+        let summary = progress
+            .alignment_summary
+            .clone()
+            .or_else(|| progress.alignment_score.map(summary_from_score))?;
+        Some(Self {
+            summary,
+            score: progress.alignment_score,
+            report_path: progress.alignment_report_file.clone(),
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        match self.summary.as_str() {
+            "ok" => "OK",
+            "minor_warnings" => "есть замечания",
+            "suspicious" => "проверить",
+            "needs_repair" => "нужна правка",
+            _ => "качество",
+        }
+    }
+
+    fn color(&self) -> egui::Color32 {
+        match self.summary.as_str() {
+            "ok" => egui::Color32::from_rgb(54, 211, 153),
+            "minor_warnings" => egui::Color32::from_rgb(246, 181, 70),
+            "suspicious" => egui::Color32::from_rgb(255, 137, 86),
+            "needs_repair" => egui::Color32::from_rgb(255, 100, 100),
+            _ => egui::Color32::from_rgb(142, 153, 175),
+        }
+    }
+
+    fn icon(&self) -> &'static str {
+        match self.summary.as_str() {
+            "ok" => "✓",
+            "minor_warnings" => "!",
+            "suspicious" => "?",
+            "needs_repair" => "!",
+            _ => "i",
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        let mut text = format!("Качество таймингов: {}", self.label());
+        if let Some(score) = self.score {
+            text.push_str(&format!("\nScore: {:.2}", score));
+        }
+        if let Some(path) = &self.report_path {
+            text.push_str(&format!("\nОтчёт: {}", path));
+        }
+        text
+    }
+
+    fn log_text(&self) -> String {
+        let mut text = format!("Качество таймингов: {}", self.label());
+        if let Some(score) = self.score {
+            text.push_str(&format!(" ({:.2})", score));
+        }
+        if let Some(path) = &self.report_path {
+            text.push_str(&format!(" — {}", path));
+        }
+        text
+    }
+}
+
+fn summary_from_score(score: f32) -> String {
+    if score >= 0.98 {
+        "ok"
+    } else if score >= 0.85 {
+        "minor_warnings"
+    } else if score >= 0.55 {
+        "suspicious"
+    } else {
+        "needs_repair"
+    }
+    .to_string()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditLevel {
+    Ok,
+    Notice,
+    Warning,
+    Error,
+}
+
+impl AuditLevel {
+    fn color(self) -> egui::Color32 {
+        match self {
+            AuditLevel::Ok => egui::Color32::from_rgb(54, 211, 153),
+            AuditLevel::Notice => egui::Color32::from_rgb(142, 153, 175),
+            AuditLevel::Warning => egui::Color32::from_rgb(246, 181, 70),
+            AuditLevel::Error => egui::Color32::from_rgb(255, 100, 100),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AuditLevel::Ok => "OK",
+            AuditLevel::Notice => "не готово",
+            AuditLevel::Warning => "проверить",
+            AuditLevel::Error => "ошибка",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackageAudit {
+    level: AuditLevel,
+    summary: String,
+    issues: Vec<String>,
+    detected_output_path: Option<PathBuf>,
+    detected_alignment: Option<AlignmentQuality>,
+}
+
+impl PackageAudit {
+    fn from_item(item: &BatchItem, plain_lines: bool) -> Self {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut notices = Vec::new();
+        let mut detected_output_path = None;
+        let mut detected_alignment = None;
+
+        if item.status == BatchStatus::MissingLyrics || item.lyrics_path.as_os_str().is_empty() {
+            errors.push("нет файла текста .txt/.lrc".to_string());
+        } else if let Ok(meta) = std::fs::metadata(&item.lyrics_path)
+            && meta.len() < 16
+        {
+            warnings.push("файл текста выглядит пустым".to_string());
+        }
+
+        if item.duration_ms < 45_000 {
+            warnings.push(format!(
+                "очень короткое аудио: {}",
+                ffmpeg::format_time_ms(item.duration_ms)
+            ));
+        } else if item.duration_ms > 9 * 60_000 {
+            warnings.push(format!(
+                "очень длинное аудио: {}",
+                ffmpeg::format_time_ms(item.duration_ms)
+            ));
+        }
+
+        let file_name = lyrics::display_file_name(&item.audio_path);
+        let markers = suspicious_source_markers(&file_name);
+        if !markers.is_empty() {
+            warnings.push(format!(
+                "подозрительные слова в имени аудио: {}",
+                markers.join(", ")
+            ));
+        }
+
+        let timings_path = batch_timings_path_for_item(item);
+        let report_path = alignment_report_path_for_timings(&timings_path);
+        if report_path.exists() {
+            match read_alignment_quality_from_report(&report_path) {
+                Some(quality) => {
+                    match quality.summary.as_str() {
+                        "needs_repair" => errors.push("отчёт таймингов: нужна правка".to_string()),
+                        "suspicious" => warnings.push("отчёт таймингов: проверить".to_string()),
+                        "minor_warnings" => {
+                            warnings.push("отчёт таймингов: есть мелкие замечания".to_string())
+                        }
+                        _ => {}
+                    }
+                    detected_alignment = Some(quality);
+                }
+                None => warnings.push("отчёт таймингов не удалось прочитать".to_string()),
+            }
+        } else if timings_path.exists() {
+            warnings.push("тайминги есть, но отчёт качества отсутствует".to_string());
+        }
+
+        let expected_output = batch_output_path(item, plain_lines);
+        if expected_output.exists() {
+            detected_output_path = Some(expected_output.clone());
+            match ffmpeg::probe_audio_duration_ms(&expected_output.to_string_lossy()) {
+                Ok(video_duration_ms) => {
+                    let (start, end, should_trim) = batch_item_trim_window(item);
+                    let expected_duration_ms = if should_trim {
+                        (end - start).max(1)
+                    } else {
+                        item.duration_ms
+                    };
+                    let diff_ms = (video_duration_ms - expected_duration_ms).abs();
+                    if diff_ms > 2_500 {
+                        warnings.push(format!(
+                            "длительность видео отличается от аудио на {}",
+                            ffmpeg::format_time_ms(diff_ms)
+                        ));
+                    }
+                }
+                Err(err) => errors.push(format!("готовое видео не читается: {err}")),
+            }
+        } else if matches!(item.status, BatchStatus::Done) || item.output_path.is_some() {
+            errors.push("статус готово, но видео не найдено".to_string());
+        } else {
+            notices.push("готовое видео ещё не создано".to_string());
+        }
+
+        let (level, issues) = if !errors.is_empty() {
+            let mut all = errors;
+            all.extend(warnings);
+            all.extend(notices);
+            (AuditLevel::Error, all)
+        } else if !warnings.is_empty() {
+            let mut all = warnings;
+            all.extend(notices);
+            (AuditLevel::Warning, all)
+        } else if !notices.is_empty() {
+            (AuditLevel::Notice, notices)
+        } else {
+            (AuditLevel::Ok, Vec::new())
+        };
+
+        let summary = if issues.is_empty() {
+            "Пакет выглядит готовым".to_string()
+        } else {
+            issues[0].clone()
+        };
+
+        Self {
+            level,
+            summary,
+            issues,
+            detected_output_path,
+            detected_alignment,
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        if self.issues.is_empty() {
+            return self.summary.clone();
+        }
+        self.issues.join("\n")
+    }
+}
+
+fn read_alignment_quality_from_report(path: &Path) -> Option<AlignmentQuality> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let score = value
+        .get("score")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+    let summary = value
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| score.map(summary_from_score))?;
+    Some(AlignmentQuality {
+        summary,
+        score,
+        report_path: Some(path.to_string_lossy().to_string()),
+    })
+}
+
+fn batch_audit_counts(items: &[BatchItem]) -> (usize, usize, usize, usize) {
+    let mut ok = 0;
+    let mut notice = 0;
+    let mut warning = 0;
+    let mut error = 0;
+    for item in items {
+        match item.audit.as_ref().map(|audit| audit.level) {
+            Some(AuditLevel::Ok) => ok += 1,
+            Some(AuditLevel::Notice) | None => notice += 1,
+            Some(AuditLevel::Warning) => warning += 1,
+            Some(AuditLevel::Error) => error += 1,
+        }
+    }
+    (ok, notice, warning, error)
+}
+
+#[derive(Clone, Debug)]
 struct BatchItem {
     folder: PathBuf,
     audio_path: PathBuf,
@@ -368,6 +785,8 @@ struct BatchItem {
     status: BatchStatus,
     progress: f32,
     output_path: Option<String>,
+    alignment_quality: Option<AlignmentQuality>,
+    audit: Option<PackageAudit>,
 }
 
 fn batch_trim_timeline_static_ui(
@@ -492,6 +911,7 @@ enum ActiveTab {
     SingleTrack,
     Batch,
     Downloader,
+    PptxOptimizer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -500,6 +920,7 @@ pub enum TrackStatus {
     Pending,
     Downloading,
     Success,
+    Warning,
     Failed,
     Skipped,
 }
@@ -513,6 +934,8 @@ pub struct TrackItem {
     pub selected: bool,
     #[serde(skip)]
     pub status: TrackStatus,
+    #[serde(default, skip_serializing)]
+    pub quality_note: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -525,6 +948,98 @@ struct BatchScanResult {
     warnings: Vec<String>,
     folder_count: usize,
     first_folder_name: String,
+}
+
+fn find_main_pptx_in_package(folder: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    let entries = std::fs::read_dir(folder).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_pptx = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("pptx"))
+            .unwrap_or(false);
+        if !is_pptx {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if name.starts_with("~$")
+            || name.contains("оптимизирован")
+            || name.contains("optimized")
+            || name.ends_with(".tmp")
+        {
+            continue;
+        }
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        candidates.push((size, path));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().map(|(_, path)| path).next()
+}
+
+fn find_pptx_replacement_media_dirs(folder: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::<(i32, PathBuf)>::new();
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if !name.contains("трек") {
+            continue;
+        }
+        let mp4_count = std::fs::read_dir(&path)
+            .ok()
+            .map(|files| {
+                files
+                    .flatten()
+                    .filter(|file| {
+                        let file_name = file.file_name().to_string_lossy().to_lowercase();
+                        file_name.starts_with("media") && file_name.ends_with(".mp4")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if mp4_count > 0 {
+            let priority = if name.contains("исправ") { 1 } else { 0 };
+            candidates.push((priority, path));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.into_iter().map(|(_, path)| path).collect()
+}
+
+fn optimized_pptx_output_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    input.with_file_name(format!("{stem} - оптимизированная 1352.pptx"))
+}
+
+fn format_file_size(bytes: u64) -> String {
+    let mb = bytes as f64 / 1024.0 / 1024.0;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{:.0} MB", mb)
+    }
 }
 
 struct KaraokeApp {
@@ -582,6 +1097,7 @@ struct KaraokeApp {
     plain_lines: bool,
     verify_lrc_with_whisper: bool,
     separate_vocals_for_word_level: bool,
+    batch_overwrite_timings: bool,
     batch_root: Option<PathBuf>,
     batch_items: Vec<BatchItem>,
     batch_running: bool,
@@ -613,6 +1129,15 @@ struct KaraokeApp {
     dl_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
     batch_start_time: Option<Instant>,
     dl_start_time: Option<Instant>,
+    pptx_package_dir: Option<PathBuf>,
+    pptx_input_path: Option<PathBuf>,
+    pptx_output_path: Option<PathBuf>,
+    pptx_is_running: bool,
+    pptx_progress: f32,
+    pptx_status_text: String,
+    pptx_log_output: String,
+    pptx_rx: Option<Receiver<PptxOptimizeUpdate>>,
+    pptx_start_time: Option<Instant>,
 }
 
 impl KaraokeApp {
@@ -722,6 +1247,7 @@ impl KaraokeApp {
             plain_lines: settings.plain_lines,
             verify_lrc_with_whisper: settings.verify_lrc_with_whisper,
             separate_vocals_for_word_level: settings.separate_vocals_for_word_level,
+            batch_overwrite_timings: settings.batch_overwrite_timings,
             batch_root: None,
             batch_items: Vec::new(),
             batch_running: false,
@@ -753,6 +1279,15 @@ impl KaraokeApp {
             dl_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
             batch_start_time: None,
             dl_start_time: None,
+            pptx_package_dir: None,
+            pptx_input_path: None,
+            pptx_output_path: None,
+            pptx_is_running: false,
+            pptx_progress: 0.0,
+            pptx_status_text: "Готов".to_string(),
+            pptx_log_output: String::new(),
+            pptx_rx: None,
+            pptx_start_time: None,
         }
     }
 
@@ -1126,6 +1661,24 @@ impl KaraokeApp {
             return;
         }
 
+        if self.active_tab == ActiveTab::PptxOptimizer {
+            if path.is_dir() {
+                self.select_pptx_package_folder(path);
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("pptx"))
+                .unwrap_or(false)
+            {
+                self.pptx_package_dir = path.parent().map(|parent| parent.to_path_buf());
+                self.pptx_input_path = Some(path.clone());
+                self.pptx_output_path = Some(optimized_pptx_output_path(&path));
+                self.pptx_status_text =
+                    format!("Выбрана презентация: {}", lyrics::display_file_name(&path));
+            }
+            return;
+        }
+
         if path.is_dir() {
             self.load_batch_folder(path, ctx);
         } else if lyrics::is_audio_file(&path) {
@@ -1163,10 +1716,11 @@ impl KaraokeApp {
 
         let fade_in = self.fade_in_ms;
         let fade_out = self.fade_out_ms;
+        let plain_lines = self.plain_lines;
         let ctx_clone = ctx.clone();
 
         std::thread::spawn(move || {
-            let (items, warnings) = scan_batch_folder(&path, fade_in, fade_out);
+            let (items, warnings) = scan_batch_folder(&path, fade_in, fade_out, plain_lines);
             let first_folder_name = lyrics::display_file_name(&path);
             let _ = tx.send(BatchScanResult {
                 root: Some(path),
@@ -1191,6 +1745,7 @@ impl KaraokeApp {
 
         let fade_in = self.fade_in_ms;
         let fade_out = self.fade_out_ms;
+        let plain_lines = self.plain_lines;
         let ctx_clone = ctx.clone();
 
         std::thread::spawn(move || {
@@ -1198,7 +1753,7 @@ impl KaraokeApp {
             let mut warnings = Vec::new();
             for path in &paths {
                 let (mut folder_items, mut folder_warnings) =
-                    scan_batch_folder(path, fade_in, fade_out);
+                    scan_batch_folder(path, fade_in, fade_out, plain_lines);
                 items.append(&mut folder_items);
                 warnings.append(&mut folder_warnings);
             }
@@ -1217,6 +1772,122 @@ impl KaraokeApp {
                 first_folder_name,
             });
             ctx_clone.request_repaint();
+        });
+    }
+
+    fn select_pptx_package_folder(&mut self, path: PathBuf) {
+        self.pptx_package_dir = Some(path.clone());
+        self.pptx_input_path = find_main_pptx_in_package(&path);
+        self.pptx_output_path = self
+            .pptx_input_path
+            .as_deref()
+            .map(optimized_pptx_output_path);
+        self.pptx_progress = 0.0;
+        self.pptx_status_text = match &self.pptx_input_path {
+            Some(input) => format!("Найдена презентация: {}", lyrics::display_file_name(input)),
+            None => "В папке не найден основной .pptx".to_string(),
+        };
+        self.pptx_log_output.push_str(&format!(
+            "📁 Папка презентации: {}\n",
+            path.to_string_lossy()
+        ));
+        if let Some(input) = &self.pptx_input_path {
+            let size = std::fs::metadata(input)
+                .map(|meta| format_file_size(meta.len()))
+                .unwrap_or_else(|_| "?".to_string());
+            self.pptx_log_output.push_str(&format!(
+                "📊 Исходная презентация: {} ({})\n",
+                input.to_string_lossy(),
+                size
+            ));
+        }
+    }
+
+    fn start_pptx_optimization(&mut self, ctx: egui::Context) {
+        if self.pptx_is_running {
+            return;
+        }
+        let Some(input) = self.pptx_input_path.clone() else {
+            self.pptx_status_text = "Сначала выберите папку с презентацией".to_string();
+            return;
+        };
+        let output = self
+            .pptx_output_path
+            .clone()
+            .unwrap_or_else(|| optimized_pptx_output_path(&input));
+        let work_dir = output
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("_pptx_optimize_1352");
+
+        let (tx, rx) = channel::<PptxOptimizeUpdate>();
+        self.pptx_rx = Some(rx);
+        self.pptx_is_running = true;
+        self.pptx_progress = 0.0;
+        self.pptx_status_text = "Оптимизация презентации...".to_string();
+        self.pptx_start_time = Some(Instant::now());
+        self.pptx_log_output.push_str(&format!(
+            "🚀 Оптимизация PPTX: {}\n",
+            input.to_string_lossy()
+        ));
+        let replacement_media_dirs = input
+            .parent()
+            .map(find_pptx_replacement_media_dirs)
+            .unwrap_or_default();
+        if !replacement_media_dirs.is_empty() {
+            self.pptx_log_output.push_str(&format!(
+                "⚡ Быстрая замена из папок: {}\n",
+                replacement_media_dirs
+                    .iter()
+                    .map(|path| lyrics::display_file_name(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        std::thread::spawn(move || {
+            let config = pptx_optimizer::OptimizerConfig {
+                input,
+                output,
+                work_dir,
+                replacement_media_dirs,
+                width: 1352,
+                crf: 20,
+                preset: "veryfast".to_string(),
+                audio_bitrate: "96k".to_string(),
+                workers: 2,
+            };
+            let tx_events = tx.clone();
+            let ctx_events = ctx.clone();
+            let result = pptx_optimizer::optimize_pptx(config, move |event| {
+                let update = match event {
+                    pptx_optimizer::OptimizerEvent::Plan { total, remaining } => {
+                        PptxOptimizeUpdate::Plan { total, remaining }
+                    }
+                    pptx_optimizer::OptimizerEvent::Done {
+                        index,
+                        total,
+                        message,
+                    } => PptxOptimizeUpdate::Done {
+                        index,
+                        total,
+                        message,
+                    },
+                    pptx_optimizer::OptimizerEvent::Log(line) => PptxOptimizeUpdate::Log(line),
+                    pptx_optimizer::OptimizerEvent::Summary(summary) => {
+                        PptxOptimizeUpdate::Summary {
+                            output_mb: summary.output_mb,
+                            mp4_mb: summary.mp4_mb,
+                            mp4_count: summary.mp4_count,
+                            bad: None,
+                        }
+                    }
+                };
+                let _ = tx_events.send(update);
+                ctx_events.request_repaint();
+            });
+            let _ = tx.send(PptxOptimizeUpdate::Finished(result));
+            ctx.request_repaint();
         });
     }
 
@@ -1353,6 +2024,7 @@ impl KaraokeApp {
                     if continue_only {
                         t.selected
                             && t.status != TrackStatus::Success
+                            && t.status != TrackStatus::Warning
                             && t.status != TrackStatus::Skipped
                     } else {
                         t.selected
@@ -1374,13 +2046,16 @@ impl KaraokeApp {
                 if continue_only {
                     if t.selected
                         && t.status != TrackStatus::Success
+                        && t.status != TrackStatus::Warning
                         && t.status != TrackStatus::Skipped
                     {
                         t.status = TrackStatus::Pending;
+                        t.quality_note = None;
                     }
                 } else {
                     if t.selected {
                         t.status = TrackStatus::Pending;
+                        t.quality_note = None;
                     }
                 }
             }
@@ -1598,7 +2273,14 @@ impl KaraokeApp {
             item.progress = 0.0;
             item.output_path = None;
             item.status = BatchStatus::Ready;
-            let _ = std::fs::remove_file(batch_timings_path(&item.audio_path));
+            if self.batch_overwrite_timings {
+                let timings_path = batch_timings_path_for_item(item);
+                let _ = std::fs::remove_file(&timings_path);
+                let default_timings_path = batch_timings_path(&item.audio_path);
+                if default_timings_path != timings_path {
+                    let _ = std::fs::remove_file(default_timings_path);
+                }
+            }
         }
         self.start_batch_pipeline(ctx, false);
     }
@@ -1613,7 +2295,7 @@ impl KaraokeApp {
             }
             item.progress = 0.0;
             item.output_path = None;
-            item.status = if batch_timings_path(&item.audio_path).exists() {
+            item.status = if batch_timings_path_for_item(item).exists() {
                 BatchStatus::ReadyToRender
             } else {
                 BatchStatus::Ready
@@ -1730,19 +2412,12 @@ impl KaraokeApp {
 
                 let item_temp = temp.join(format!("{:03}", idx + 1));
                 let _ = std::fs::create_dir_all(&item_temp);
-                let timings_path = batch_timings_path(&item.audio_path);
+                let timings_path = batch_timings_path_for_item(item);
                 let mut render_audio_path = item.audio_path.clone();
-                let mut lyrics_text =
+                let lyrics_text =
                     std::fs::read_to_string(&item.lyrics_path).unwrap_or_else(|_| String::new());
 
-                let start = item
-                    .trim_start_ms
-                    .clamp(0, item.duration_ms.saturating_sub(1000));
-                let end = item.trim_end_ms.clamp(start + 1000, item.duration_ms);
-                let should_trim = start > 0
-                    || end < item.duration_ms.saturating_sub(250)
-                    || item.fade_in_ms > 0
-                    || item.fade_out_ms > 0;
+                let (start, end, should_trim) = batch_item_trim_window(item);
 
                 if should_trim {
                     let trimmed_path = item_temp.join("audio.wav");
@@ -1755,11 +2430,6 @@ impl KaraokeApp {
                         &trimmed_path,
                     ) {
                         Ok(()) => {
-                            lyrics_text = lyrics::shift_lrc_for_trim(
-                                &lyrics_text,
-                                start,
-                                end.saturating_sub(start),
-                            );
                             render_audio_path = trimmed_path;
                         }
                         Err(err) => {
@@ -1769,6 +2439,7 @@ impl KaraokeApp {
                                 progress: 0.0,
                                 message: err,
                                 output_path: None,
+                                alignment: None,
                             });
                             continue;
                         }
@@ -1784,6 +2455,7 @@ impl KaraokeApp {
                         progress: 0.0,
                         message,
                         output_path: None,
+                        alignment: None,
                     });
                     continue;
                 }
@@ -1795,6 +2467,7 @@ impl KaraokeApp {
                         progress: 1.0,
                         message: "Тайминги уже есть, Whisper пропущен.".to_string(),
                         output_path: None,
+                        alignment: None,
                     });
                 } else {
                     align_queue.push(AlignQueueEntry {
@@ -1933,12 +2606,14 @@ impl KaraokeApp {
                                     } else {
                                         BatchStatus::Aligning
                                     };
+                                    let alignment = AlignmentQuality::from_progress(&update);
                                     let _ = tx.send(ProgressUpdate::BatchProgress {
                                         index,
                                         status,
                                         progress: update.progress.clamp(0.0, 1.0),
                                         message: update.status,
                                         output_path: None,
+                                        alignment,
                                     });
                                     ctx.request_repaint();
                                     continue;
@@ -1991,6 +2666,7 @@ impl KaraokeApp {
                         progress: 0.0,
                         message: "Нет файла таймингов".to_string(),
                         output_path: None,
+                        alignment: None,
                     });
                     continue;
                 }
@@ -2001,6 +2677,7 @@ impl KaraokeApp {
                     progress: 0.0,
                     message: "Рендеринг".to_string(),
                     output_path: None,
+                    alignment: None,
                 });
 
                 let mut render_cmd = std::process::Command::new(&renderer_path);
@@ -2077,6 +2754,7 @@ impl KaraokeApp {
                                             (progress * 100.0).round() as i32
                                         ),
                                         output_path: None,
+                                        alignment: None,
                                     });
                                     ctx.request_repaint();
                                     continue;
@@ -2101,6 +2779,7 @@ impl KaraokeApp {
                                 progress: 1.0,
                                 message: "Готово".to_string(),
                                 output_path: Some(output),
+                                alignment: None,
                             });
                         } else if !cancel.load(Ordering::Relaxed) {
                             let _ = tx.send(ProgressUpdate::BatchProgress {
@@ -2111,6 +2790,7 @@ impl KaraokeApp {
                                 progress: 0.0,
                                 message: "Rust-рендер завершился с ошибкой".to_string(),
                                 output_path: None,
+                                alignment: None,
                             });
                         }
                     }
@@ -2122,6 +2802,7 @@ impl KaraokeApp {
                             progress: 0.0,
                             message,
                             output_path: None,
+                            alignment: None,
                         });
                     }
                 }
@@ -2225,6 +2906,7 @@ impl KaraokeApp {
                     error.unwrap_or_else(|| "Процесс завершился с ошибкой".to_string()),
                 )
             };
+            refresh_batch_item_audit(item, self.plain_lines);
         }
         self.is_generating = false;
         if self.batch_single_mode {
@@ -2770,7 +3452,6 @@ impl KaraokeApp {
             ));
             ctx.request_repaint();
 
-            let mut trim_for_lyrics: Option<(i64, i64)> = None;
             let worker_audio_path = if let Some((start, end)) = trim_bounds {
                 let should_trim = start > 0
                     || ffmpeg::probe_audio_duration_ms(&audio_path)
@@ -2798,10 +3479,7 @@ impl KaraokeApp {
                         fade_out_ms as i64,
                         &trimmed_path,
                     ) {
-                        Ok(()) => {
-                            trim_for_lyrics = Some((start, end.saturating_sub(start)));
-                            trimmed_path.to_string_lossy().to_string()
-                        }
+                        Ok(()) => trimmed_path.to_string_lossy().to_string(),
                         Err(err) => {
                             let _ = tx.send(ProgressUpdate::Error(err));
                             ctx.request_repaint();
@@ -2815,10 +3493,7 @@ impl KaraokeApp {
                 audio_path.clone()
             };
 
-            let lyrics_for_worker = trim_for_lyrics
-                .map(|(start, duration)| lyrics::shift_lrc_for_trim(&lyrics, start, duration))
-                .unwrap_or(lyrics);
-            if let Err(e) = std::fs::write(&temp_lyrics_path, &lyrics_for_worker) {
+            if let Err(e) = std::fs::write(&temp_lyrics_path, &lyrics) {
                 let _ = tx.send(ProgressUpdate::Error(format!(
                     "Не удалось записать временный файл текста: {}",
                     e
@@ -2971,6 +3646,9 @@ impl KaraokeApp {
                     error: None,
                     file: None,
                     batch_align_index: None,
+                    alignment_report_file: None,
+                    alignment_score: None,
+                    alignment_summary: None,
                 }));
                 let _ = tx.send(ProgressUpdate::RawLog(format!(
                     "🎬 Rust-рендер: {}",
@@ -3050,6 +3728,9 @@ impl KaraokeApp {
                                         error: None,
                                         file: None,
                                         batch_align_index: None,
+                                        alignment_report_file: None,
+                                        alignment_score: None,
+                                        alignment_summary: None,
                                     }));
                                     ctx.request_repaint();
                                     continue;
@@ -3068,6 +3749,9 @@ impl KaraokeApp {
                                             error: None,
                                             file: None,
                                             batch_align_index: None,
+                                            alignment_report_file: None,
+                                            alignment_score: None,
+                                            alignment_summary: None,
                                         }));
                                         ctx.request_repaint();
                                         continue;
@@ -3099,6 +3783,9 @@ impl KaraokeApp {
                                 error: None,
                                 file: Some(output_mp4_path.to_string_lossy().to_string()),
                                 batch_align_index: None,
+                                alignment_report_file: None,
+                                alignment_score: None,
+                                alignment_summary: None,
                             }));
                         } else {
                             let _ = tx.send(ProgressUpdate::Error(
@@ -3149,6 +3836,7 @@ impl eframe::App for KaraokeApp {
             plain_lines: self.plain_lines,
             verify_lrc_with_whisper: self.verify_lrc_with_whisper,
             separate_vocals_for_word_level: self.separate_vocals_for_word_level,
+            batch_overwrite_timings: self.batch_overwrite_timings,
         };
 
         // Единая современная темная тема для всех стандартных виджетов egui.
@@ -3210,6 +3898,88 @@ impl eframe::App for KaraokeApp {
             self.audio_rx = None;
         }
 
+        loop {
+            let update = self.pptx_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            let Some(update) = update else {
+                break;
+            };
+            match update {
+                PptxOptimizeUpdate::Log(line) => {
+                    self.pptx_log_output.push_str(&format!("{line}\n"));
+                }
+                PptxOptimizeUpdate::Plan { total, remaining } => {
+                    self.pptx_progress = if total == 0 {
+                        0.0
+                    } else {
+                        (total.saturating_sub(remaining)) as f32 / total as f32
+                    };
+                    self.pptx_status_text =
+                        format!("Найдено видео: {}, к оптимизации: {}", total, remaining);
+                    self.pptx_log_output.push_str(&format!(
+                        "📦 Найдено встроенных MP4: {}, к оптимизации: {}\n",
+                        total, remaining
+                    ));
+                }
+                PptxOptimizeUpdate::Done {
+                    index,
+                    total,
+                    message,
+                } => {
+                    self.pptx_progress = if total == 0 {
+                        0.0
+                    } else {
+                        index as f32 / total as f32
+                    };
+                    self.pptx_status_text = format!("Оптимизация видео: {}/{}", index, total);
+                    self.pptx_log_output.push_str(&format!("{message}\n"));
+                }
+                PptxOptimizeUpdate::Summary {
+                    output_mb,
+                    mp4_mb,
+                    mp4_count,
+                    bad,
+                } => {
+                    self.pptx_progress = 1.0;
+                    if bad.is_none() {
+                        self.pptx_status_text = format!(
+                            "Готово: {:.0} MB, видео: {} шт. / {:.0} MB",
+                            output_mb, mp4_count, mp4_mb
+                        );
+                    } else {
+                        self.pptx_status_text =
+                            format!("Файл собран, но проверка сообщила: {:?}", bad);
+                    }
+                    self.pptx_log_output.push_str(&format!(
+                        "✅ Итог: {:.1} MB, видео: {} шт. / {:.1} MB, проверка: {:?}\n",
+                        output_mb, mp4_count, mp4_mb, bad
+                    ));
+                }
+                PptxOptimizeUpdate::Finished(result) => {
+                    self.pptx_is_running = false;
+                    self.pptx_rx = None;
+                    match result {
+                        Ok(()) => {
+                            self.pptx_progress = 1.0;
+                            if let Some(output) = &self.pptx_output_path {
+                                if let Ok(meta) = std::fs::metadata(output) {
+                                    self.pptx_status_text =
+                                        format!("Готово: {}", format_file_size(meta.len()));
+                                }
+                                self.pptx_log_output.push_str(&format!(
+                                    "🎉 Сохранено: {}\n",
+                                    output.to_string_lossy()
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            self.pptx_status_text = "Ошибка оптимизации".to_string();
+                            self.pptx_log_output.push_str(&format!("❌ {err}\n"));
+                        }
+                    }
+                }
+            }
+        }
+
         // Опрос прогресса из фонового канала
         loop {
             let update = self.rx.as_ref().and_then(|rx| rx.try_recv().ok());
@@ -3219,12 +3989,20 @@ impl eframe::App for KaraokeApp {
 
             match update {
                 ProgressUpdate::Progress(prog) => {
+                    let alignment = AlignmentQuality::from_progress(&prog);
                     self.progress = prog.progress;
                     self.status_text = prog.status;
                     if let Some(index) = self.batch_current_index
                         && let Some(item) = self.batch_items.get_mut(index)
                     {
                         item.progress = prog.progress;
+                        if let Some(alignment) = alignment.clone() {
+                            item.alignment_quality = Some(alignment);
+                        }
+                    }
+                    if let Some(alignment) = alignment {
+                        self.log_output
+                            .push_str(&format!("Качество: {}\n", alignment.log_text()));
                     }
                     if let Some(err) = &prog.error {
                         paths::debug_log(format!("[karaoke-ui] Progress error: {}", err));
@@ -3254,6 +4032,7 @@ impl eframe::App for KaraokeApp {
                     progress,
                     message,
                     output_path,
+                    alignment,
                 } => {
                     self.progress = progress;
                     self.status_text = message.clone();
@@ -3267,9 +4046,20 @@ impl eframe::App for KaraokeApp {
                     if let Some(item) = self.batch_items.get_mut(index) {
                         item.status = status;
                         item.progress = progress;
+                        if let Some(alignment) = alignment.clone() {
+                            item.alignment_quality = Some(alignment);
+                        }
                         if output_path.is_some() {
                             item.output_path = output_path.clone();
                         }
+                        refresh_batch_item_audit(item, self.plain_lines);
+                    }
+                    if let Some(alignment) = alignment {
+                        self.log_output.push_str(&format!(
+                            "Batch #{} качество: {}\n",
+                            index + 1,
+                            alignment.log_text()
+                        ));
                     }
                     if let Some(path) = output_path {
                         self.generated_file = Some(path.clone());
@@ -3372,11 +4162,18 @@ impl eframe::App for KaraokeApp {
                 .filter(|item| item.status == BatchStatus::MissingLyrics)
                 .count();
             let processable_items = total_items.saturating_sub(missing_lyrics);
+            let (audit_ok, audit_notice, audit_warning, audit_error) =
+                batch_audit_counts(&self.batch_items);
 
             if res.folder_count == 1 {
                 self.batch_status_text = format!(
-                    "Найдено {} треков в {} · к обработке {} · без текста {}",
-                    total_items, res.first_folder_name, processable_items, missing_lyrics
+                    "Найдено {} треков в {} · к обработке {} · без текста {} · проверить {} · ошибок аудита {}",
+                    total_items,
+                    res.first_folder_name,
+                    processable_items,
+                    missing_lyrics,
+                    audit_warning,
+                    audit_error
                 );
                 self.log_output.push_str(&format!(
                     "📁 Batch-папка: {}\n",
@@ -3387,8 +4184,13 @@ impl eframe::App for KaraokeApp {
                 ));
             } else {
                 self.batch_status_text = format!(
-                    "Найдено {} треков в {} папках · к обработке {} · без текста {}",
-                    total_items, res.folder_count, processable_items, missing_lyrics
+                    "Найдено {} треков в {} папках · к обработке {} · без текста {} · проверить {} · ошибок аудита {}",
+                    total_items,
+                    res.folder_count,
+                    processable_items,
+                    missing_lyrics,
+                    audit_warning,
+                    audit_error
                 );
                 self.log_output.push_str(&format!(
                         "📁 Batch: перетащено папок: {}, найдено треков: {}, к обработке: {}, без текста: {}\n",
@@ -3400,8 +4202,14 @@ impl eframe::App for KaraokeApp {
             }
 
             self.log_output.push_str(&format!(
-                "🎵 Найдено треков: {}, к обработке: {}, без текста: {}\n",
-                total_items, processable_items, missing_lyrics
+                "🎵 Найдено треков: {}, к обработке: {}, без текста: {}, аудит OK: {}, не готово: {}, проверить: {}, ошибок: {}\n",
+                total_items,
+                processable_items,
+                missing_lyrics,
+                audit_ok,
+                audit_notice,
+                audit_warning,
+                audit_error
             ));
             for warning in res.warnings {
                 self.log_output.push_str(&format!("⚠️ {}\n", warning));
@@ -3469,7 +4277,11 @@ impl eframe::App for KaraokeApp {
             .filter(|path| path.is_dir())
             .cloned()
             .collect();
-        if dropped_dirs.len() > 1 && !self.is_generating && !self.batch_running {
+        if dropped_dirs.len() > 1
+            && self.active_tab != ActiveTab::PptxOptimizer
+            && !self.is_generating
+            && !self.batch_running
+        {
             self.load_batch_folders(dropped_dirs, ctx);
             self.active_tab = ActiveTab::Batch;
         } else {
@@ -3568,12 +4380,19 @@ impl eframe::App for KaraokeApp {
                 {
                     self.active_tab = ActiveTab::Downloader;
                 }
+                if ui
+                    .selectable_label(self.active_tab == ActiveTab::PptxOptimizer, egui::RichText::new("Оптимизация PPTX").strong())
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::PptxOptimizer;
+                }
                 ui.separator();
                 ui.label(
                     egui::RichText::new(match self.active_tab {
                         ActiveTab::SingleTrack => "Обычный режим создания караоке-видео для одного трека.",
                         ActiveTab::Batch => "Массовая генерация: каждая подпапка получает свой MP4 рядом с MP3/LRC.",
                         ActiveTab::Downloader => "Загрузка аудио: скачивание музыки по названию или списку из Excel.",
+                        ActiveTab::PptxOptimizer => "Сжатие презентаций Музлото: уменьшает встроенные MP4 без изменения слайдов.",
                     })
                     .size(12.0)
                     .color(muted),
@@ -3613,6 +4432,8 @@ impl eframe::App for KaraokeApp {
                                 .iter()
                                 .filter(|item| item.status == BatchStatus::MissingLyrics)
                                 .count();
+                            let (_audit_ok, _audit_notice, audit_warning, audit_error) =
+                                batch_audit_counts(&self.batch_items);
 
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
@@ -3757,6 +4578,34 @@ impl eframe::App for KaraokeApp {
                                                 .size(13.0)
                                                 .color(if missing_lyrics > 0 {
                                                     egui::Color32::from_rgb(255, 176, 96)
+                                                } else {
+                                                    muted
+                                                }),
+                                            );
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} проверить",
+                                                    audit_warning
+                                                ))
+                                                .strong()
+                                                .size(13.0)
+                                                .color(if audit_warning > 0 {
+                                                    egui::Color32::from_rgb(246, 181, 70)
+                                                } else {
+                                                    muted
+                                                }),
+                                            );
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} аудит ошибок",
+                                                    audit_error
+                                                ))
+                                                .strong()
+                                                .size(13.0)
+                                                .color(if audit_error > 0 {
+                                                    egui::Color32::from_rgb(255, 100, 100)
                                                 } else {
                                                     muted
                                                 }),
@@ -3988,6 +4837,10 @@ impl eframe::App for KaraokeApp {
                                                 &mut self.separate_vocals_for_word_level,
                                                 "Вокал для слов (Demucs, точнее, но дольше)",
                                             );
+                                            ui.checkbox(
+                                                &mut self.batch_overwrite_timings,
+                                                "Перезаписывать тайминги Whisper (всегда распознавать заново)",
+                                            );
                                         });
                                     },
                                 );
@@ -4177,7 +5030,7 @@ impl eframe::App for KaraokeApp {
                                                                         ui.vertical(|ui| {
                                                                             ui.set_width(
                                                                                 list_inner_width
-                                                                                    - 190.0,
+                                                                                    - 250.0,
                                                                             );
                                                                             ui.label(
                                                                                 egui::RichText::new(
@@ -4188,6 +5041,42 @@ impl eframe::App for KaraokeApp {
                                                                                 .color(text),
                                                                             );
                                                                         });
+                                                                        if let Some(audit) =
+                                                                            &item.audit
+                                                                        {
+                                                                            let audit_response =
+                                                                                ui.label(
+                                                                                    egui::RichText::new(
+                                                                                        audit.level
+                                                                                            .label(),
+                                                                                    )
+                                                                                    .size(10.5)
+                                                                                    .strong()
+                                                                                    .color(
+                                                                                        audit
+                                                                                            .level
+                                                                                            .color(),
+                                                                                    ),
+                                                                                );
+                                                                            if !audit
+                                                                                .issues
+                                                                                .is_empty()
+                                                                            {
+                                                                                audit_response
+                                                                                    .on_hover_text(
+                                                                                        audit
+                                                                                            .tooltip(),
+                                                                                    );
+                                                                            }
+                                                                        } else {
+                                                                            ui.label(
+                                                                                egui::RichText::new(
+                                                                                    "аудит",
+                                                                                )
+                                                                                .size(10.5)
+                                                                                .color(muted),
+                                                                            );
+                                                                        }
                                                                         ui.vertical(|ui| {
                                                                             ui.set_width(108.0);
                                                                             ui.with_layout(
@@ -4256,54 +5145,77 @@ impl eframe::App for KaraokeApp {
                                                                 status_rect.center();
                                                             match &item.status {
                                                                 BatchStatus::Done => {
+                                                                    let quality =
+                                                                        item.alignment_quality
+                                                                            .as_ref();
+                                                                    let fill = quality
+                                                                        .map(|q| q.color())
+                                                                        .unwrap_or(success);
+                                                                    let icon = quality
+                                                                        .map(|q| q.icon())
+                                                                        .unwrap_or("✓");
                                                                     painter.circle_filled(
                                                                         status_center,
                                                                         8.0,
-                                                                        success,
+                                                                        fill,
                                                                     );
-                                                                    painter.line_segment(
-                                                                        [
-                                                                            egui::pos2(
-                                                                                status_center.x
-                                                                                    - 4.0,
-                                                                                status_center.y,
+                                                                    if icon == "✓" {
+                                                                        painter.line_segment(
+                                                                            [
+                                                                                egui::pos2(
+                                                                                    status_center.x
+                                                                                        - 4.0,
+                                                                                    status_center.y,
+                                                                                ),
+                                                                                egui::pos2(
+                                                                                    status_center.x
+                                                                                        - 1.0,
+                                                                                    status_center.y
+                                                                                        + 3.0,
+                                                                                ),
+                                                                            ],
+                                                                            egui::Stroke::new(
+                                                                                1.8,
+                                                                                egui::Color32::from_rgb(
+                                                                                    8, 18, 14,
+                                                                                ),
                                                                             ),
-                                                                            egui::pos2(
-                                                                                status_center.x
-                                                                                    - 1.0,
-                                                                                status_center.y
-                                                                                    + 3.0,
+                                                                        );
+                                                                        painter.line_segment(
+                                                                            [
+                                                                                egui::pos2(
+                                                                                    status_center.x
+                                                                                        - 1.0,
+                                                                                    status_center.y
+                                                                                        + 3.0,
+                                                                                ),
+                                                                                egui::pos2(
+                                                                                    status_center.x
+                                                                                        + 5.0,
+                                                                                    status_center.y
+                                                                                        - 4.0,
+                                                                                ),
+                                                                            ],
+                                                                            egui::Stroke::new(
+                                                                                1.8,
+                                                                                egui::Color32::from_rgb(
+                                                                                    8, 18, 14,
+                                                                                ),
                                                                             ),
-                                                                        ],
-                                                                        egui::Stroke::new(
-                                                                            1.8,
+                                                                        );
+                                                                    } else {
+                                                                        painter.text(
+                                                                            status_center,
+                                                                            egui::Align2::CENTER_CENTER,
+                                                                            icon,
+                                                                            egui::FontId::proportional(
+                                                                                10.0,
+                                                                            ),
                                                                             egui::Color32::from_rgb(
-                                                                                8, 18, 14,
+                                                                                18, 16, 10,
                                                                             ),
-                                                                        ),
-                                                                    );
-                                                                    painter.line_segment(
-                                                                        [
-                                                                            egui::pos2(
-                                                                                status_center.x
-                                                                                    - 1.0,
-                                                                                status_center.y
-                                                                                    + 3.0,
-                                                                            ),
-                                                                            egui::pos2(
-                                                                                status_center.x
-                                                                                    + 5.0,
-                                                                                status_center.y
-                                                                                    - 4.0,
-                                                                            ),
-                                                                        ],
-                                                                        egui::Stroke::new(
-                                                                            1.8,
-                                                                            egui::Color32::from_rgb(
-                                                                                8, 18, 14,
-                                                                            ),
-                                                                        ),
-                                                                    );
+                                                                        );
+                                                                    }
                                                                 }
                                                                 BatchStatus::Aligning
                                                                 | BatchStatus::Rendering => {
@@ -4387,6 +5299,42 @@ impl eframe::App for KaraokeApp {
                                                                     );
                                                                 }
                                                             }
+                                                            let status_hover = item
+                                                                .alignment_quality
+                                                                .as_ref()
+                                                                .map(|quality| quality.tooltip())
+                                                                .unwrap_or_else(|| match &item.status {
+                                                                    BatchStatus::Done => {
+                                                                        "Готово".to_string()
+                                                                    }
+                                                                    BatchStatus::ReadyToRender => {
+                                                                        "Тайминги готовы к рендеру".to_string()
+                                                                    }
+                                                                    BatchStatus::Aligning => {
+                                                                        "Создание таймингов".to_string()
+                                                                    }
+                                                                    BatchStatus::Rendering => {
+                                                                        "Рендеринг видео".to_string()
+                                                                    }
+                                                                    BatchStatus::MissingLyrics => {
+                                                                        "Нет файла текста".to_string()
+                                                                    }
+                                                                    BatchStatus::Ready => {
+                                                                        "Готово к обработке".to_string()
+                                                                    }
+                                                                    BatchStatus::Error(err) => {
+                                                                        format!("Ошибка: {err}")
+                                                                    }
+                                                                });
+                                                            ui.interact(
+                                                                status_rect,
+                                                                ui.id().with((
+                                                                    "batch-status",
+                                                                    idx,
+                                                                )),
+                                                                egui::Sense::hover(),
+                                                            )
+                                                            .on_hover_text(status_hover);
                                                             painter.rect_filled(
                                                                 remove_rect,
                                                                 9.0,
@@ -4477,6 +5425,26 @@ impl eframe::App for KaraokeApp {
                                                                             );
                                                                         }
                                                                         ui.horizontal(|ui| {
+                                                                            if let Some(quality) =
+                                                                                &item.alignment_quality
+                                                                            {
+                                                                                ui.label(
+                                                                                    egui::RichText::new(
+                                                                                        quality.log_text(),
+                                                                                    )
+                                                                                    .color(quality.color())
+                                                                                    .size(11.0),
+                                                                                );
+                                                                                if let Some(path) =
+                                                                                    &quality.report_path
+                                                                                    && ui
+                                                                                        .button("Открыть отчёт")
+                                                                                        .on_hover_text(path)
+                                                                                        .clicked()
+                                                                                {
+                                                                                    open_path(Path::new(path));
+                                                                                }
+                                                                            }
                                                                             ui.with_layout(
                                                                                 egui::Layout::right_to_left(
                                                                                     egui::Align::Center,
@@ -4525,6 +5493,44 @@ impl eframe::App for KaraokeApp {
                                                                                 },
                                                                             );
                                                                         });
+                                                                        if let Some(audit) =
+                                                                            &item.audit
+                                                                        {
+                                                                            ui.add_space(4.0);
+                                                                            ui.label(
+                                                                                egui::RichText::new(
+                                                                                    format!(
+                                                                                        "Аудит пакета: {} — {}",
+                                                                                        audit.level
+                                                                                            .label(),
+                                                                                        audit.summary
+                                                                                    ),
+                                                                                )
+                                                                                .size(11.0)
+                                                                                .color(
+                                                                                    audit
+                                                                                        .level
+                                                                                        .color(),
+                                                                                ),
+                                                                            );
+                                                                            for issue in audit
+                                                                                .issues
+                                                                                .iter()
+                                                                                .skip(1)
+                                                                                .take(4)
+                                                                            {
+                                                                                ui.label(
+                                                                                    egui::RichText::new(
+                                                                                        format!(
+                                                                                            "• {}",
+                                                                                            issue
+                                                                                        ),
+                                                                                    )
+                                                                                    .size(10.5)
+                                                                                    .color(muted),
+                                                                                );
+                                                                            }
+                                                                        }
                                                                         if !self.trim_status.is_empty() {
                                                                             ui.label(
                                                                                 egui::RichText::new(
@@ -4834,7 +5840,7 @@ impl eframe::App for KaraokeApp {
                                             }
 
                                             let has_incomplete = self.dl_tracks.iter().any(|t| {
-                                                t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Skipped
+                                                t.selected && t.status != TrackStatus::Success && t.status != TrackStatus::Warning && t.status != TrackStatus::Skipped
                                             });
                                             let can_continue = can_start && has_incomplete;
 
@@ -4876,9 +5882,10 @@ impl eframe::App for KaraokeApp {
                                      let total_selected = self.dl_tracks.iter().filter(|t| t.selected).count();
                                      if total_selected > 0 {
                                          let success_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Success).count();
+                                         let warning_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Warning).count();
                                          let failed_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Failed).count();
                                          let skipped_count = self.dl_tracks.iter().filter(|t| t.selected && t.status == TrackStatus::Skipped).count();
-                                         let finished_count = success_count + failed_count + skipped_count;
+                                         let finished_count = success_count + warning_count + failed_count + skipped_count;
 
                                          let progress = finished_count as f32 / total_selected as f32;
                                          ui.add(
@@ -4887,6 +5894,10 @@ impl eframe::App for KaraokeApp {
                                                  .show_percentage()
                                          );
                                          ui.add_space(8.0);
+                                         ui.label(format!(
+                                             "Успешно: {}, проверить: {}, ошибок: {}, пропущено: {}",
+                                             success_count, warning_count, failed_count, skipped_count
+                                         ));
 
                                          ui.horizontal(|ui| {
                                              ui.label(egui::RichText::new(format!("✅ Скачано: {}", success_count)).color(egui::Color32::from_rgb(34, 197, 94)));
@@ -5019,10 +6030,14 @@ impl eframe::App for KaraokeApp {
                                                                 TrackStatus::Pending => ("⏳ Ожидание", muted),
                                                                 TrackStatus::Downloading => ("🔄 Загрузка", egui::Color32::from_rgb(250, 204, 21)),
                                                                 TrackStatus::Success => ("✅ Успешно", egui::Color32::from_rgb(34, 197, 94)),
+                                                                TrackStatus::Warning => ("⚠️ Проверить", egui::Color32::from_rgb(249, 115, 22)),
                                                                 TrackStatus::Failed => ("❌ Ошибка", egui::Color32::from_rgb(239, 68, 68)),
                                                                 TrackStatus::Skipped => ("⏭️ Пропущен", egui::Color32::from_rgb(156, 163, 175)),
                                                             };
-                                                            ui.label(egui::RichText::new(status_text).color(status_color));
+                                                            let status_resp = ui.label(egui::RichText::new(status_text).color(status_color));
+                                                            if let Some(note) = &track.quality_note {
+                                                                status_resp.on_hover_text(note);
+                                                            }
                                                             ui.end_row();
                                                         }
                                                     });
@@ -5155,6 +6170,188 @@ impl eframe::App for KaraokeApp {
                         });
                     }
 
+                    ui.add_space(batch_margin);
+                });
+            } else if self.active_tab == ActiveTab::PptxOptimizer {
+                let batch_margin = 14.0;
+                let content_width = ui.available_width() - batch_margin * 2.0;
+                let col_height = ui.available_height() - 20.0;
+
+                ui.horizontal(|ui| {
+                    ui.add_space(batch_margin);
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width.max(720.0));
+                        ui.set_height(col_height);
+                        card_frame.show(ui, |ui| {
+                            ui.set_min_width(content_width - 36.0);
+                            ui.set_min_height(col_height - 36.0);
+
+                            ui.label(
+                                egui::RichText::new("Оптимизация презентации")
+                                    .strong()
+                                    .size(18.0)
+                                    .color(text),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Выберите папку пакета. Программа найдёт основной PPTX и создаст рядом лёгкую копию.")
+                                    .size(12.0)
+                                    .color(muted),
+                            );
+                            ui.add_space(16.0);
+
+                            drop_zone_frame.show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    let folder_label = self
+                                        .pptx_package_dir
+                                        .as_ref()
+                                        .map(|path| path.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "Перетащите папку пакета сюда или выберите её".to_string());
+                                    let button = egui::Button::new(
+                                        egui::RichText::new(folder_label)
+                                            .strong()
+                                            .size(12.0)
+                                            .color(if self.pptx_package_dir.is_some() {
+                                                success
+                                            } else {
+                                                egui::Color32::from_rgb(198, 205, 216)
+                                            }),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .min_size(egui::vec2(ui.available_width(), 42.0));
+
+                                    if ui.add_enabled(!self.pptx_is_running, button).clicked()
+                                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                                    {
+                                        self.select_pptx_package_folder(path);
+                                    }
+                                });
+                            });
+                            ui.add_space(16.0);
+
+                            egui::Grid::new("pptx_optimizer_grid")
+                                .num_columns(2)
+                                .spacing([14.0, 10.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Исходный PPTX").color(muted));
+                                    if let Some(input) = &self.pptx_input_path {
+                                        let size = std::fs::metadata(input)
+                                            .map(|meta| format_file_size(meta.len()))
+                                            .unwrap_or_else(|_| "?".to_string());
+                                        ui.label(format!(
+                                            "{} ({})",
+                                            lyrics::display_file_name(input),
+                                            size
+                                        ));
+                                    } else {
+                                        ui.label("Не выбран");
+                                    }
+                                    ui.end_row();
+
+                                    ui.label(egui::RichText::new("Новый файл").color(muted));
+                                    if let Some(output) = &self.pptx_output_path {
+                                        ui.label(lyrics::display_file_name(output));
+                                    } else {
+                                        ui.label("Будет создан рядом с исходником");
+                                    }
+                                    ui.end_row();
+
+                                    ui.label(egui::RichText::new("Профиль").color(muted));
+                                    ui.label("MP4 1352px · быстрый H.264 · AAC 96k");
+                                    ui.end_row();
+                                });
+
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                let can_start = self.pptx_input_path.is_some() && !self.pptx_is_running;
+                                if ui
+                                    .add_enabled(
+                                        can_start,
+                                        egui::Button::new(
+                                            egui::RichText::new("Оптимизировать презентацию")
+                                                .strong(),
+                                        )
+                                        .fill(egui::Color32::from_rgb(45, 118, 255)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_pptx_optimization(ctx.clone());
+                                }
+
+                                if let Some(output) = &self.pptx_output_path
+                                    && output.exists()
+                                    && ui.button("Открыть папку").clicked()
+                                {
+                                    open_in_explorer(output);
+                                }
+
+                                if ui.button("Очистить лог").clicked() && !self.pptx_is_running {
+                                    self.pptx_log_output.clear();
+                                }
+                            });
+
+                            ui.add_space(16.0);
+                            ui.separator();
+                            ui.add_space(10.0);
+
+                            let status_color = if self.pptx_is_running {
+                                accent
+                            } else if self.pptx_status_text.contains("Готово") {
+                                success
+                            } else if self.pptx_status_text.contains("Ошибка") {
+                                egui::Color32::from_rgb(255, 100, 100)
+                            } else {
+                                muted
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&self.pptx_status_text)
+                                        .strong()
+                                        .color(status_color),
+                                );
+                                if self.pptx_is_running {
+                                    ui.add(egui::widgets::Spinner::new().size(14.0));
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::ProgressBar::new(self.pptx_progress)
+                                    .animate(self.pptx_is_running)
+                                    .show_percentage(),
+                            );
+
+                            if let Some(started_at) = self.pptx_start_time
+                                && self.pptx_is_running
+                            {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Прошло: {} мин",
+                                        started_at.elapsed().as_secs() / 60
+                                    ))
+                                    .size(11.0)
+                                    .color(muted),
+                                );
+                            }
+
+                            ui.add_space(14.0);
+                            log_frame.show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("pptx_optimizer_log")
+                                    .stick_to_bottom(true)
+                                    .max_height((ui.available_height() - 8.0).max(220.0))
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut self.pptx_log_output)
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(16)
+                                                .lock_focus(true),
+                                        );
+                                    });
+                            });
+                        });
+                    });
                     ui.add_space(batch_margin);
                 });
             } else {
@@ -5888,6 +7085,7 @@ impl eframe::App for KaraokeApp {
             plain_lines: self.plain_lines,
             verify_lrc_with_whisper: self.verify_lrc_with_whisper,
             separate_vocals_for_word_level: self.separate_vocals_for_word_level,
+            batch_overwrite_timings: self.batch_overwrite_timings,
         };
 
         if old_settings != new_settings
@@ -5931,6 +7129,10 @@ fn parse_log_line_and_update_status(log_line: &str, tracks: &mut [TrackItem]) {
         if let Some(pos) = extract_track_num_between(log_line, "[+] [", "]") {
             update_status_by_pos(tracks, pos, TrackStatus::Success);
         }
+    } else if log_line.contains("[?] [") && log_line.contains("Download quality:") {
+        if let Some(pos) = extract_track_num_between(log_line, "[?] [", "]") {
+            update_download_quality_by_pos(tracks, pos, log_line);
+        }
     } else if log_line.contains("[-] [") {
         if let Some(pos) = extract_track_num_between(log_line, "[-] [", "]") {
             update_status_by_pos(tracks, pos, TrackStatus::Failed);
@@ -5959,5 +7161,36 @@ fn extract_track_num_after(s: &str, prefix: &str) -> Option<usize> {
 fn update_status_by_pos(tracks: &mut [TrackItem], pos: usize, status: TrackStatus) {
     if let Some(t) = tracks.iter_mut().find(|t| t.pos == pos) {
         t.status = status;
+    }
+}
+
+fn update_download_quality_by_pos(tracks: &mut [TrackItem], pos: usize, log_line: &str) {
+    if let Some(t) = tracks.iter_mut().find(|t| t.pos == pos) {
+        let detail = log_line
+            .split_once("Download quality:")
+            .map(|(_, tail)| tail.trim())
+            .unwrap_or(log_line)
+            .to_string();
+        t.quality_note = Some(detail.clone());
+        if detail.starts_with("suspicious") {
+            t.status = TrackStatus::Warning;
+        }
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn suspicious_source_markers_detect_live_versions() {
+        let markers = suspicious_source_markers("Artist - Song Live Version.mp3");
+        assert!(markers.contains(&"live"));
+        assert!(markers.contains(&"version"));
+    }
+
+    #[test]
+    fn suspicious_source_markers_ignore_clean_names() {
+        assert!(suspicious_source_markers("Artist - Song.mp3").is_empty());
     }
 }

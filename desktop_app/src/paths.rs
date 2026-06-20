@@ -53,6 +53,8 @@ fn executable_name(base_name: &str) -> String {
 
 /// Ищет bundled worker рядом с приложением или Python-скрипт в dev-режиме.
 pub fn find_worker() -> Option<PathBuf> {
+    clear_bundled_runtime_quarantine();
+
     let base = app_base_dir();
     let worker_exe = executable_name("karaoke_worker");
     let candidates = [
@@ -69,7 +71,9 @@ pub fn find_worker() -> Option<PathBuf> {
 
     for candidate in candidates {
         if candidate.exists() {
-            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+            let worker = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+            prepare_worker_runtime(&worker);
+            return Some(worker);
         }
     }
     None
@@ -154,23 +158,42 @@ pub fn clear_bundled_runtime_quarantine() {
     }
 
     let base = app_base_dir();
-    clear_quarantine(&base.join("worker"));
+    let worker_dirs = [
+        base.join("worker"),
+        base.join("../Resources/worker"),
+        base.join("../../../worker"),
+    ];
+    for worker_dir in worker_dirs {
+        clear_quarantine(&worker_dir);
+        repair_python_shared_library(&worker_dir);
+        repair_macos_codesign(&worker_dir);
+    }
+}
 
+/// Готовит runtime рядом с конкретным worker-бинарником перед запуском.
+/// Это держит защиту централизованной для parse-sheet, download, batch и генерации.
+pub fn prepare_worker_runtime(worker_path: &Path) {
+    if is_python_worker(worker_path) {
+        return;
+    }
+    if let Some(worker_dir) = worker_path.parent() {
+        clear_quarantine(worker_dir);
+        repair_python_shared_library(worker_dir);
+        repair_macos_codesign(worker_dir);
+    }
+}
+
+/// Восстанавливает worker/_internal/Python из bundled Python.framework.
+/// Безопасно для dev-режима (там worker — это .py скрипт, папки _internal нет).
+#[cfg(target_os = "macos")]
+fn repair_python_shared_library(worker_dir: &Path) {
     // Самовосстановление worker/_internal/Python: PyInstaller кладёт туда
     // симлинк на Python.framework/Versions/3.x/Python. Симлинк хрупок и ломается
     // при пересылке бокса через zip / Finder-копию / FAT-диск / облако, после
     // чего воркер падает с "Failed to load Python shared library: no such file".
     // Если файла нет или это сломанный симлинк — восстанавливаем из framework,
     // который лежит рядом и пересылку переживает.
-    repair_python_shared_library();
-}
-
-/// Восстанавливает worker/_internal/Python из bundled Python.framework.
-/// Безопасно для dev-режима (там worker — это .py скрипт, папки _internal нет).
-#[cfg(target_os = "macos")]
-fn repair_python_shared_library() {
-    let base = app_base_dir();
-    let internal = base.join("worker").join("_internal");
+    let internal = worker_dir.join("_internal");
     let py_link = internal.join("Python");
 
     // Если Python уже существует как обычный читаемый файл — чинить нечего.
@@ -194,7 +217,7 @@ fn repair_python_shared_library() {
 
     // Ищем настоящий Python внутри Python.framework в нескольких вариантах
     // расположения (PyInstaller может класть framework в _internal или рядом).
-    let mut search_dirs = vec![internal.clone(), base.join("worker")];
+    let mut search_dirs = vec![internal.clone(), worker_dir.to_path_buf()];
     // Сканируем поддиректории _internal на случай вложенного framework.
     if let Ok(entries) = std::fs::read_dir(&internal) {
         for entry in entries.flatten() {
@@ -227,21 +250,98 @@ fn repair_python_shared_library() {
                         &py_link,
                         std::os::unix::fs::PermissionsExt::from_mode(0o755),
                     );
-                    debug_log(format!(
-                        "repair_python: restored from {}",
-                        real.display()
-                    ));
+                    debug_log(format!("repair_python: restored from {}", real.display()));
                 }
                 return;
             }
         }
     }
 
-    debug_log("repair_python: Python.framework not found, cannot restore");
+    debug_log(format!(
+        "repair_python: Python.framework not found in {}",
+        worker_dir.display()
+    ));
 }
 
 #[cfg(not(target_os = "macos"))]
-fn repair_python_shared_library() {}
+fn repair_python_shared_library(_worker_dir: &Path) {}
+
+#[cfg(target_os = "macos")]
+fn codesign_verify(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    std::process::Command::new("codesign")
+        .args(["-v"])
+        .arg(path)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_ad_hoc(path: &Path, deep: bool) {
+    if !path.exists() || codesign_verify(path) {
+        return;
+    }
+
+    let mut cmd = std::process::Command::new("codesign");
+    cmd.args(["--force", "--sign", "-"]);
+    if deep {
+        cmd.arg("--deep");
+    }
+    let status = cmd.arg(path).status();
+    debug_log(format!(
+        "codesign repair: {} deep={} status={:?}",
+        path.display(),
+        deep,
+        status
+    ));
+}
+
+#[cfg(target_os = "macos")]
+fn should_codesign_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    if name == "Python" || name == "karaoke_worker" || name == "karaoke_render" {
+        return true;
+    }
+    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("");
+    matches!(ext, "dylib" | "so")
+}
+
+#[cfg(target_os = "macos")]
+fn repair_macos_codesign(worker_dir: &Path) {
+    if !worker_dir.exists() {
+        return;
+    }
+
+    codesign_ad_hoc(&worker_dir.join("karaoke_worker"), true);
+    codesign_ad_hoc(&worker_dir.join("karaoke_render"), true);
+    codesign_ad_hoc(&worker_dir.join("_internal").join("Python"), false);
+
+    let internal = worker_dir.join("_internal");
+    if !internal.is_dir() {
+        return;
+    }
+
+    let mut stack = vec![internal];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if should_codesign_file(&path) {
+                codesign_ad_hoc(&path, false);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn repair_macos_codesign(_worker_dir: &Path) {}
 
 pub fn exports_dir() -> PathBuf {
     let base = app_base_dir();

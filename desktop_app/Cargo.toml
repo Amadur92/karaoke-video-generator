@@ -1,6 +1,6 @@
 [package]
 name = "desktop_app"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,7 @@ rodio = { version = "0.19", default-features = false, features = ["wav"] }
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 imageproc = "0.25"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3

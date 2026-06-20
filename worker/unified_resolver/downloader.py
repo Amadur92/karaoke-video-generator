@@ -305,13 +305,30 @@ def _safe_remove(path: Optional[str]) -> None:
 
 
 class Downloader:
-    def __init__(self, output_dir: str = ".", format: str = "mp3"):
+    def __init__(
+        self,
+        output_dir: str = ".",
+        format: str = "mp3",
+        cookies_from_browser: str | None = None,
+        duration_tolerance: int | None = None,
+    ):
         self.output_dir = output_dir
         self.format = format.lower()
         if self.format not in {"mp3", "m4a", "flac"}:
             self.format = "mp3"
+        self.cookies_from_browser = (cookies_from_browser or "").strip() or None
+        self.duration_tolerance = duration_tolerance if duration_tolerance and duration_tolerance > 0 else None
         self.temp_dir = os.path.join(self.output_dir, ".tmp")
         os.makedirs(self.temp_dir, exist_ok=True)
+
+    def _add_cookie_options(self, options: dict) -> dict:
+        if self.cookies_from_browser:
+            options = dict(options)
+            options["cookiesfrombrowser"] = (self.cookies_from_browser,)
+        return options
+
+    def _duration_tolerance(self, default: int) -> int:
+        return self.duration_tolerance or default
 
     def download(self, track: TrackMetadata, candidates: list[ScoredCandidate], override_dir: Optional[str] = None) -> bool:
         """
@@ -340,7 +357,12 @@ class Downloader:
             if any(f.startswith("critical_marker:") for f in scored.flags):
                 print(f"[#] Skipping candidate '{candidate.title}' because it contains a critical bad marker (karaoke/minus/instrumental).")
                 continue
-            if scored.score < 20:
+            allow_low_score_exact = (
+                self.duration_tolerance
+                and scored.title_score >= 78
+                and scored.artist_score >= 40
+            )
+            if scored.score < 20 and not allow_low_score_exact:
                 print(f"[#] Skipping candidate '{candidate.title}' due to low score ({scored.score} < 20).")
                 continue
                 
@@ -364,7 +386,7 @@ class Downloader:
                     # наверняка другая версия (radio edit, кавер). Отвергаем и идём
                     # к следующему кандидату, а не принимаем заведомо не тот трек.
                     actual_dur = get_audio_duration(temp_audio)
-                    if track.duration_sec and actual_dur and abs(track.duration_sec - actual_dur) > 25:
+                    if track.duration_sec and actual_dur and abs(track.duration_sec - actual_dur) > self._duration_tolerance(25):
                         print(
                             f"[!] Downloaded duration ({actual_dur}s) differs from reference "
                             f"({track.duration_sec}s) by {abs(track.duration_sec - actual_dur)}s "
@@ -412,7 +434,7 @@ class Downloader:
         # чем подсунуть extended/радио-edit другого размера.
         _ref_dur = track.duration_sec
         _actual = get_audio_duration(temp_audio)
-        if _ref_dur and _actual and abs(_ref_dur - _actual) > 40:
+        if _ref_dur and _actual and abs(_ref_dur - _actual) > self._duration_tolerance(40):
             print(
                 f"[-] Final check failed: downloaded {_actual}s vs reference {_ref_dur}s "
                 f"(diff {abs(_ref_dur - _actual)}s). Rejecting likely wrong version."
@@ -617,6 +639,7 @@ class Downloader:
                 "noplaylist": True,
                 "nocheckcertificate": True,
             }
+            options = self._add_cookie_options(options)
 
             print(f"[*] Downloading from SoundCloud: {track_url}...")
             with YoutubeDL(options) as ydl:
@@ -655,6 +678,7 @@ class Downloader:
                 "noplaylist": True,
                 "nocheckcertificate": True,
             }
+            options = self._add_cookie_options(options)
             
             print(f"[*] Downloading from YouTube URL: {video_url}...")
             with YoutubeDL(options) as ydl:
@@ -708,12 +732,17 @@ class Downloader:
             dur = entry.get("duration")
             if expected_dur and dur:
                 diff = abs(expected_dur - dur)
+                tolerance = self._duration_tolerance(25)
+                if self.duration_tolerance and diff > tolerance:
+                    continue
                 if diff <= 4:
                     score += 40
                 elif diff <= 8:
                     score += 28
                 elif diff <= 15:
                     score += 12
+                elif diff <= tolerance:
+                    score += 4
                 else:
                     # Сильно отличающаяся длительность — подозрение на другую версию.
                     score -= 35
@@ -775,6 +804,7 @@ class Downloader:
                 "noplaylist": True,
                 "nocheckcertificate": True,
             }
+            options = self._add_cookie_options(options)
 
             with YoutubeDL(options) as ydl:
                 # Объединяем кандидатов из нескольких запросов (оригинал +

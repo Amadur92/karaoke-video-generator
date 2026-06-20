@@ -6,6 +6,8 @@
 """
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -143,6 +145,29 @@ def test_score_duration_mismatch_penalized():
     assert score_candidate(track, good).score > score_candidate(track, bad).score
 
 
+def test_download_quality_summary_ok_for_clean_candidate():
+    from unified_resolver.__main__ import download_quality_summary
+
+    track = _track(duration=234)
+    candidate = Candidate(source="youtube", title="Земфира - Хочешь", artists=["Земфира"], duration_sec=234)
+    scored = score_candidate(track, candidate)
+    quality, reasons = download_quality_summary(scored)
+    assert quality == "ok"
+    assert reasons == []
+
+
+def test_download_quality_summary_flags_live_candidate():
+    from unified_resolver.__main__ import download_quality_summary
+
+    track = _track(duration=234)
+    candidate = Candidate(source="youtube", title="Земфира - Хочешь Live Version", artists=["Земфира"], duration_sec=260)
+    scored = score_candidate(track, candidate)
+    quality, reasons = download_quality_summary(scored)
+    assert quality == "suspicious"
+    assert any("live" in reason for reason in reasons)
+    assert any(reason.startswith("candidate:") for reason in reasons)
+
+
 # ----------------- YouTube/SoundCloud candidate ranking -----------------
 
 def _entry(title, duration, uploader="user", eid=None):
@@ -159,6 +184,7 @@ def test_rank_youtube_entries_prefers_close_duration():
     """Главный сигнал — близость длительности к эталону."""
     from unified_resolver.downloader import Downloader
     dl = Downloader.__new__(Downloader)  # без __init__ (не создаём директории)
+    dl.duration_tolerance = None
     track = _track(duration=234)
     entries = [
         _entry("Хочешь", 300, "ZemfiraVEVO"),   # далеко по длительности
@@ -176,6 +202,7 @@ def test_rank_youtube_entries_prefers_close_duration():
 def test_rank_youtube_entries_excludes_critical_markers():
     from unified_resolver.downloader import Downloader
     dl = Downloader.__new__(Downloader)
+    dl.duration_tolerance = None
     track = _track()
     entries = [
         _entry("Хочешь караоке", 234, "user"),
@@ -219,7 +246,11 @@ def _run():
     )
     for name, obj in tests:
         try:
-            obj()
+            if "tmp_path" in getattr(obj, "__code__").co_varnames[: obj.__code__.co_argcount]:
+                with tempfile.TemporaryDirectory() as tmp:
+                    obj(Path(tmp))
+            else:
+                obj()
             print(f"PASS {name}")
         except AssertionError as exc:
             failures.append((name, str(exc)))

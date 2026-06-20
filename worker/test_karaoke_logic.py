@@ -16,6 +16,7 @@ from karaoke_worker import (  # noqa: E402
     clean_word,
     clamp_word_timing,
     distribute_words_between_anchors,
+    evaluate_alignment_quality,
     estimate_line_duration,
     fuzzy_word_match,
     match_lyrics_to_whisper,
@@ -142,6 +143,81 @@ def test_shift_karaoke_timings_clamps_negative_to_zero():
     ]}]
     shifted = shift_karaoke_timings(karaoke, -10.0)
     assert shifted[0]["start"] == 0.0
+
+
+def test_alignment_quality_report_ok_for_clean_timings():
+    karaoke = [
+        {"start": 1.0, "end": 2.0, "words": [
+            {"word": "hello", "start": 1.0, "end": 1.4},
+            {"word": "world", "start": 1.45, "end": 2.0},
+        ]},
+        {"start": 3.0, "end": 4.0, "words": [
+            {"word": "next", "start": 3.0, "end": 3.4},
+            {"word": "line", "start": 3.45, "end": 4.0},
+        ]},
+    ]
+    report = evaluate_alignment_quality(karaoke, audio_duration=5.0, source="test")
+    assert report["summary"] == "ok"
+    assert report["score"] == 1.0
+    assert report["line_count"] == 2
+    assert report["word_count"] == 4
+    assert report["issues"] == []
+
+
+def test_alignment_quality_report_flags_suspicious_timings():
+    karaoke = [
+        {"start": 1.0, "end": 8.5, "words": [
+            {"word": "very", "start": 1.0, "end": 4.3},
+            {"word": "late", "start": 7.2, "end": 7.7},
+        ]},
+        {"start": 7.0, "end": 8.0, "words": [
+            {"word": "overlap", "start": 7.0, "end": 7.01},
+        ]},
+    ]
+    report = evaluate_alignment_quality(karaoke, audio_duration=7.5, source="test")
+    kinds = {issue["kind"] for issue in report["issues"]}
+    assert report["summary"] == "needs_repair"
+    assert "line_overlap" in kinds
+    assert "long_word" in kinds
+    assert "large_internal_gap" in kinds
+    assert "tiny_word" in kinds
+    assert "line_out_of_bounds" in kinds
+    assert report["score"] < 1.0
+
+
+def test_alignment_quality_report_flags_text_mismatch():
+    karaoke = [
+        {"start": 1.0, "end": 2.0, "words": [
+            {"word": "hello", "start": 1.0, "end": 1.4},
+            {"word": "world", "start": 1.45, "end": 2.0},
+        ]},
+    ]
+    report = evaluate_alignment_quality(
+        karaoke,
+        audio_duration=5.0,
+        source="test",
+        text_match={"score": 0.2, "recognized_preview": "totally different"},
+    )
+    assert report["summary"] == "needs_repair"
+    assert report["metrics"]["text_match_score"] == 0.2
+    assert any(issue["kind"] == "text_mismatch" for issue in report["issues"])
+
+
+def test_alignment_quality_report_accepts_good_text_match():
+    karaoke = [
+        {"start": 1.0, "end": 2.0, "words": [
+            {"word": "hello", "start": 1.0, "end": 1.4},
+            {"word": "world", "start": 1.45, "end": 2.0},
+        ]},
+    ]
+    report = evaluate_alignment_quality(
+        karaoke,
+        audio_duration=5.0,
+        source="test",
+        text_match={"score": 0.9, "recognized_preview": "hello world"},
+    )
+    assert report["summary"] == "ok"
+    assert report["metrics"]["text_match_score"] == 0.9
 
 
 # ----------------- match_lyrics_to_whisper -----------------
