@@ -981,7 +981,7 @@ fn find_main_pptx_in_package(folder: &Path) -> Option<PathBuf> {
         let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         candidates.push((size, path));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates.into_iter().map(|(_, path)| path).next()
 }
 
@@ -1020,7 +1020,7 @@ fn find_pptx_replacement_media_dirs(folder: &Path) -> Vec<PathBuf> {
             candidates.push((priority, path));
         }
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.sort_by_key(|candidate| candidate.0);
     candidates.into_iter().map(|(_, path)| path).collect()
 }
 
