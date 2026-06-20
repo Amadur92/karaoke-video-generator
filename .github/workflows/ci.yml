@@ -38,6 +38,9 @@ jobs:
           key: ci-cargo-${{ hashFiles('desktop_app/Cargo.lock') }}
           restore-keys: ci-cargo-
 
+      - name: Install Linux system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+
       - name: Check formatting
         run: cargo fmt --manifest-path desktop_app/Cargo.toml --check
 
