@@ -7098,7 +7098,8 @@ impl eframe::App for KaraokeApp {
 
 fn main() -> eframe::Result {
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
-        println!("{APP_VERSION}");
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), "{APP_VERSION}");
         return Ok(());
     }
 

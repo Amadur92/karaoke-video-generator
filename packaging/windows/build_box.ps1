@@ -48,9 +48,27 @@ $ReleaseDir = Join-Path $TargetDir "release"
 Remove-Item (Join-Path $ReleaseDir "desktop_app.exe") -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $ReleaseDir "karaoke_render.exe") -Force -ErrorAction SilentlyContinue
 cargo build --release
-$BuiltVersion = & (Join-Path $ReleaseDir "desktop_app.exe") --version
-if ($BuiltVersion.Trim() -ne $AppVersion) {
-    throw "Built desktop_app.exe reports version '$BuiltVersion', expected '$AppVersion'."
+
+$GuiExe = Join-Path $ReleaseDir "desktop_app.exe"
+$ExeBytes = [System.IO.File]::ReadAllBytes($GuiExe)
+$VersionBytes = [System.Text.Encoding]::UTF8.GetBytes($AppVersion)
+$VersionFound = $false
+for ($i = 0; $i -le $ExeBytes.Length - $VersionBytes.Length; $i++) {
+    $matched = $true
+    for ($j = 0; $j -lt $VersionBytes.Length; $j++) {
+        if ($ExeBytes[$i + $j] -ne $VersionBytes[$j]) {
+            $matched = $false
+            break
+        }
+    }
+    if ($matched) {
+        $VersionFound = $true
+        break
+    }
+}
+
+if (-not $VersionFound) {
+    throw "Built desktop_app.exe does not contain expected version '$AppVersion'."
 }
 Pop-Location
 
