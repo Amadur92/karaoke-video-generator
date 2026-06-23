@@ -14,8 +14,15 @@ if [[ -z "$FFMPEG_BIN" || -z "$FFPROBE_BIN" ]]; then
 fi
 
 cd "$ROOT_DIR/desktop_app"
-cargo build --release
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+APP_VERSION="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+rm -f "$TARGET_DIR/release/desktop_app" "$TARGET_DIR/release/karaoke_render"
+cargo build --release
+BUILT_VERSION="$("$TARGET_DIR/release/desktop_app" --version)"
+if [[ "$BUILT_VERSION" != "$APP_VERSION" ]]; then
+  echo "Built desktop_app reports version '$BUILT_VERSION', expected '$APP_VERSION'." >&2
+  exit 1
+fi
 
 rm -rf "$BOX_DIR"
 mkdir -p "$BOX_DIR/worker" "$BOX_DIR/bin/lib" "$BOX_DIR/assets"

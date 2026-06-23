@@ -7097,6 +7097,11 @@ impl eframe::App for KaraokeApp {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("{APP_VERSION}");
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!(

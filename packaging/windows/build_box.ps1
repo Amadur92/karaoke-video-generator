@@ -41,9 +41,17 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     (Join-Path $WorkerDir "karaoke_worker.py")
 
 Push-Location (Join-Path $Root "desktop_app")
-cargo build --release
 $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
 $TargetDir = $metadata.target_directory
+$AppVersion = $metadata.packages[0].version
+$ReleaseDir = Join-Path $TargetDir "release"
+Remove-Item (Join-Path $ReleaseDir "desktop_app.exe") -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $ReleaseDir "karaoke_render.exe") -Force -ErrorAction SilentlyContinue
+cargo build --release
+$BuiltVersion = & (Join-Path $ReleaseDir "desktop_app.exe") --version
+if ($BuiltVersion.Trim() -ne $AppVersion) {
+    throw "Built desktop_app.exe reports version '$BuiltVersion', expected '$AppVersion'."
+}
 Pop-Location
 
 if (Test-Path $BoxDir) {
