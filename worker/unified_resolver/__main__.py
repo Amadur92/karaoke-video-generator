@@ -10,6 +10,18 @@ from .resolver import Resolver
 from .spotify import SpotifyResolver, extract_spotify_track_id
 
 
+def configure_utf8_stdio() -> None:
+    """Keep Windows code pages from crashing JSON/log output with non-CP1251 chars."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+configure_utf8_stdio()
+
+
 def parse_artist_list(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 

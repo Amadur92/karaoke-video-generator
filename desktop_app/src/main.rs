@@ -1954,7 +1954,7 @@ impl KaraokeApp {
                 std::process::Command::new(&worker_path)
             };
 
-            cmd.env("PYTHONUTF8", "1");
+            cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
             cmd.arg("parse-sheet").arg(&path);
 
             ffmpeg::hide_subprocess_window(&mut cmd);
@@ -2112,7 +2112,7 @@ impl KaraokeApp {
                 std::process::Command::new(&worker_path)
             };
 
-            cmd.env("PYTHONUTF8", "1");
+            cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
 
             if mode_excel {
                 let xlsx_path = match excel_path {
@@ -2528,6 +2528,7 @@ impl KaraokeApp {
                     }
                 }
                 cmd.env("PYTHONUTF8", "1")
+                    .env("PYTHONIOENCODING", "utf-8")
                     .arg("--cli")
                     .arg("--batch-align-queue")
                     .arg(&queue_path)
@@ -3523,6 +3524,7 @@ impl KaraokeApp {
             cmd.env("KARAOKE_EXPORT_DIR", &output_dir)
                 .env("KARAOKE_UPLOAD_DIR", &uploads)
                 .env("PYTHONUTF8", "1")
+                .env("PYTHONIOENCODING", "utf-8")
                 .arg("--cli")
                 .arg("--audio")
                 .arg(&worker_audio_path)

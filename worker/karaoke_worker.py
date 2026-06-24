@@ -15,6 +15,18 @@ import shutil
 # Отключаем проверку SSL-сертификатов: нужна для скачивания моделей/инструментов на macOS.
 ssl._create_default_https_context = ssl._create_unverified_context
 
+
+def configure_utf8_stdio() -> None:
+    """Avoid Windows console code page crashes when logs contain mixed alphabets."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+configure_utf8_stdio()
+
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
     RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
