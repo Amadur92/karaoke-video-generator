@@ -2715,6 +2715,10 @@ impl KaraokeApp {
                     )
                     .arg("--audio-delay")
                     .arg(audio_delay_seconds.to_string())
+                    .arg("--ffmpeg")
+                    .arg(paths::tool_path("ffmpeg"))
+                    .arg("--ffprobe")
+                    .arg(paths::tool_path("ffprobe"))
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped());
                 if plain_lines {
@@ -3702,6 +3706,10 @@ impl KaraokeApp {
                     )
                     .arg("--audio-delay")
                     .arg(audio_delay_seconds.to_string())
+                    .arg("--ffmpeg")
+                    .arg(paths::tool_path("ffmpeg"))
+                    .arg("--ffprobe")
+                    .arg(paths::tool_path("ffprobe"))
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped());
 

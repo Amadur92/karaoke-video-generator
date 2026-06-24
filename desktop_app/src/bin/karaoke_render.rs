@@ -95,6 +95,7 @@ struct RenderConfig {
     scrolling: bool,
     plain_lines: bool,
     ffmpeg: Option<PathBuf>,
+    ffprobe: Option<PathBuf>,
     debug_frame_time: Option<f64>,
     debug_frame_output: Option<PathBuf>,
 }
@@ -164,6 +165,7 @@ fn parse_args() -> Result<RenderConfig, String> {
     let mut scrolling = true;
     let mut plain_lines = false;
     let mut ffmpeg = None;
+    let mut ffprobe = None;
     let mut debug_frame_time = None;
     let mut debug_frame_output = None;
 
@@ -187,6 +189,7 @@ fn parse_args() -> Result<RenderConfig, String> {
             "--plain-lines" => plain_lines = true,
             "--no-scrolling" => scrolling = false,
             "--ffmpeg" => ffmpeg = Some(PathBuf::from(value()?)),
+            "--ffprobe" => ffprobe = Some(PathBuf::from(value()?)),
             "--audio-delay" => {
                 audio_delay = value()?
                     .parse::<f64>()
@@ -219,13 +222,38 @@ fn parse_args() -> Result<RenderConfig, String> {
         scrolling,
         plain_lines,
         ffmpeg,
+        ffprobe,
         debug_frame_time,
         debug_frame_output,
     })
 }
 
-fn audio_duration_seconds(audio: &PathBuf) -> Result<f64, String> {
-    let mut cmd = Command::new("ffprobe");
+fn default_ffmpeg_path(config: &RenderConfig) -> PathBuf {
+    config
+        .ffmpeg
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"))
+}
+
+fn default_ffprobe_path(config: &RenderConfig) -> PathBuf {
+    if let Some(ffprobe) = &config.ffprobe {
+        return ffprobe.clone();
+    }
+    if let Some(ffmpeg) = &config.ffmpeg
+        && let Some(parent) = ffmpeg.parent()
+    {
+        let ffprobe_name = if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        return parent.join(ffprobe_name);
+    }
+    PathBuf::from("ffprobe")
+}
+
+fn audio_duration_seconds(audio: &PathBuf, ffprobe: &PathBuf) -> Result<f64, String> {
+    let mut cmd = Command::new(ffprobe);
     hide_subprocess_window(&mut cmd);
     let output = cmd
         .arg("-v")
@@ -962,10 +990,7 @@ fn render_ass(
         plain_lines,
     )?;
 
-    let ffmpeg = config
-        .ffmpeg
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let ffmpeg = default_ffmpeg_path(config);
     let font_dir = std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -1129,7 +1154,8 @@ fn render(config: RenderConfig) -> Result<(), String> {
         .map_err(|e| format!("Не удалось прочитать timings: {e}"))?;
     let lines: Vec<KaraokeLine> =
         serde_json::from_str(&timings).map_err(|e| format!("Некорректный JSON timings: {e}"))?;
-    let duration = audio_duration_seconds(&config.audio)?;
+    let ffprobe = default_ffprobe_path(&config);
+    let duration = audio_duration_seconds(&config.audio, &ffprobe)?;
 
     let (size_scale, crf, preset) = match config.quality.as_str() {
         "high" => (1.0_f32, "19", "medium"),
@@ -1149,10 +1175,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
     let safe_line_w = safe_text_width(width, size_scale);
     let line_h = (75.0 * size_scale).round() as u32;
     let y_draw = (8.0 * size_scale).round() as i32;
-    let ffmpeg = config
-        .ffmpeg
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let ffmpeg = default_ffmpeg_path(&config);
     let use_ass_renderer = config.engine == "ass" && ffmpeg_supports_ass_filter(&ffmpeg);
     let fps = if use_ass_renderer { 60.0_f64 } else { 30.0_f64 };
     let total_frames = ((duration * fps).ceil() as usize).max(1);
