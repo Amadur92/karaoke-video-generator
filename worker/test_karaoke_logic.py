@@ -26,6 +26,7 @@ from karaoke_worker import (  # noqa: E402
     strip_lrc_timestamps,
     _redistribute_words_in_line,
 )
+from karaoke_alignment import normalize_lyrics_text  # noqa: E402
 
 
 def _w(word, start, end, probability=None):
@@ -70,6 +71,17 @@ def test_parse_timestamped_lyrics_returns_none_for_plain_text():
 def test_strip_lrc_timestamps_keeps_text():
     lrc = "[00:10.00]hello world\n[00:20.00]next line"
     assert strip_lrc_timestamps(lrc) == "hello world\nnext line"
+
+
+def test_normalize_lyrics_text_preserves_user_line_breaks():
+    text = "first phrase, second phrase\none...Two\nA denial\nA denial"
+    normalized = normalize_lyrics_text(text)
+    assert normalized.splitlines() == [
+        "first phrase, second phrase",
+        "one...Two",
+        "A denial",
+        "A denial",
+    ]
 
 
 def test_estimate_line_duration_bounds():

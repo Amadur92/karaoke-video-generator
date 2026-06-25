@@ -1861,9 +1861,6 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         except Exception:
             timestamped_karaoke = None
 
-        if not timestamped_karaoke:
-            lyrics = split_plain_lyrics_phrases(lyrics)
-
         probe_timestamped_with_whisper = bool(
             timestamped_karaoke and (verify_lrc_with_whisper or not plain_lines)
         )
@@ -1990,10 +1987,6 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     max_word_dur=2.0,
                     nonspeech_skip=3.0,
                 )
-                try:
-                    result.regroup(by_gap=True)
-                except Exception:
-                    pass
                 whisper_words = []
                 for segment in getattr(result, 'segments', []) or []:
                     for w in getattr(segment, 'words', []) or []:

@@ -51,25 +51,8 @@ def normalize_lyrics_text(text):
     if not isinstance(text, str):
         return text
     text = normalize_mixed_cyrillic_text(text)
-    text = re.sub(r'([A-Za-zА-Яа-яЁё]{2,})([.!?…]{2,})(?=([A-ZА-ЯЁ]))', r'\1\2\n', text)
-    text = re.sub(r'(?i)(\bA\s+denial[.!?…]*)(?:\s+|(?=A\s+denial))', r'\1\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
-
-    grouped_lines = []
-    denial_run = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if re.fullmatch(r'(?i)A\s+denial[.!?…]*', stripped):
-            denial_run.append(stripped)
-            continue
-        for idx in range(0, len(denial_run), 2):
-            grouped_lines.append(" ".join(denial_run[idx:idx + 2]))
-        denial_run = []
-        grouped_lines.append(line.rstrip())
-    for idx in range(0, len(denial_run), 2):
-        grouped_lines.append(" ".join(denial_run[idx:idx + 2]))
-
-    return "\n".join(grouped_lines).strip()
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
 
 def clean_word(w):
