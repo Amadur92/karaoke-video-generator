@@ -3719,6 +3719,8 @@ impl KaraokeApp {
 
                 match render_cmd.spawn() {
                     Ok(mut render_child) => {
+                        let mut render_error_tail: std::collections::VecDeque<String> =
+                            std::collections::VecDeque::new();
                         if let Some(stderr) = render_child.stderr.take() {
                             use std::io::{BufRead, BufReader};
                             let reader = BufReader::new(stderr);
@@ -3771,6 +3773,10 @@ impl KaraokeApp {
                                     continue;
                                 }
                                 if !trimmed.is_empty() {
+                                    if render_error_tail.len() >= 8 {
+                                        render_error_tail.pop_front();
+                                    }
+                                    render_error_tail.push_back(trimmed.to_string());
                                     let _ = tx.send(ProgressUpdate::RawLog(format!(
                                         "[Rust] {}",
                                         trimmed
@@ -3798,9 +3804,13 @@ impl KaraokeApp {
                                 alignment_summary: None,
                             }));
                         } else {
-                            let _ = tx.send(ProgressUpdate::Error(
-                                "Rust-рендер завершился с ошибкой.".to_string(),
-                            ));
+                            let tail = render_error_tail.into_iter().collect::<Vec<_>>().join("\n");
+                            let message = if tail.trim().is_empty() {
+                                "Rust-рендер завершился с ошибкой.".to_string()
+                            } else {
+                                format!("Rust-рендер завершился с ошибкой:\n{}", tail)
+                            };
+                            let _ = tx.send(ProgressUpdate::Error(message));
                         }
                         ctx.request_repaint();
                     }

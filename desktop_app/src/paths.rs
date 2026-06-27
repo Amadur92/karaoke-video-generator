@@ -155,6 +155,7 @@ fn clear_quarantine(_path: &Path) {}
 pub fn clear_bundled_runtime_quarantine() {
     if let Some(bin_dir) = bundled_bin_dir() {
         clear_quarantine(&bin_dir);
+        repair_macos_bin_runtime(&bin_dir);
     }
 
     let base = app_base_dir();
@@ -298,6 +299,62 @@ fn codesign_ad_hoc(path: &Path, deep: bool) {
         status
     ));
 }
+
+#[cfg(target_os = "macos")]
+fn chmod_executable(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = meta.permissions();
+        let mode = permissions.mode();
+        if mode & 0o111 == 0 {
+            permissions.set_mode(mode | 0o755);
+            let _ = std::fs::set_permissions(path, permissions);
+            debug_log(format!("chmod repair: {}", path.display()));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn repair_macos_bin_runtime(bin_dir: &Path) {
+    if !bin_dir.exists() {
+        return;
+    }
+
+    for tool in ["ffmpeg", "ffprobe"] {
+        let path = bin_dir.join(tool);
+        chmod_executable(&path);
+        codesign_ad_hoc(&path, true);
+    }
+
+    let lib_dir = bin_dir.join("lib");
+    if !lib_dir.is_dir() {
+        return;
+    }
+    let mut stack = vec![lib_dir];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "dylib")
+            {
+                codesign_ad_hoc(&path, false);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn repair_macos_bin_runtime(_bin_dir: &Path) {}
 
 #[cfg(target_os = "macos")]
 fn should_codesign_file(path: &Path) -> bool {

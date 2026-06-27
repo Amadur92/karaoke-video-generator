@@ -185,7 +185,7 @@ pub fn render_trimmed_audio(
         cmd.arg("-af").arg(audio_filters.join(","));
     }
 
-    let status = cmd
+    let output_result = cmd
         .arg("-acodec")
         .arg("pcm_s16le")
         .arg("-ar")
@@ -193,13 +193,31 @@ pub fn render_trimmed_audio(
         .arg("-ac")
         .arg("2")
         .arg(output)
-        .status()
+        .output()
         .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
 
-    if status.success() {
+    if output_result.status.success() {
         Ok(())
     } else {
-        Err("ffmpeg не смог создать обрезанный аудиофайл.".to_string())
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
+        let tail = stderr
+            .lines()
+            .filter(|line| !is_ffmpeg_noise(line.trim()))
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tail.trim().is_empty() {
+            Err("ffmpeg не смог создать обрезанный аудиофайл.".to_string())
+        } else {
+            Err(format!(
+                "ffmpeg не смог создать обрезанный аудиофайл:\n{}",
+                tail
+            ))
+        }
     }
 }
 
