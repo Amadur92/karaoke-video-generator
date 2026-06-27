@@ -7,13 +7,19 @@ BUILD_DIR="$ROOT_DIR/packaging/build"
 BOX_DIR="$OUT_DIR/KaraokeGenerator-macos"
 APP_PATH="$OUT_DIR/Karaoke Generator.app"
 DMG_ROOT="$BUILD_DIR/app-dmg-root"
-DMG_PATH="$OUT_DIR/KaraokeGenerator-macOS-AppleSilicon-arm64-app.dmg"
+DMG_NAME="${DMG_NAME:-KaraokeGenerator-macOS-$(uname -m)-app.dmg}"
+DMG_PATH="$OUT_DIR/$DMG_NAME"
 ENTITLEMENTS="$BUILD_DIR/app-entitlements.plist"
-SIGN_IDENTITY="${SIGN_IDENTITY:-Developer ID Application: Mikhail Sokolenko (CFCFKWCVR9)}"
-NOTARY_PROFILE="${NOTARY_PROFILE:-karaoke-notary}"
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 APP_VERSION="$(cd "$ROOT_DIR/desktop_app" && cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 
-"$ROOT_DIR/packaging/macos/build_box.sh"
+if [[ "${SKIP_BUILD_BOX:-0}" != "1" ]]; then
+  "$ROOT_DIR/packaging/macos/build_box.sh"
+elif [[ ! -x "$BOX_DIR/Karaoke Generator" ]]; then
+  echo "Portable macOS box not found. Run packaging/macos/build_box.sh first." >&2
+  exit 1
+fi
 
 rm -rf "$APP_PATH" "$DMG_ROOT" "$DMG_PATH"
 mkdir -p \
@@ -70,7 +76,11 @@ sign_file() {
   [[ -f "$item" ]] || return 0
   chmod u+w "$item" 2>/dev/null || true
   codesign --remove-signature "$item" >/dev/null 2>&1 || true
-  codesign --force --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$item"
+  if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign - "$item"
+  else
+    codesign --force --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$item"
+  fi
 }
 
 while IFS= read -r -d '' item; do
@@ -87,7 +97,11 @@ sign_file "$APP_PATH/Contents/Resources/bin/ffmpeg"
 sign_file "$APP_PATH/Contents/Resources/bin/ffprobe"
 sign_file "$APP_PATH/Contents/Resources/worker/karaoke_worker"
 sign_file "$APP_PATH/Contents/Resources/worker/karaoke_render"
-codesign --force --deep --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP_PATH"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign - "$APP_PATH"
+else
+  codesign --force --deep --timestamp --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP_PATH"
+fi
 
 codesign --verify --deep --strict --verbose=4 "$APP_PATH"
 spctl -a -t exec -vv "$APP_PATH" || true
@@ -109,10 +123,14 @@ hdiutil create \
   -format UDZO \
   "$DMG_PATH"
 
-codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
-xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
-xcrun stapler staple "$DMG_PATH"
-xcrun stapler validate "$DMG_PATH"
-spctl -a -t open --context context:primary-signature -vv "$DMG_PATH"
+if [[ "$SIGN_IDENTITY" != "-" ]]; then
+  codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
+  if [[ -n "$NOTARY_PROFILE" ]]; then
+    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
+    spctl -a -t open --context context:primary-signature -vv "$DMG_PATH"
+  fi
+fi
 
 echo "$DMG_PATH"

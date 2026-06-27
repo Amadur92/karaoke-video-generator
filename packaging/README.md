@@ -36,17 +36,29 @@ packaging/dist/KaraokeGenerator-macos/
 GitHub Actions release artifact names:
 
 ```text
+KaraokeGenerator-macOS-Intel-x64-app.dmg
+KaraokeGenerator-macOS-AppleSilicon-arm64-app.dmg
 KaraokeGenerator-macOS-Intel-x64-portable.tar.gz
 KaraokeGenerator-macOS-AppleSilicon-arm64-portable.tar.gz
 ```
 
-These are the files to give to macOS users. They contain the app, PyInstaller
-worker with its own Python runtime, FFmpeg, FFprobe, and bundled fonts.
+Give normal macOS users the `.app.dmg` files. They contain a single
+`Karaoke Generator.app` bundle with the PyInstaller worker, its own Python
+runtime, FFmpeg, FFprobe, and bundled fonts inside
+`Contents/Resources`, so users cannot easily separate the executable from its
+runtime files. The portable `.tar.gz` files are kept as a fallback/debug
+distribution.
 
 Run:
 
 ```bash
 ./packaging/dist/KaraokeGenerator-macos/Karaoke\ Generator
+```
+
+Local `.app` DMG build:
+
+```bash
+./packaging/macos/build_app_dmg.sh
 ```
 
 ## Windows
@@ -74,6 +86,6 @@ worker with its own Python runtime, FFmpeg, FFprobe, and bundled fonts.
 
 ## Notes
 
-The first packaging target is a portable folder. Turning it into `.dmg`,
-`.app`, or a signed Windows installer should be the next layer after this
-folder build is stable.
+The first packaging target is still a portable folder because it is useful for
+debugging. The macOS user-facing layer is the `.app.dmg` wrapper built from
+that folder.

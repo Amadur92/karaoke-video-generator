@@ -84,9 +84,11 @@ jobs:
           - os: macos-15-intel
             label: Intel x64
             artifact_name: KaraokeGenerator-macOS-Intel-x64-portable
+            app_dmg_name: KaraokeGenerator-macOS-Intel-x64-app.dmg
           - os: macos-latest
             label: Apple Silicon arm64
             artifact_name: KaraokeGenerator-macOS-AppleSilicon-arm64-portable
+            app_dmg_name: KaraokeGenerator-macOS-AppleSilicon-arm64-app.dmg
 
     steps:
       - uses: actions/checkout@v6
@@ -135,6 +137,19 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: packaging/dist/${{ matrix.artifact_name }}.tar.gz
+
+      - name: Build macOS app DMG
+        env:
+          DMG_NAME: ${{ matrix.app_dmg_name }}
+          SIGN_IDENTITY: "-"
+          SKIP_BUILD_BOX: "1"
+        run: ./packaging/macos/build_app_dmg.sh
+
+      - name: Upload macOS app DMG artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.app_dmg_name }}
+          path: packaging/dist/${{ matrix.app_dmg_name }}
 
   release:
     needs: [windows-box, macos-box]
