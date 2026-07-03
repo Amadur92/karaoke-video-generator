@@ -38,6 +38,7 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
     --collect-data whisper `
     --add-data "$Root\desktop_app\assets\Montserrat-Regular.ttf;." `
     --add-data "$Root\desktop_app\assets\Montserrat-Bold.ttf;." `
+    --add-data "$Root\desktop_app\assets\Montserrat-Black.ttf;." `
     (Join-Path $WorkerDir "karaoke_worker.py")
 
 Push-Location (Join-Path $Root "desktop_app")

@@ -352,6 +352,14 @@ fn karaoke_output_filename(artist: &str, title: &str, plain_lines: bool) -> Stri
     ))
 }
 
+fn font_display_name(_font: &str) -> &'static str {
+    "Montserrat"
+}
+
+fn normalized_font_choice(_font: &str) -> String {
+    "montserrat".to_string()
+}
+
 fn batch_output_path(item: &BatchItem, plain_lines: bool) -> PathBuf {
     let artist = if item.artist.trim().is_empty() {
         "Исполнитель"
@@ -443,6 +451,8 @@ enum ProgressUpdate {
     },
     RawLog(String),
     Error(String),
+    VideoTrimmed(String),
+    VideoTrimError(String),
     Finished(bool),
     BatchFinished,
 }
@@ -1033,6 +1043,23 @@ fn optimized_pptx_output_path(input: &Path) -> PathBuf {
     input.with_file_name(format!("{stem} - оптимизированная 1352.pptx"))
 }
 
+fn trimmed_video_output_path(input: &Path, start_ms: i64, end_ms: i64) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let start = ffmpeg::format_time_ms(start_ms).replace(':', "-");
+    let end = ffmpeg::format_time_ms(end_ms).replace(':', "-");
+    let mut candidate = input.with_file_name(format!("{stem} - cut {start}-{end}.mp4"));
+    let mut index = 2;
+    while candidate.exists() {
+        candidate = input.with_file_name(format!("{stem} - cut {start}-{end} ({index}).mp4"));
+        index += 1;
+    }
+    candidate
+}
+
 fn format_file_size(bytes: u64) -> String {
     let mb = bytes as f64 / 1024.0 / 1024.0;
     if mb >= 1024.0 {
@@ -1221,7 +1248,7 @@ impl KaraokeApp {
             lyrics: settings.lyrics,
             model: settings.model,
             quality: settings.quality,
-            font: settings.font,
+            font: normalized_font_choice(&settings.font),
             color_active: settings.color_active,
             color_inactive: settings.color_inactive,
             color_bg: settings.color_bg,
@@ -1523,6 +1550,90 @@ impl KaraokeApp {
         self.video_started_ms = start_ms;
         self.video_status = "Видео воспроизводится внутри приложения.".to_string();
         Ok(())
+    }
+
+    fn generated_video_trim_bounds(&self) -> Option<(i64, i64, i64, bool)> {
+        let duration_ms = self.video_duration_ms.max(0);
+        if duration_ms < 1000 {
+            return None;
+        }
+
+        let start_ms = self
+            .trim_start_ms
+            .clamp(0, duration_ms.saturating_sub(1000));
+        let requested_end_ms = if self.trim_end_ms > 0 {
+            self.trim_end_ms
+        } else {
+            duration_ms
+        };
+        let end_ms = requested_end_ms.clamp(start_ms + 1000, duration_ms);
+        let is_trimmed = start_ms > 250 || end_ms < duration_ms.saturating_sub(250);
+        Some((start_ms, end_ms, duration_ms, is_trimmed))
+    }
+
+    fn start_generated_video_trim(&mut self, ctx: egui::Context) {
+        if self.is_generating {
+            return;
+        }
+
+        let Some(input) = self.generated_file.clone() else {
+            self.status_text = "Сначала сгенерируйте видео.".to_string();
+            return;
+        };
+        let input_path = PathBuf::from(&input);
+        if !input_path.exists() {
+            self.status_text = "Готовый видеофайл не найден.".to_string();
+            self.log_output
+                .push_str(&format!("❌ Видео не найдено: {input}\n"));
+            return;
+        }
+
+        if self.video_duration_ms <= 0 {
+            self.video_duration_ms = ffmpeg::probe_audio_duration_ms(&input).unwrap_or(0);
+        }
+        let Some((start_ms, end_ms, _duration_ms, is_trimmed)) = self.generated_video_trim_bounds()
+        else {
+            self.status_text = "Не удалось определить длительность видео.".to_string();
+            self.log_output
+                .push_str("❌ Не удалось определить длительность готового видео.\n");
+            return;
+        };
+        if !is_trimmed {
+            self.status_text = "Выберите фрагмент для обрезки.".to_string();
+            self.log_output
+                .push_str("ℹ️ Для обрезки готового видео сдвиньте начало или конец фрагмента.\n");
+            return;
+        }
+
+        let output_path = trimmed_video_output_path(&input_path, start_ms, end_ms);
+        self.stop_video_preview();
+        self.video_texture = None;
+        self.is_generating = true;
+        self.progress = 0.1;
+        self.status_text = "Обрезаем готовое видео...".to_string();
+        self.log_output.push_str(&format!(
+            "✂️ Обрезка MP4 без нового рендера: {} - {} → {}\n",
+            ffmpeg::format_time_ms(start_ms),
+            ffmpeg::format_time_ms(end_ms),
+            output_path.to_string_lossy()
+        ));
+
+        let (tx, rx) = channel::<ProgressUpdate>();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = ffmpeg::render_trimmed_video(&input, start_ms, end_ms, &output_path);
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(ProgressUpdate::VideoTrimmed(
+                        output_path.to_string_lossy().to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let _ = tx.send(ProgressUpdate::VideoTrimError(err));
+                }
+            }
+            ctx.request_repaint();
+        });
     }
 
     fn sync_video_preview(&mut self, ctx: &egui::Context) {
@@ -2350,7 +2461,7 @@ impl KaraokeApp {
         let items = self.batch_items.clone();
         let model = self.model.clone();
         let quality = self.quality.clone();
-        let font = self.font.clone();
+        let font = normalized_font_choice(&self.font);
         let active_hex = format!(
             "#{:02X}{:02X}{:02X}",
             self.color_active[0], self.color_active[1], self.color_active[2]
@@ -2700,6 +2811,8 @@ impl KaraokeApp {
                     .arg(&task.output_path)
                     .arg("--quality")
                     .arg(&quality)
+                    .arg("--font")
+                    .arg(&font)
                     .arg("--color-active")
                     .arg(&active_hex)
                     .arg("--color-inactive")
@@ -3384,7 +3497,7 @@ impl KaraokeApp {
         let lyrics = self.lyrics.clone();
         let model = self.model.clone();
         let quality = self.quality.clone();
-        let font = self.font.clone();
+        let font = normalized_font_choice(&self.font);
         let active_color = self.color_active;
         let inactive_color = self.color_inactive;
         let bg_color = self.color_bg;
@@ -3691,6 +3804,8 @@ impl KaraokeApp {
                     .arg(&output_mp4_path)
                     .arg("--quality")
                     .arg(&quality)
+                    .arg("--font")
+                    .arg(&font)
                     .arg("--color-active")
                     .arg(&active_hex)
                     .arg("--color-inactive")
@@ -4101,6 +4216,26 @@ impl eframe::App for KaraokeApp {
                     self.is_generating = false;
                     self.status_text = "Ошибка".to_string();
                     self.log_output.push_str(&format!("❌ Ошибка: {}\n", err));
+                }
+                ProgressUpdate::VideoTrimmed(path) => {
+                    self.is_generating = false;
+                    self.progress = 1.0;
+                    self.status_text = "Видео обрезано.".to_string();
+                    self.stop_video_preview();
+                    self.video_texture = None;
+                    self.video_status = String::new();
+                    self.video_duration_ms = ffmpeg::probe_audio_duration_ms(&path).unwrap_or(0);
+                    self.video_position_ms = 0;
+                    self.generated_file = Some(path.clone());
+                    self.log_output
+                        .push_str(&format!("✅ Обрезанное видео сохранено: {path}\n"));
+                }
+                ProgressUpdate::VideoTrimError(err) => {
+                    paths::debug_log(format!("[video-trim-error] {}", err));
+                    self.is_generating = false;
+                    self.status_text = "Ошибка обрезки видео".to_string();
+                    self.log_output
+                        .push_str(&format!("❌ Ошибка обрезки видео: {}\n", err));
                 }
                 ProgressUpdate::Finished(success) => {
                     if self.batch_current_index.is_some() {
@@ -4766,33 +4901,13 @@ impl eframe::App for KaraokeApp {
                                                         .color(muted),
                                                 );
                                                 egui::ComboBox::from_id_salt("batch_font_combo")
-                                                    .selected_text(match self.font.as_str() {
-                                                        "arial" => "Arial",
-                                                        "helvetica" => "Helvetica",
-                                                        "georgia" => "Georgia",
-                                                        _ => "Montserrat",
-                                                    })
+                                                    .selected_text(font_display_name(&self.font))
                                                     .width(170.0)
                                                     .show_ui(ui, |ui| {
                                                         ui.selectable_value(
                                                             &mut self.font,
                                                             "montserrat".to_string(),
                                                             "Montserrat",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.font,
-                                                            "arial".to_string(),
-                                                            "Arial",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.font,
-                                                            "helvetica".to_string(),
-                                                            "Helvetica",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.font,
-                                                            "georgia".to_string(),
-                                                            "Georgia",
                                                         );
                                                     });
                                             });
@@ -6590,18 +6705,10 @@ impl eframe::App for KaraokeApp {
 
                                             ui.label(egui::RichText::new("Шрифт").color(muted));
                                             egui::ComboBox::from_id_salt("font_combo")
-                                                .selected_text(match self.font.as_str() {
-                                                    "arial" => "Arial",
-                                                    "helvetica" => "Helvetica",
-                                                    "georgia" => "Georgia",
-                                                    _ => "Montserrat (Bold)",
-                                                })
+                                                .selected_text(font_display_name(&self.font))
                                                 .width(ui.available_width() - 10.0)
                                                 .show_ui(ui, |ui| {
-                                                    ui.selectable_value(&mut self.font, "montserrat".to_string(), "Montserrat (Bold)");
-                                                    ui.selectable_value(&mut self.font, "arial".to_string(), "Arial");
-                                                    ui.selectable_value(&mut self.font, "helvetica".to_string(), "Helvetica");
-                                                    ui.selectable_value(&mut self.font, "georgia".to_string(), "Georgia");
+                                                    ui.selectable_value(&mut self.font, "montserrat".to_string(), "Montserrat");
                                                 });
                                             ui.end_row();
                                         });
@@ -6823,6 +6930,19 @@ impl eframe::App for KaraokeApp {
                                                     .color(muted),
                                             );
                                         }
+                                        if let Some((start_ms, end_ms, _duration_ms, true)) =
+                                            self.generated_video_trim_bounds()
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Фрагмент: {} - {}",
+                                                    ffmpeg::format_time_ms(start_ms),
+                                                    ffmpeg::format_time_ms(end_ms)
+                                                ))
+                                                .size(11.0)
+                                                .color(muted),
+                                            );
+                                        }
                                     });
 
                                     ui.with_layout(
@@ -6868,6 +6988,22 @@ impl eframe::App for KaraokeApp {
                                                 }
                                             }
 
+                                            let trim_btn = egui::Button::new(
+                                                egui::RichText::new("ОБРЕЗАТЬ MP4")
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(egui::Color32::from_rgb(37, 99, 235))
+                                            .rounding(8.0)
+                                            .min_size(egui::vec2(140.0, 36.0));
+                                            let can_trim_video = !self.is_generating
+                                                && self
+                                                    .generated_video_trim_bounds()
+                                                    .map(|(_, _, _, is_trimmed)| is_trimmed)
+                                                    .unwrap_or(false);
+                                            if ui.add_enabled(can_trim_video, trim_btn).clicked() {
+                                                self.start_generated_video_trim(ctx.clone());
+                                            }
                                         },
                                     );
                                 });

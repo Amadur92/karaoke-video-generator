@@ -32,6 +32,7 @@ cp "$TARGET_DIR/release/karaoke_render" "$BOX_DIR/worker/karaoke_render"
 cp -R "$WORKER_DIST/"* "$BOX_DIR/worker/"
 cp "$ROOT_DIR/desktop_app/assets/Montserrat-Regular.ttf" "$BOX_DIR/assets/Montserrat-Regular.ttf"
 cp "$ROOT_DIR/desktop_app/assets/Montserrat-Bold.ttf" "$BOX_DIR/assets/Montserrat-Bold.ttf"
+cp "$ROOT_DIR/desktop_app/assets/Montserrat-Black.ttf" "$BOX_DIR/assets/Montserrat-Black.ttf"
 cp "$FFMPEG_BIN" "$BOX_DIR/bin/ffmpeg"
 cp "$FFPROBE_BIN" "$BOX_DIR/bin/ffprobe"
 

@@ -25,6 +25,7 @@ mkdir -p "$OUT_DIR"
   --collect-data whisper \
   --add-data "$ROOT_DIR/desktop_app/assets/Montserrat-Regular.ttf:." \
   --add-data "$ROOT_DIR/desktop_app/assets/Montserrat-Bold.ttf:." \
+  --add-data "$ROOT_DIR/desktop_app/assets/Montserrat-Black.ttf:." \
   "$WORKER_DIR/karaoke_worker.py"
 
 echo "$OUT_DIR/dist/karaoke_worker"

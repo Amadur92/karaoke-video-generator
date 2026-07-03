@@ -221,6 +221,64 @@ pub fn render_trimmed_audio(
     }
 }
 
+pub fn render_trimmed_video(
+    input: &str,
+    start_ms: i64,
+    end_ms: i64,
+    output: &Path,
+) -> Result<(), String> {
+    let duration_ms = end_ms - start_ms;
+    if duration_ms < 1000 {
+        return Err("Оставьте хотя бы 1 секунду видео после обрезки.".to_string());
+    }
+
+    let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
+    hide_subprocess_window(&mut cmd);
+    let output_result = cmd
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-ss")
+        .arg(format!("{:.3}", start_ms.max(0) as f64 / 1000.0))
+        .arg("-t")
+        .arg(format!("{:.3}", duration_ms as f64 / 1000.0))
+        .arg("-map")
+        .arg("0")
+        .arg("-c")
+        .arg("copy")
+        .arg("-avoid_negative_ts")
+        .arg("make_zero")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output)
+        .output()
+        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
+
+    if output_result.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
+        let tail = stderr
+            .lines()
+            .filter(|line| !is_ffmpeg_noise(line.trim()))
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tail.trim().is_empty() {
+            Err("ffmpeg не смог создать обрезанный видеофайл.".to_string())
+        } else {
+            Err(format!(
+                "ffmpeg не смог создать обрезанный видеофайл:\n{}",
+                tail
+            ))
+        }
+    }
+}
+
 pub fn probe_video_size(path: &str) -> Result<(usize, usize), String> {
     let mut cmd = std::process::Command::new(paths::tool_path("ffprobe"));
     hide_subprocess_window(&mut cmd);

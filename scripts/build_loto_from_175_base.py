@@ -26,7 +26,8 @@ for prefix in ("p", "a", "r", "p14"):
 
 VIDEO_OFF = {"x": "623888", "y": "3795870"}
 VIDEO_EXT = {"cx": "10944225", "cy": "1818337"}
-VIDEO_CROP = "4545"
+DEFAULT_HORIZONTAL_CROP = 0
+DEFAULT_VERTICAL_CROP = 4545
 
 
 def q(ns: str, tag: str) -> str:
@@ -162,7 +163,11 @@ def update_track_title(slide_root: etree._Element, track: dict) -> None:
     normalize_title_run_style(shape, size)
 
 
-def update_video_picture(slide_root: etree._Element) -> str:
+def update_video_picture(
+    slide_root: etree._Element,
+    horizontal_crop: int,
+    vertical_crop: int,
+) -> str:
     pictures = slide_root.xpath(
         '//p:pic[.//a:videoFile or .//p14:media]',
         namespaces=NS,
@@ -184,7 +189,14 @@ def update_video_picture(slide_root: etree._Element) -> str:
         blip = blip_fill.xpath("./a:blip", namespaces=NS)[0]
         rect = etree.Element(q("a", "srcRect"))
         blip.addnext(rect)
-    rect.attrib.update({"l": VIDEO_CROP, "t": VIDEO_CROP, "r": VIDEO_CROP, "b": VIDEO_CROP})
+    rect.attrib.update(
+        {
+            "l": str(horizontal_crop),
+            "t": str(vertical_crop),
+            "r": str(horizontal_crop),
+            "b": str(vertical_crop),
+        }
+    )
 
     blip = picture.xpath("./p:blipFill/a:blip", namespaces=NS)[0]
     poster_rid = blip.get(q("r", "embed")) or blip.get(q("r", "link"))
@@ -259,7 +271,14 @@ def generate_poster(video_path: Path, out_path: Path) -> None:
         )
 
 
-def build(base_pptx: Path, xlsx_path: Path, media_dir: Path, output_pptx: Path) -> None:
+def build(
+    base_pptx: Path,
+    xlsx_path: Path,
+    media_dir: Path,
+    output_pptx: Path,
+    horizontal_crop: int,
+    vertical_crop: int,
+) -> None:
     tracks = load_tracks(xlsx_path, media_dir)
     output_pptx.parent.mkdir(parents=True, exist_ok=True)
 
@@ -278,7 +297,11 @@ def build(base_pptx: Path, xlsx_path: Path, media_dir: Path, output_pptx: Path) 
             slide_path = f"ppt/slides/slide{slide_index}.xml"
             root = etree.fromstring(zin.read(slide_path))
             update_track_title(root, track)
-            poster_rid = update_video_picture(root)
+            poster_rid = update_video_picture(
+                root,
+                horizontal_crop=horizontal_crop,
+                vertical_crop=vertical_crop,
+            )
             modified_xml[slide_path] = serialize(root)
 
             rels = read_rels(zin, slide_index)
@@ -317,9 +340,28 @@ def main() -> None:
     parser.add_argument("--xlsx", type=Path, required=True)
     parser.add_argument("--media-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--horizontal-crop",
+        type=int,
+        default=DEFAULT_HORIZONTAL_CROP,
+        help="PowerPoint video srcRect crop for left/right edges in 1/1000%% units. Default: no side crop.",
+    )
+    parser.add_argument(
+        "--vertical-crop",
+        type=int,
+        default=DEFAULT_VERTICAL_CROP,
+        help="PowerPoint video srcRect crop for top/bottom edges in 1/1000%% units.",
+    )
     args = parser.parse_args()
 
-    build(args.base, args.xlsx, args.media_dir, args.output)
+    build(
+        args.base,
+        args.xlsx,
+        args.media_dir,
+        args.output,
+        horizontal_crop=args.horizontal_crop,
+        vertical_crop=args.vertical_crop,
+    )
     print(f"[pptx] wrote {args.output}")
 
 

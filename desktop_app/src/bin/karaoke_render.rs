@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 
 const MONTSERRAT_BOLD: &[u8] = include_bytes!("../../assets/Montserrat-Bold.ttf");
+const MONTSERRAT_BLACK: &[u8] = include_bytes!("../../assets/Montserrat-Black.ttf");
 const ASS_BASE_FONT_SIZE: f32 = 52.0;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -51,6 +52,7 @@ struct WordLayer {
 
 struct LineCache {
     inactive: RgbaImage,
+    active_inactive: RgbaImage,
     active_plain: RgbaImage,
     words: Vec<WordLayer>,
     width: u32,
@@ -81,6 +83,24 @@ fn paint_line_highlight(img: &mut RgbaImage, words: &[WordLayer], t: f64) {
     }
 }
 
+fn blend_images(a: &RgbaImage, b: &RgbaImage, amount: f32) -> RgbaImage {
+    if amount <= 0.001 {
+        return a.clone();
+    }
+    if amount >= 0.999 {
+        return b.clone();
+    }
+    let inv = 1.0 - amount;
+    let mut out = a.clone();
+    for (dst, src) in out.pixels_mut().zip(b.pixels()) {
+        dst.0[0] = (dst.0[0] as f32 * inv + src.0[0] as f32 * amount).round() as u8;
+        dst.0[1] = (dst.0[1] as f32 * inv + src.0[1] as f32 * amount).round() as u8;
+        dst.0[2] = (dst.0[2] as f32 * inv + src.0[2] as f32 * amount).round() as u8;
+        dst.0[3] = (dst.0[3] as f32 * inv + src.0[3] as f32 * amount).round() as u8;
+    }
+    out
+}
+
 struct RenderConfig {
     timings: PathBuf,
     audio: PathBuf,
@@ -91,6 +111,7 @@ struct RenderConfig {
     background: Rgba<u8>,
     inactive_opacity: f32,
     audio_delay: f64,
+    font: String,
     engine: String,
     scrolling: bool,
     plain_lines: bool,
@@ -145,7 +166,7 @@ fn escape_filter_path(path: &Path) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--inactive-opacity 0.65] [--audio-delay 0.0] [--plain-lines] [--no-scrolling]"
+        "Usage: karaoke_render --timings timings.json --audio input.wav --output out.mp4 [--quality medium|high|ultra] [--font montserrat] [--color-active #000000] [--color-inactive #B4B9C3] [--color-bg #FFFFFF] [--inactive-opacity 0.65] [--audio-delay 0.0] [--plain-lines] [--no-scrolling]"
     );
     std::process::exit(2);
 }
@@ -161,6 +182,7 @@ fn parse_args() -> Result<RenderConfig, String> {
     let mut background = parse_color("#FFFFFF")?;
     let mut inactive_opacity = 0.65_f32;
     let mut audio_delay = 0.0;
+    let mut font = "montserrat".to_string();
     let mut engine = "frames".to_string();
     let mut scrolling = true;
     let mut plain_lines = false;
@@ -176,6 +198,7 @@ fn parse_args() -> Result<RenderConfig, String> {
             "--audio" => audio = Some(PathBuf::from(value()?)),
             "--output" => output = Some(PathBuf::from(value()?)),
             "--quality" => quality = value()?,
+            "--font" => font = value()?,
             "--color-active" => active = parse_color(&value()?)?,
             "--color-inactive" => inactive = parse_color(&value()?)?,
             "--color-bg" => background = parse_color(&value()?)?,
@@ -218,6 +241,7 @@ fn parse_args() -> Result<RenderConfig, String> {
         background,
         inactive_opacity,
         audio_delay,
+        font,
         engine,
         scrolling,
         plain_lines,
@@ -226,6 +250,20 @@ fn parse_args() -> Result<RenderConfig, String> {
         debug_frame_time,
         debug_frame_output,
     })
+}
+
+fn selected_montserrat_font(
+    font: &str,
+) -> Result<(&'static [u8], &'static str, &'static str), String> {
+    match font.trim().to_lowercase().as_str() {
+        "montserrat_black" | "montserrat black" | "montserrat-black" => {
+            Ok((MONTSERRAT_BLACK, "Montserrat Black", "Montserrat Black"))
+        }
+        "montserrat" | "montserrat_bold" | "montserrat bold" | "montserrat-bold" => {
+            Ok((MONTSERRAT_BOLD, "Montserrat", "Montserrat Bold"))
+        }
+        _ => Ok((MONTSERRAT_BOLD, "Montserrat", "Montserrat Bold")),
+    }
 }
 
 fn default_ffmpeg_path(config: &RenderConfig) -> PathBuf {
@@ -367,7 +405,8 @@ fn paste_alpha_onto_opaque(dst: &mut RgbaImage, src: &RgbaImage, x: i32, y: i32,
 #[allow(clippy::too_many_arguments)]
 fn build_line_cache(
     lines: &[KaraokeLine],
-    font: &FontArc,
+    inactive_font: &FontArc,
+    active_font: &FontArc,
     font_size: f32,
     line_height: u32,
     y_draw: i32,
@@ -384,48 +423,70 @@ fn build_line_cache(
     let word_active_offset = (10.0 * render_scale).round() as i32;
     let line_pad_x = (40.0 * render_scale).round() as u32;
     let line_text_x = (20.0 * render_scale).round() as i32;
-    let space_w = text_width(font, render_font_size, " ");
+    let inactive_space_w = text_width(inactive_font, render_font_size, " ");
+    let active_space_w = text_width(active_font, render_font_size, " ");
 
     lines
         .iter()
         .map(|line| {
-            let widths: Vec<f32> = line
+            let inactive_widths: Vec<f32> = line
                 .words
                 .iter()
-                .map(|word| text_width(font, render_font_size, &word.word))
+                .map(|word| text_width(inactive_font, render_font_size, &word.word))
                 .collect();
-            let total_w =
-                widths.iter().sum::<f32>() + space_w * line.words.len().saturating_sub(1) as f32;
-            let line_w = (total_w.ceil() as u32 + line_pad_x).max(1);
+            let active_widths: Vec<f32> = line
+                .words
+                .iter()
+                .map(|word| text_width(active_font, render_font_size, &word.word))
+                .collect();
+            let inactive_total_w = inactive_widths.iter().sum::<f32>()
+                + inactive_space_w * line.words.len().saturating_sub(1) as f32;
+            let active_total_w = active_widths.iter().sum::<f32>()
+                + active_space_w * line.words.len().saturating_sub(1) as f32;
+            let content_w = inactive_total_w.max(active_total_w);
+            let line_w = (content_w.ceil() as u32 + line_pad_x).max(1);
             let base_line_w = (line_w as f32 / text_supersample).round().max(1.0) as u32;
             let mut inactive_img =
+                ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
+            let mut active_inactive_img =
                 ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
             let mut active_plain_img =
                 ImageBuffer::from_pixel(line_w, render_line_height, Rgba([0, 0, 0, 0]));
 
-            let mut x = line_text_x;
+            let mut inactive_x =
+                line_text_x + ((content_w - inactive_total_w) / 2.0).round() as i32;
+            let mut active_x = line_text_x + ((content_w - active_total_w) / 2.0).round() as i32;
             let mut layers = Vec::with_capacity(line.words.len());
             for (idx, word) in line.words.iter().enumerate() {
                 draw_text_mut(
                     &mut inactive_img,
                     inactive,
-                    x,
+                    inactive_x,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font,
+                    inactive_font,
+                    &word.word,
+                );
+                draw_text_mut(
+                    &mut active_inactive_img,
+                    inactive,
+                    active_x,
+                    render_y_draw,
+                    PxScale::from(render_font_size),
+                    active_font,
                     &word.word,
                 );
                 draw_text_mut(
                     &mut active_plain_img,
                     active,
-                    x,
+                    active_x,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font,
+                    active_font,
                     &word.word,
                 );
 
-                let word_w = widths[idx].ceil() as u32;
+                let word_w = active_widths[idx].ceil() as u32;
                 let mut active_img = ImageBuffer::from_pixel(
                     word_w + word_pad,
                     render_line_height,
@@ -437,7 +498,7 @@ fn build_line_cache(
                     word_active_offset,
                     render_y_draw,
                     PxScale::from(render_font_size),
-                    font,
+                    active_font,
                     &word.word,
                 );
 
@@ -453,18 +514,26 @@ fn build_line_cache(
                 layers.push(WordLayer {
                     start: word.start,
                     end: word.end,
-                    paste_x: ((x - word_active_offset) as f32 / text_supersample).round() as i32,
+                    paste_x: ((active_x - word_active_offset) as f32 / text_supersample).round()
+                        as i32,
                     fill_width: ((word_active_offset.max(0) as f32 + word_w as f32)
                         / text_supersample)
                         .round()
                         .max(1.0) as u32,
                     image: base_active_img,
                 });
-                x += (widths[idx] + space_w).round() as i32;
+                inactive_x += (inactive_widths[idx] + inactive_space_w).round() as i32;
+                active_x += (active_widths[idx] + active_space_w).round() as i32;
             }
 
             let base_inactive_img = imageops::resize(
                 &inactive_img,
+                base_line_w,
+                line_height,
+                imageops::FilterType::Lanczos3,
+            );
+            let base_active_inactive_img = imageops::resize(
+                &active_inactive_img,
                 base_line_w,
                 line_height,
                 imageops::FilterType::Lanczos3,
@@ -478,6 +547,7 @@ fn build_line_cache(
 
             LineCache {
                 inactive: base_inactive_img,
+                active_inactive: base_active_inactive_img,
                 active_plain: base_active_plain_img,
                 words: layers,
                 width: base_line_w,
@@ -665,7 +735,9 @@ fn write_ass_file(
     size_scale: f32,
     scrolling: bool,
     plain_lines: bool,
+    font: &str,
 ) -> Result<(), String> {
+    let (font_bytes, ass_font_name, font_log_name) = selected_montserrat_font(font)?;
     let mut ass = String::new();
     ass.push_str("[Script Info]\n");
     ass.push_str("ScriptType: v4.00+\n");
@@ -674,7 +746,8 @@ fn write_ass_file(
     ass.push_str("[V4+ Styles]\n");
     ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
     ass.push_str(&format!(
-        "Style: Dynamic,Montserrat,{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        "Style: Dynamic,{},{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
+        ass_font_name,
         ASS_BASE_FONT_SIZE * size_scale,
         ass_color(active, 0),
         ass_color(active, 0),
@@ -686,8 +759,8 @@ fn write_ass_file(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
     );
 
-    let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
-        .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
+    let font = FontArc::try_from_slice(font_bytes)
+        .map_err(|_| format!("Не удалось загрузить {font_log_name}"))?;
     let base_font_size = ASS_BASE_FONT_SIZE * size_scale;
     let min_font_size = base_font_size * (26.0 / 42.0);
     let line_spacing = 62.0_f32 * size_scale;
@@ -988,6 +1061,7 @@ fn render_ass(
         size_scale,
         scrolling,
         plain_lines,
+        &config.font,
     )?;
 
     let ffmpeg = default_ffmpeg_path(config);
@@ -1203,15 +1277,18 @@ fn render(config: RenderConfig) -> Result<(), String> {
         eprintln!("[Rust] ffmpeg ASS/subtitles filter not found; falling back to frame renderer");
     }
 
-    let font = FontArc::try_from_slice(MONTSERRAT_BOLD)
+    let inactive_font = FontArc::try_from_slice(MONTSERRAT_BOLD)
         .map_err(|_| "Не удалось загрузить Montserrat Bold".to_string())?;
+    let active_font = FontArc::try_from_slice(MONTSERRAT_BLACK)
+        .map_err(|_| "Не удалось загрузить Montserrat Black".to_string())?;
     let text_supersample = 3.0_f32;
     // Pillow/FreeType and ab_glyph expose slightly different perceived pixel sizes.
     // This compensation keeps Montserrat visually aligned with the legacy renderer.
     let render_font_size_max = font_size_max * 1.18;
     let cache = build_line_cache(
         &lines,
-        &font,
+        &inactive_font,
+        &active_font,
         render_font_size_max,
         line_h,
         y_draw,
@@ -1233,10 +1310,11 @@ fn render(config: RenderConfig) -> Result<(), String> {
         line_spacing,
     );
 
-    // Кэш квантованных ресайзов: ключ (line_idx, new_w, new_h), значение — RgbaImage.
+    // Кэш квантованных ресайзов: ключ (line_idx, variant, new_w, new_h), значение — RgbaImage.
     // Используем RefCell, т.к. замыкание захватывает по ссылке, а кадры рендерятся последовательно.
     // Кэшируем только статичные варианты (inactive / active_plain), highlight меняется каждый кадр.
-    let resize_cache: RefCell<HashMap<(usize, u32, u32), RgbaImage>> = RefCell::new(HashMap::new());
+    let resize_cache: RefCell<HashMap<(usize, u8, u32, u32), RgbaImage>> =
+        RefCell::new(HashMap::new());
     // Шаг квантования: 2px. Визуально неотличимо, но резко повышает hit-rate при мелких
     // колебаниях scale в scrolling-режиме.
     const QUANTUM: u32 = 2;
@@ -1274,21 +1352,30 @@ fn render(config: RenderConfig) -> Result<(), String> {
             } else {
                 1.0
             };
-            let is_display_active = idx == active_idx;
+            let center_strength = weight * weight * (3.0 - 2.0 * weight);
             let is_highlight_live =
                 !config.plain_lines && line_highlight_is_live(&line_cache.words, highlight_t);
 
-            let is_cacheable = !(is_highlight_live || config.plain_lines && is_display_active);
-
-            let mut line_img = if config.plain_lines && is_display_active {
-                line_cache.active_plain.clone()
+            let (target_img, target_variant) = if config.plain_lines {
+                (line_cache.active_plain.clone(), 2_u8)
             } else if is_highlight_live {
-                let mut img = line_cache.inactive.clone();
+                let mut img = line_cache.active_inactive.clone();
                 paint_line_highlight(&mut img, &line_cache.words, highlight_t);
-                img
+                (img, 3_u8)
             } else {
-                line_cache.inactive.clone()
+                (line_cache.active_inactive.clone(), 1_u8)
             };
+            let (mut line_img, cache_variant) = if center_strength <= 0.001 {
+                (line_cache.inactive.clone(), 0_u8)
+            } else if center_strength >= 0.999 {
+                (target_img, target_variant)
+            } else {
+                (
+                    blend_images(&line_cache.inactive, &target_img, center_strength),
+                    4_u8,
+                )
+            };
+            let is_cacheable = cache_variant != 3 && cache_variant != 4;
 
             let target_scale =
                 (font_size_min + (font_size_max - font_size_min) * weight) / font_size_max;
@@ -1300,7 +1387,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
             if is_cacheable {
                 let qw = quantize(raw_w, QUANTUM).max(1);
                 let qh = quantize(raw_h, QUANTUM).max(1);
-                let key = (idx, qw, qh);
+                let key = (idx, cache_variant, qw, qh);
                 let cache = resize_cache.borrow();
                 if let Some(cached) = cache.get(&key) {
                     line_img = cached.clone();
@@ -1321,9 +1408,7 @@ fn render(config: RenderConfig) -> Result<(), String> {
             } else {
                 1.0
             };
-            if !is_display_active {
-                opacity *= config.inactive_opacity;
-            }
+            opacity *= config.inactive_opacity + (1.0 - config.inactive_opacity) * center_strength;
 
             let x = width as i32 / 2 - raw_w as i32 / 2;
             let y_center_resized = y_text_center * scale;
