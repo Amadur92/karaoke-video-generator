@@ -170,12 +170,14 @@ def test_download_quality_summary_flags_live_candidate():
 
 # ----------------- YouTube/SoundCloud candidate ranking -----------------
 
-def _entry(title, duration, uploader="user", eid=None):
+def _entry(title, duration, uploader="user", eid=None, view_count=None, description=None):
     return {
         "id": eid or title,
         "title": title,
         "duration": duration,
         "uploader": uploader,
+        "view_count": view_count,
+        "description": description,
         "webpage_url": f"https://www.youtube.com/watch?v={eid or title}",
     }
 
@@ -214,14 +216,92 @@ def test_rank_youtube_entries_excludes_critical_markers():
     assert ranked[0][1]["title"] == "Хочешь"
 
 
-def test_youtube_search_queries_adds_translit():
-    """При латинском исполнителе добавляется кириллический вариант запроса."""
+def test_youtube_search_queries_adds_translit_and_topic():
+    """При латинском исполнителе добавляется кириллический вариант запроса
+    и topic-вариант (для смещения выдачи к студийным YouTube Music-каналам)."""
     from unified_resolver.downloader import Downloader
     dl = Downloader.__new__(Downloader)
     track = TrackMetadata(title="Hochesh", artists=["Zemfira"], duration_sec=234)
     queries = dl._youtube_search_queries("Zemfira - Hochesh", track)
-    assert len(queries) == 2
     assert any(has_cyrillic(q) for q in queries)
+    # topic-запрос должен присутствовать
+    assert any(q.lower().endswith(" topic") for q in queries)
+
+
+# ----------------- view_count signal (G) -----------------
+
+def test_rank_youtube_entries_view_count_bonus():
+    """Более популярный клип (больше просмотров) должен получать бонус.
+    Оригинальный клип у популярного трека обычно имеет на порядки больше
+    просмотров, чем live/phonk/AI-версии."""
+    from unified_resolver.downloader import Downloader
+    dl = Downloader.__new__(Downloader)
+    dl.duration_tolerance = None
+    track = _track(duration=234)
+    entries = [
+        _entry("Хочешь", 234, "ZemfiraVEVO", view_count=5_000_000),
+        _entry("Хочешь", 234, "user", view_count=5_000),
+    ]
+    ranked = dl._rank_youtube_entries(entries, track)
+    # Оба прошли фильтры, но более популярный — первый.
+    assert ranked[0][1]["uploader"] == "ZemfiraVEVO"
+
+
+def test_rank_youtube_entries_view_count_not_for_wrong_title():
+    """Регрессия: просмотры популярного клипа ДРУГОГО трека того же артиста
+    не должны давать бонус. Кейс «Рок-Острова - Ничего не говори»: клип
+    «Костры» того же артиста имеет 12M просмотров, но это другая песня.
+    Бонус за view_count применяется только при title_sim ≥ 60."""
+    from unified_resolver.downloader import Downloader
+    dl = Downloader.__new__(Downloader)
+    dl.duration_tolerance = None
+    track = TrackMetadata(title="Ничего не говори", artists=["Рок-Острова"], duration_sec=289)
+    entries = [
+        # Другой трек того же артиста, огромная популярность, близкая длина.
+        _entry("Рок-Острова – Костры (2010)", 296, "Рок-Острова", view_count=12_500_000),
+        # Нужный трек, меньше просмотров, но точное совпадение названия.
+        _entry("Рок-Острова - Ничего не говори", 289, "Рок-Острова", view_count=500_000),
+    ]
+    ranked = dl._rank_youtube_entries(entries, track)
+    # Нужный трек обязан победить, несмотря на меньшую популярность.
+    assert "Ничего не говори" in ranked[0][1]["title"]
+
+
+def test_rank_youtube_entries_description_concert_penalty():
+    """Описание с признаками концерта штрафует кандидата.
+    Регрессия Рок-острова #36: «Хит 90-х собрал публику» с описанием
+    «Выступление на улице» — это концертная запись, не студийный оригинал."""
+    from unified_resolver.downloader import Downloader
+    dl = Downloader.__new__(Downloader)
+    dl.duration_tolerance = None
+    track = TrackMetadata(title="Ничего не говори", artists=["Рок-Острова"], duration_sec=289)
+    entries = [
+        _entry(
+            "Рок Острова Ничего не говори | Хит 90-х собрал публику",
+            289, "Ivan Calen",
+            description="Выступление на улице. Рок Острова - Ничего не говори. Русские хиты 90-х",
+        ),
+        _entry(
+            "Рок-Острова – Ничего не говори (1996)",
+            240, "Рок-Острова",
+            description="Рок-Острова – Ничего не говори (1996). Эксклюзивы на Бусти",
+        ),
+    ]
+    ranked = dl._rank_youtube_entries(entries, track)
+    # Студийная версия должна победить концертную, несмотря на меньшую длительность.
+    assert ranked[0][1]["title"].startswith("Рок-Острова")
+
+
+def test_has_concert_marker_in_text_detects_live_description():
+    """Прямая проверка детектора концертных описаний."""
+    from unified_resolver.markers import has_concert_marker_in_text
+    assert has_concert_marker_in_text("Live at Wembley Stadium 1998") is True
+    assert has_concert_marker_in_text("Запись концерта в Кремле") is True
+    assert has_concert_marker_in_text("Выступление на фестивале Максидром") is True
+    assert has_concert_marker_in_text("Studio recording, 2024") is False
+    assert has_concert_marker_in_text("") is False
+    # Если reference-title содержит маркер — не срабатывает (легитимный live-трек).
+    assert has_concert_marker_in_text("Live at Wembley", "Song Live") is False
 
 
 # ----------------- file validation -----------------
@@ -235,6 +315,396 @@ def test_is_valid_audio_file_rejects_tiny(tmp_path):
     small = tmp_path / "tiny.mp3"
     small.write_bytes(b"not really audio")
     assert is_valid_audio_file(str(small)) is False
+
+
+# ----------------- word-boundary marker matching (D) -----------------
+
+def test_marker_word_boundary_no_false_positive_on_substring():
+    """Регрессия: «live» НЕ должно матчиться внутри «delivery»/«oliver».
+    Раньше использовался substring-match; с переходом на word-boundary
+    короткие маркеры безопасны."""
+    from unified_resolver.markers import has_critical_marker
+    assert has_critical_marker("Song delivery", "Song") is False
+    assert has_critical_marker("Oliver Twist Song", "Oliver Twist") is False
+    # А реальное слово «live» — матчится.
+    assert has_critical_marker("Song (Live)", "Song") is True
+
+
+def test_marker_new_live_markers_detected():
+    """Новые маркеры для live-выступлений без слова «live» в названии."""
+    from unified_resolver.markers import find_critical_markers
+    # Реальные кейсы из пакета Vau_Muzloto_184:
+    assert "супердискотэка" in find_critical_markers(
+        "Кар-Мэн - Лондон, Гудбай (СупердискотЭка 90-х)", "Лондон гуд бай"
+    )
+    assert "привет андрей" in find_critical_markers(
+        "Рок-Острова - Ничего не говори (Привет, Андрей!)", "Ничего не говори"
+    )
+    assert "музыкальный ринг" in find_critical_markers(
+        'Маша и Медведи - Любочка (Live @ "Музыкальный ринг")', "Любочка"
+    )
+    # Универсальные live-формы:
+    assert "unplugged" in find_critical_markers("Song (MTV Unplugged)", "Song")
+    assert "bbc" not in find_critical_markers("Song (BBC Session)", "Song") or \
+           "session" in find_critical_markers("Song (BBC Session)", "Song")
+
+
+def test_marker_ai_cover_detected():
+    """AI-каверы и нейрогенерация — отдельный класс «не той версии»."""
+    from unified_resolver.markers import find_critical_markers
+    assert "udio ai" in find_critical_markers(
+        "Рок-Острова - Ничего не говори [Udio Ai]", "Ничего не говори"
+    )
+    assert "ai cover" in find_critical_markers("Song (AI cover)", "Song")
+
+
+def test_marker_word_boundary_safe_for_short_markers():
+    """Короткие маркеры (tour, bbc, 8d) не должны давать ложных срабатываний."""
+    from unified_resolver.markers import has_critical_marker
+    # «tour» внутри «contour»/«tournament» — НЕ матчится.
+    assert has_critical_marker("Song contour demo", "Song") is False
+    # Но «Tour Edition» — матчится.
+    assert has_critical_marker("Song (Tour Edition)", "Song") is True
+
+
+# ----------------- critical marker = hard exclude (C) -----------------
+
+def test_score_critical_marker_is_hard_zero():
+    """Регрессия: критический маркер прижимает score к 0 (раньше был −80),
+    чтобы live/remix никогда не выигрывали ранжирование при слабой конкуренции."""
+    track = _track()
+    # Идеальное совпадение title/artist/duration, но это live-версия.
+    live = Candidate(
+        source="youtube", title="Земфира - Хочешь (Live)",
+        artists=["Земfira"], duration_sec=234,
+    )
+    s = score_candidate(track, live)
+    assert s.score == 0.0
+    assert any(f.startswith("critical_marker:") for f in s.flags)
+
+
+def test_score_original_beats_live_even_with_duration_bonus():
+    """Даже если у live-версии идеальная длительность, а у оригинала есть
+    небольшое расхождение — оригинал обязан победить (live принудительно = 0)."""
+    track = _track(duration=234)
+    original = Candidate(
+        source="youtube", title="Земфира - Хочешь",
+        artists=["Земфira"], duration_sec=242,  # 8с расхождение
+    )
+    live = Candidate(
+        source="youtube", title="Земфира - Хочешь (Live)",
+        artists=["Земфira"], duration_sec=234,  # идеально
+    )
+    assert score_candidate(track, original).score > score_candidate(track, live).score
+
+
+# ----------------- weak album detection (B) -----------------
+
+def test_is_weak_album_detects_compilations_and_live():
+    from unified_resolver.itunes import is_weak_album
+    assert is_weak_album("Новое и Лучшее") is True
+    assert is_weak_album("Greatest Hits") is True
+    assert is_weak_album("Дискотека 80-х (Авторадио)") is True
+    assert is_weak_album("MTV Unplugged") is True
+    assert is_weak_album("Live at Wembley") is True
+    assert is_weak_album("Deluxe Edition") is True
+    # Студийный альбом — НЕ слабый.
+    assert is_weak_album("Вокруг света") is False
+    assert is_weak_album(None) is False
+
+
+def test_deezer_enrich_skips_wrong_artist_compilation():
+    """Регрессия Vau_Muzloto_184 #29: «Маша и Медведи - Любочка» обогащался
+    из сборника «DJ Groove и все, все…» с чужой длительностью (318с вместо
+    ~257с). Теперь enrichment должен отсечь чужого артиста и не брать его
+    длительность из сборника."""
+    import unified_resolver.resolver as resolver_mod
+    from unified_resolver.resolver import enrich_from_deezer
+
+    # Мокаем Deezer API: первый результат — сборник DJ Groove (чужой артист,
+    # слабый альбом), второй — настоящий трек группы.
+    fake_results = {
+        "data": [
+            {
+                "title": "Любочка",
+                "artist": {"name": "DJ Groove"},
+                "album": {"title": "DJ Groove и все, все, все...", "cover_big": "x"},
+                "duration": 318, "isrc": "FAKE1",
+            },
+            {
+                "title": "Любочка",
+                "artist": {"name": "Маша и Медведи"},
+                "album": {"title": "Сlobber", "cover_big": "y"},
+                "duration": 257, "isrc": "FR2X41802514",
+            },
+        ]
+    }
+    real_get_json = resolver_mod.get_json
+    try:
+        resolver_mod.get_json = lambda url: fake_results
+        from unified_resolver.models import TrackMetadata
+        t = TrackMetadata(title="Любочка", artists=["Маша и Медведи"])
+        enrich_from_deezer(t)
+        # Должен выбрать запись нужного артиста из студийного альбома.
+        assert t.duration_sec == 257, f"expected 257, got {t.duration_sec}"
+        assert t.isrc == "FR2X41802514"
+    finally:
+        resolver_mod.get_json = real_get_json
+
+
+def test_deezer_enrich_falls_back_to_weak_when_no_strong():
+    """Если студийного альбома нужного артиста нет, enrichment всё равно
+    берёт доступную запись (не ухудшаем поведение для редких релизов)."""
+    import unified_resolver.resolver as resolver_mod
+    from unified_resolver.resolver import enrich_from_deezer
+
+    fake_results = {
+        "data": [
+            {
+                "title": "Редкая песня",
+                "artist": {"name": "Исполнитель"},
+                "album": {"title": "Greatest Hits", "cover_big": "x"},
+                "duration": 200, "isrc": "FB1",
+            },
+        ]
+    }
+    real_get_json = resolver_mod.get_json
+    try:
+        resolver_mod.get_json = lambda url: fake_results
+        from unified_resolver.models import TrackMetadata
+        t = TrackMetadata(title="Редкая песня", artists=["Исполнитель"])
+        enrich_from_deezer(t)
+        assert t.duration_sec == 200
+    finally:
+        resolver_mod.get_json = real_get_json
+
+
+# ----------------- duration validation (A) -----------------
+
+def test_duration_validator_drops_suspicious_reference():
+    """Регрессия Vau_Muzloto_184 #29/#36: enrichment привязался к чужой
+    длительности (318с), а реальный оригинал идёт ~257с. Медиана YouTube-
+    выдачи ~257 — расхождение >15%, эталон должен быть обнулён, чтобы
+    duration-фильтр не убивал настоящий оригинал."""
+    from unified_resolver.duration_check import DurationValidator
+    from unified_resolver.models import TrackMetadata
+
+    # Имитируем YouTube-выдачу: преобладают версии ~255–262с.
+    fake_durations = [257, 260, 255, 262, 273, 261, 258]
+    validator = DurationValidator(search_fn=lambda q: fake_durations)
+
+    t = TrackMetadata(title="Любочка", artists=["Маша и Медведи"], duration_sec=318)
+    note = validator.validate(t)
+    assert t.duration_sec is None, "reference duration should have been dropped"
+    assert note and note.startswith("reference_duration_dropped")
+    assert "deviation=" in note
+
+
+def test_duration_validator_keeps_consistent_reference():
+    """При согласованности эталона с медианой выдачи — ничего не меняется."""
+    from unified_resolver.duration_check import DurationValidator
+    from unified_resolver.models import TrackMetadata
+
+    fake_durations = [256, 260, 258, 262, 257, 259, 261]
+    validator = DurationValidator(search_fn=lambda q: fake_durations)
+
+    t = TrackMetadata(title="Песня", artists=["А"], duration_sec=258)
+    note = validator.validate(t)
+    assert t.duration_sec == 258
+    assert note and note.startswith("ok:")
+
+
+def test_duration_validator_skips_when_too_few_samples():
+    """Мало данных — не принимаем поспешных решений, оставляем эталон."""
+    from unified_resolver.duration_check import DurationValidator
+    from unified_resolver.models import TrackMetadata
+
+    validator = DurationValidator(search_fn=lambda q: [257, 999])
+    t = TrackMetadata(title="Песня", artists=["А"], duration_sec=318)
+    note = validator.validate(t)
+    assert t.duration_sec == 318
+    assert note is None
+
+
+def test_duration_validator_tolerates_search_error():
+    """Сетевая ошибка YouTube не должна заваливать весь pipeline."""
+    from unified_resolver.duration_check import DurationValidator
+    from unified_resolver.models import TrackMetadata
+
+    def boom(_q):
+        raise RuntimeError("network down")
+
+    t = TrackMetadata(title="Песня", artists=["А"], duration_sec=200)
+    note = DurationValidator(search_fn=boom).validate(t)
+    # Эталон сохранён, проверка просто пропущена.
+    assert t.duration_sec == 200
+    assert note and note.startswith("validation_skipped")
+
+
+# ----------------- MusicBrainz enrichment (E) -----------------
+
+_MB_LJOBOCHKA_RESPONSE = {
+    "recordings": [
+        {
+            "title": "Любочка", "length": 261000, "video": None,
+            "disambiguation": None,
+            "releases": [{"title": "Звездная серия", "date": "2000",
+                          "release-group": {"primary-type": "Album"}}],
+        },
+        {
+            "title": "Любочка", "length": 256000, "video": None,
+            "disambiguation": None,
+            "releases": [{"title": "ВсеСОЮЗный 2", "date": "1998",
+                          "release-group": {"primary-type": "Album"}}],
+        },
+        {
+            # Сборник — должен быть отсеян.
+            "title": "Любочка", "length": 318000, "video": None,
+            "disambiguation": None,
+            "releases": [{"title": "DJ Groove и все, все...", "date": "1999",
+                          "release-group": {"primary-type": "Album",
+                                            "secondary-types": ["Compilation"]}}],
+        },
+    ]
+}
+
+
+def test_musicbrainz_overwrites_wrong_reference_duration():
+    """Регрессия: MusicBrainz должен перезаписать enrichment-длительность,
+    если она расходится с медианой студийных релизов > 10%. Кейс «Маша и
+    Медведи - Любочка»: Deezer дал 318с из сборника, MB знает ~258с.
+    Медиана студийных {261, 256} = 258 (сборник 318 отсеян)."""
+    import unified_resolver.musicbrainz as mb_mod
+    from unified_resolver.musicbrainz import enrich_from_musicbrainz
+    from unified_resolver.models import TrackMetadata
+
+    real_get_json = mb_mod.get_json
+    try:
+        mb_mod.get_json = lambda url, **kw: _MB_LJOBOCHKA_RESPONSE
+        t = TrackMetadata(title="Любочка", artists=["Маша и Медведи"], duration_sec=318)
+        note = enrich_from_musicbrainz(t)
+        assert t.duration_sec == 258, f"expected 258, got {t.duration_sec}"
+        assert note and note.startswith("mb_overwrote_duration")
+    finally:
+        mb_mod.get_json = real_get_json
+
+
+def test_musicbrainz_keeps_consistent_reference():
+    """При согласии MusicBrainz с текущим ref-duration — ничего не меняется."""
+    import unified_resolver.musicbrainz as mb_mod
+    from unified_resolver.musicbrainz import enrich_from_musicbrainz
+    from unified_resolver.models import TrackMetadata
+
+    real_get_json = mb_mod.get_json
+    try:
+        mb_mod.get_json = lambda url, **kw: _MB_LJOBOCHKA_RESPONSE
+        t = TrackMetadata(title="Любочка", artists=["Маша и Медведи"], duration_sec=259)
+        note = enrich_from_musicbrainz(t)
+        assert t.duration_sec == 259
+        assert note and note.startswith("mb_ok:")
+    finally:
+        mb_mod.get_json = real_get_json
+
+
+def test_musicbrainz_sets_duration_when_missing():
+    """Если у трека не было duration_sec — берём медиану MusicBrainz."""
+    import unified_resolver.musicbrainz as mb_mod
+    from unified_resolver.musicbrainz import enrich_from_musicbrainz
+    from unified_resolver.models import TrackMetadata
+
+    real_get_json = mb_mod.get_json
+    try:
+        mb_mod.get_json = lambda url, **kw: _MB_LJOBOCHKA_RESPONSE
+        t = TrackMetadata(title="Любочка", artists=["Маша и Медведи"])
+        note = enrich_from_musicbrainz(t)
+        assert t.duration_sec == 258
+        assert note and note.startswith("mb_set_duration")
+    finally:
+        mb_mod.get_json = real_get_json
+
+
+def test_musicbrainz_works_with_single_studio_sample():
+    """MusicBrainz дедуплицирует recordings по ID, поэтому для нишевых
+    треков возвращается 1 студийная запись — её достаточно для перезаписи."""
+    import unified_resolver.musicbrainz as mb_mod
+    from unified_resolver.musicbrainz import enrich_from_musicbrainz
+    from unified_resolver.models import TrackMetadata
+
+    single = {"recordings": [{
+        "title": "Song", "length": 240000, "video": None, "disambiguation": None,
+        "releases": [{"title": "Studio Album", "date": "2000",
+                      "release-group": {"primary-type": "Album"}}],
+    }]}
+    real_get_json = mb_mod.get_json
+    try:
+        mb_mod.get_json = lambda url, **kw: single
+        t = TrackMetadata(title="Song", artists=["X"], duration_sec=320)
+        note = enrich_from_musicbrainz(t)
+        assert t.duration_sec == 240
+        assert note and note.startswith("mb_overwrote_duration")
+    finally:
+        mb_mod.get_json = real_get_json
+
+
+def test_musicbrainz_skips_live_and_remix_disambiguations():
+    """Recording с disambiguation 'live'/'remix' не должен учитываться."""
+    from unified_resolver.musicbrainz import _collect_studio_durations
+    from unified_resolver.models import TrackMetadata
+
+    data = {
+        "recordings": [
+            {"title": "Song", "length": 240000, "video": None, "disambiguation": None,
+             "releases": [{"release-group": {"primary-type": "Album"}}]},
+            {"title": "Song", "length": 300000, "video": None, "disambiguation": "live recording",
+             "releases": [{"release-group": {"primary-type": "Album"}}]},
+            {"title": "Song", "length": 250000, "video": None, "disambiguation": "radio edit",
+             "releases": [{"release-group": {"primary-type": "Album"}}]},
+        ]
+    }
+    t = TrackMetadata(title="Song", artists=["X"])
+    durations = _collect_studio_durations(data, t)
+    # Только студийная 240с осталась.
+    assert durations == [240]
+
+
+def test_musicbrainz_tolerates_api_failure():
+    """Сетевая ошибка / пустой ответ не ломают pipeline."""
+    import unified_resolver.musicbrainz as mb_mod
+    from unified_resolver.musicbrainz import enrich_from_musicbrainz
+    from unified_resolver.models import TrackMetadata
+
+    real_get_json = mb_mod.get_json
+    try:
+        mb_mod.get_json = lambda url, **kw: None
+        t = TrackMetadata(title="Песня", artists=["А"], duration_sec=200)
+        note = enrich_from_musicbrainz(t)
+        assert t.duration_sec == 200  # эталон сохранён
+        assert note is None
+    finally:
+        mb_mod.get_json = real_get_json
+
+
+# ----------------- provenance (I) -----------------
+
+def test_save_provenance_writes_json(tmp_path):
+    from unified_resolver.downloader import Downloader
+    from unified_resolver.models import TrackMetadata
+    import json
+
+    dl = Downloader.__new__(Downloader)
+    dl.format = "mp3"
+    track = TrackMetadata(title="Хочешь", artists=["Земфира"], duration_sec=234)
+    provenance = {
+        "track": {"title": "Хочешь", "artists": ["Земфира"], "duration_sec_reference": 234},
+        "selected": {"source": "youtube", "title": "Хочешь", "actual_duration": 234},
+        "tried": [],
+    }
+    dl._save_provenance(track, provenance, str(tmp_path))
+    out = tmp_path / "Земфира - Хочешь.source.json"
+    assert out.exists()
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["selected"]["source"] == "youtube"
+    assert saved["track"]["duration_sec_reference"] == 234
 
 
 # ----------------- простой раннер -----------------

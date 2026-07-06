@@ -342,20 +342,43 @@ class Downloader:
             safe_artist = "".join(c for c in track.primary_artist if c.isalnum() or c in " -_().")
             track_folder = f"{safe_artist} - {safe_title}"
             track_dir = os.path.join(self.output_dir, track_folder)
-            
+
         os.makedirs(track_dir, exist_ok=True)
-        
+
         temp_audio: Optional[str] = None
         temp_cover: Optional[str] = None
         resolved_candidate = None
-        
+
+        # Provenance-запись: фиксирует, откуда и почему скачан трек, чтобы
+        # массово ревьюить пакеты и быстро ловить регрессии (live-версии и т.д.).
+        # Сохраняется в .source.json рядом с аудио (см. _save_provenance).
+        provenance: dict[str, Any] = {
+            "track": {
+                "title": track.title,
+                "artists": list(track.artists),
+                "album": track.album,
+                "duration_sec_reference": track.duration_sec,
+                "isrc": track.isrc,
+            },
+            "duration_note": getattr(track, "duration_note", None),
+            "tried": [],
+            "selected": None,
+        }
+
         # Try candidates in order
         for scored in candidates:
             candidate = scored.candidate
-            
+
             # Skip candidates with critical bad markers or very low scores
             if any(f.startswith("critical_marker:") for f in scored.flags):
                 print(f"[#] Skipping candidate '{candidate.title}' because it contains a critical bad marker (karaoke/minus/instrumental).")
+                provenance["tried"].append({
+                    "source": candidate.source,
+                    "title": candidate.title,
+                    "score": scored.score,
+                    "result": "skipped_critical_marker",
+                    "flags": scored.flags,
+                })
                 continue
             allow_low_score_exact = (
                 self.duration_tolerance
@@ -364,8 +387,14 @@ class Downloader:
             )
             if scored.score < 20 and not allow_low_score_exact:
                 print(f"[#] Skipping candidate '{candidate.title}' due to low score ({scored.score} < 20).")
+                provenance["tried"].append({
+                    "source": candidate.source,
+                    "title": candidate.title,
+                    "score": scored.score,
+                    "result": "skipped_low_score",
+                })
                 continue
-                
+
             print(f"[*] Trying candidate from '{candidate.source}' (Score: {scored.score})...")
             try:
                 if candidate.source == "jiosaavn" and candidate.external_id:
@@ -377,9 +406,9 @@ class Downloader:
                 elif "youtube" in candidate.source:
                     if candidate.public_url:
                         temp_audio = self._download_youtube(candidate.public_url)
-                
+
                 if temp_audio:
-                    # Постскачивательная проверка длительности: некоторые источники
+                    # Постскачивательные проверки длительности: некоторые источники
                     # (JioSaavn, Deezer metadata) не сообщают duration в кандидате,
                     # поэтому фильтр по длительности не мог их отсечь заранее. Если
                     # скачанный файл сильно расходится с эталоном (>25с) — это почти
@@ -392,14 +421,46 @@ class Downloader:
                             f"({track.duration_sec}s) by {abs(track.duration_sec - actual_dur)}s "
                             f"— likely wrong version, discarding and trying next candidate."
                         )
+                        provenance["tried"].append({
+                            "source": candidate.source,
+                            "title": candidate.title,
+                            "score": scored.score,
+                            "result": "rejected_duration_mismatch",
+                            "expected_duration": track.duration_sec,
+                            "actual_duration": actual_dur,
+                            "url": candidate.public_url,
+                        })
                         _safe_remove(temp_audio)
                         temp_audio = None
                         continue
                     resolved_candidate = candidate
+                    provenance["selected"] = {
+                        "source": candidate.source,
+                        "title": candidate.title,
+                        "artists": list(candidate.artists),
+                        "score": scored.score,
+                        "url": candidate.public_url,
+                        "external_id": candidate.external_id,
+                        "expected_duration": track.duration_sec,
+                        "actual_duration": actual_dur,
+                    }
                     print(f"[+] Successfully downloaded stream from '{candidate.source}'!")
                     break
+                else:
+                    provenance["tried"].append({
+                        "source": candidate.source,
+                        "title": candidate.title,
+                        "score": scored.score,
+                        "result": "no_stream",
+                    })
             except Exception as e:
                 print(f"[!] Failed to download candidate from '{candidate.source}': {e}", file=sys.stderr)
+                provenance["tried"].append({
+                    "source": candidate.source,
+                    "title": candidate.title,
+                    "score": scored.score,
+                    "result": f"error:{type(e).__name__}",
+                })
                 
         # Fallback to YouTube search if all candidates failed or no candidates were found
         if not temp_audio:
@@ -409,7 +470,7 @@ class Downloader:
             # по длительности и официальности канала, а не по запросу.
             query = f"{track.primary_artist} - {track.title}".strip(" -")
             try:
-                temp_audio = self._download_youtube_search(query, track)
+                temp_audio = self._download_youtube_search(query, track, provenance)
             except Exception as e:
                 print(f"[!] YouTube search download failed: {e}", file=sys.stderr)
 
@@ -419,7 +480,7 @@ class Downloader:
             print(f"[!] YouTube unavailable/failed. Trying SoundCloud search...")
             sc_query = f"{track.primary_artist} {track.title}".strip()
             try:
-                temp_audio = self._download_soundcloud_search(sc_query, track)
+                temp_audio = self._download_soundcloud_search(sc_query, track, provenance)
             except Exception as e:
                 print(f"[!] SoundCloud search download failed: {e}", file=sys.stderr)
 
@@ -441,7 +502,7 @@ class Downloader:
             )
             _safe_remove(temp_audio)
             return False
-            
+
         try:
             # Determine downloaded audio duration and enrich track metadata.
             # Сохраняем исходный эталон, чтобы не затереть его реальной
@@ -450,17 +511,27 @@ class Downloader:
             actual_duration = get_audio_duration(temp_audio)
             if actual_duration:
                 print(f"[*] Actual downloaded audio duration: {actual_duration}s")
-                
+
+            # Финализируем provenance: обновляем actual_duration, если он ещё
+            # не был записан (для direct-candidate он уже есть; для fallback
+            # берём из реально скачанного файла).
+            if provenance.get("selected"):
+                provenance["selected"].setdefault("actual_duration", actual_duration)
+                provenance["selected"].setdefault("expected_duration", _ref_dur)
+
+            # Сохраняем .source.json рядом с аудио для последующего аудита паков.
+            self._save_provenance(track, provenance, track_dir)
+
             # Fetch and save lyrics
             lyrics_data = self._get_lyrics(track, resolved_candidate)
             plain_lyrics = lyrics_data.get("plain") if lyrics_data else None
-            
+
             if lyrics_data:
                 self._save_lrc_file(track, lyrics_data, track_dir)
-            
+
             # Cover art download
             temp_cover = self._download_cover(track)
-            
+
             # Post-processing (conversion, tagging & lyrics embedding)
             self._post_process(track, temp_audio, temp_cover, plain_lyrics, track_dir)
             return True
@@ -528,7 +599,7 @@ class Downloader:
         safe_artist = "".join(c for c in track.primary_artist if c.isalnum() or c in " -_().")
         lrc_filename = f"{safe_artist} - {safe_title}.lrc"
         lrc_path = os.path.join(target_dir, lrc_filename)
-        
+
         # We prefer synced lyrics, otherwise fallback to plain
         content = lyrics_data.get("synced") or lyrics_data.get("plain")
         if content:
@@ -538,6 +609,27 @@ class Downloader:
                 print(f"[+] Saved lyrics to: {lrc_path}")
             except Exception as e:
                 print(f"[!] Failed to save LRC file: {e}", file=sys.stderr)
+
+    def _save_provenance(self, track: TrackMetadata, provenance: dict, target_dir: str) -> None:
+        """
+        Сохраняет рядом с аудио файл ``.source.json`` с описанием того, откуда
+        и почему скачан трек: выбранный источник/URL/канал/длительность, список
+        отвергнутых кандидатов, заметка о валидации эталонной длительности.
+
+        Назначение — массовый аудит пакетов: по этому файлу видно, был ли
+        сброшен enrichment-duration, брался ли трек из фолбэк-поиска, какие
+        кандидаты были пропущены по маркерам/длительности. Помогает ловить
+        регрессии (live-версии и т.п.) без прослушивания самих треков.
+        """
+        safe_title = "".join(c for c in track.title if c.isalnum() or c in " -_().")
+        safe_artist = "".join(c for c in track.primary_artist if c.isalnum() or c in " -_().")
+        path = os.path.join(target_dir, f"{safe_artist} - {safe_title}.source.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f_out:
+                json.dump(provenance, f_out, ensure_ascii=False, indent=2)
+            print(f"[+] Saved provenance to: {path}")
+        except Exception as e:
+            print(f"[!] Failed to save provenance: {e}", file=sys.stderr)
 
     def _download_jiosaavn(self, pid: str) -> Optional[str]:
         """
@@ -702,17 +794,37 @@ class Downloader:
           - близость длительности к эталонной (главный сигнал);
           - сходство названия с «артист - название»;
           - официальность канала (VEVO / Topic / лейбл);
-          - отсутствие критических bad-маркеров (караоке, минус, ремикс ...).
+          - просмотры (view_count) — оригинал популярного трека обычно имеет
+            на 1–2 порядка больше просмотров, чем любая live/AI/phonk-версия;
+          - отсутствие критических bad-маркеров в названии (караоке, минус ...);
+          - отсутствие концертных маркеров в описании (см. has_concert_marker_in_text).
 
         Возвращает список (score, entry), отсортированный по убыванию score.
-        Кандидаты с критическими bad-маркерами полностью исключаются
+        Кандидаты с критическими bad-маркерами в названии полностью исключаются
         (кроме случая, когда искомый трек сам содержит этот маркер).
         """
         from .scoring import ratio
-        from .markers import has_critical_marker, find_soft_markers, is_official_channel
+        from .markers import (
+            has_critical_marker,
+            has_concert_marker_in_text,
+            find_soft_markers,
+            is_official_channel,
+        )
 
         target_title = f"{track.primary_artist} {track.title}".strip()
         expected_dur = track.duration_sec
+
+        # Для нормировки view_count в бонус используем максимальное значение
+        # в выборке — это позволяет давать относительный бонус (лог-шкала),
+        # не зависящий от абсолютной популярности трека.
+        max_views = 0
+        for entry in entries:
+            if not entry:
+                continue
+            v = entry.get("view_count") or 0
+            if isinstance(v, (int, float)) and v > max_views:
+                max_views = int(v)
+
         ranked: list[tuple[float, dict]] = []
 
         for entry in entries:
@@ -730,6 +842,7 @@ class Downloader:
 
             # 2. Длительность — главный сигнал для выбора правильной версии.
             dur = entry.get("duration")
+            duration_penalty = 0.0
             if expected_dur and dur:
                 diff = abs(expected_dur - dur)
                 tolerance = self._duration_tolerance(25)
@@ -746,6 +859,7 @@ class Downloader:
                 else:
                     # Сильно отличающаяся длительность — подозрение на другую версию.
                     score -= 35
+                    duration_penalty = 35.0
             elif expected_dur and not dur:
                 score -= 5  # нет длительности — небольшая неуверенность
 
@@ -757,6 +871,52 @@ class Downloader:
             # 4. Мягкий штраф за «lyrics»/«audio»-видео (часто низкое качество).
             score -= 4 * len(find_soft_markers(title, track.title))
 
+            # 5. Просмотры (view_count) — относительный бонус по лог-шкале.
+            # У популярного трека официальный клип имеет миллионы просмотров,
+            # тогда как live/phonk/AI-версии — тысячи. Лог-шкала сглаживает
+            # разницу: разница в 100× даёт ~+10 баллов, в 10× — ~+7.
+            #
+            # ВАЖНО: бонус применяется ТОЛЬКО при достаточном совпадении названия
+            # (title_sim ≥ 60). Иначе просмотры нерелевантны — популярный клип
+            # другого трека (например, «Костры» того же артиста) получал бы
+            # незаслуженный бонус и мог обойти нужный, но менее популярный оригинал.
+            #
+            # Компенсация duration-штрафа: если ref-duration привязан к чужой
+            # версии (концерт/сборник/переиздание), duration-сигнал ошибочно
+            # штрафует настоящий популярный оригинал. При гигантском перевесе
+            # просмотров (≥100× от максимального) — это сильный сигнал, что
+            # кандидат и есть оригинал, и duration_penalty частично гасится.
+            views = entry.get("view_count") or 0
+            if (
+                isinstance(views, (int, float))
+                and views > 0
+                and max_views > 0
+                and title_sim >= 60
+            ):
+                import math
+
+                if views >= max_views:
+                    score += 12.0
+                    # Доминирующий по просмотрам кандидат (максимальный в выборке)
+                    # с длительностью, выходящей за tolerance — гасим duration-штраф.
+                    # Типичный кейс: ref=191 (концерт), оригинал=208, просмотров 60M
+                    # против 82K у концертной версии. diff=17 даёт −35; компенсируем
+                    # 25, чтобы popular-оригинал не проигрывал концертной версии.
+                    if duration_penalty > 0:
+                        score += min(duration_penalty, 25.0)
+                else:
+                    # log(views/max_views) ≤ 0; нормируем: max=+12, 1/100 max ≈ +7.
+                    ratio_views = views / max_views
+                    score += max(0.0, 12.0 + math.log10(max(ratio_views, 1e-9)) * 2.5)
+
+            # 6. Концертные маркеры в описании. Описание есть не всегда
+            # (flat-extraction его не отдаёт), поэтому штрафуем только при
+            # наличии. Штраф существенный (−20), чтобы концертная запись
+            # проигрывала студийной даже при идеальной длительности.
+            description = entry.get("description") or ""
+            if description and has_concert_marker_in_text(description, track.title):
+                score -= 20
+
             ranked.append((score, entry))
 
         ranked.sort(key=lambda pair: pair[0], reverse=True)
@@ -766,9 +926,15 @@ class Downloader:
         """
         Формирует список поисковых запросов для YouTube.
 
-        Если исполнитель указан латиницей, а кириллицы в запросе нет, добавляем
-        транслитерированный вариант — русские треки часто лучше ищутся по
-        оригинальному написанию (Zemfira → Земфира).
+        Стратегия:
+          1. Основной запрос «{артист} - {название}».
+          2. Если исполнитель латиницей — транслитерированный вариант
+             (Zemfira → Земфира): русские треки лучше ищутся по оригиналу.
+          3. Запрос «{артист} {название} topic»: каналы «… - Topic» — это
+             авто-сгенерированные YouTube Music студийные версии, практически
+             всегда оригинальные (без live/remix). Подмешивание такого запроса
+             повышает шанс вытащить именно студийную версию в выдачу, где затем
+             сработает бонус за официальный Topic-канал.
         """
         from .text_norm import has_cyrillic, translit_lat_to_cyr
 
@@ -777,9 +943,18 @@ class Downloader:
             cyr = translit_lat_to_cyr(primary_query)
             if cyr and cyr.lower() != primary_query.lower():
                 queries.append(cyr)
+
+        # Topic-вариант: добавляем слово «topic», чтобы сместить выдачу к
+        # YouTube Music-каналам со студийными версиями.
+        artist = track.primary_artist.strip()
+        title = track.title.strip()
+        if artist and title:
+            topic_query = f"{artist} {title} topic"
+            if topic_query.lower() not in (q.lower() for q in queries):
+                queries.append(topic_query)
         return queries
 
-    def _download_youtube_search(self, query: str, track: TrackMetadata) -> Optional[str]:
+    def _download_youtube_search(self, query: str, track: TrackMetadata, out_provenance: Optional[dict] = None) -> Optional[str]:
         """
         Ищет трек на YouTube и скачивает лучший кандидат.
         Ранжирование учитывает длительность, официальность канала и bad-маркеры,
@@ -848,6 +1023,19 @@ class Downloader:
                     ext = (download_info or {}).get("ext") or "webm"
                     downloaded_path = os.path.join(temp_dir, f"{video_id}.{ext}")
                     if downloaded_path and is_valid_audio_file(downloaded_path):
+                        if out_provenance is not None:
+                            out_provenance.clear()
+                            out_provenance.update({
+                                "source": "youtube-search",
+                                "title": best_entry.get("title"),
+                                "channel": uploader,
+                                "url": webpage_url,
+                                "external_id": video_id,
+                                "rank_score": round(best_score, 2),
+                                "expected_duration": track.duration_sec,
+                                "actual_duration": dur,
+                                "queries": self._youtube_search_queries(query, track),
+                            })
                         return downloaded_path
                     print("[!] YouTube search download produced invalid audio, discarding...")
                     _safe_remove(downloaded_path)
@@ -857,7 +1045,7 @@ class Downloader:
             print(f"[!] YouTube search download failed: {e}", file=sys.stderr)
         return None
 
-    def _download_soundcloud_search(self, query: str, track: TrackMetadata) -> Optional[str]:
+    def _download_soundcloud_search(self, query: str, track: TrackMetadata, out_provenance: Optional[dict] = None) -> Optional[str]:
         """
         Ищет трек на SoundCloud и скачивает лучший кандидат.
         Повторно использует _rank_youtube_entries — сигналы ранжирования
@@ -910,7 +1098,20 @@ class Downloader:
                     )
                     track_url = best_entry.get("url") or best_entry.get("webpage_url")
                     if track_url:
-                        return self._download_soundcloud(track_url)
+                        result = self._download_soundcloud(track_url)
+                        if result and out_provenance is not None:
+                            out_provenance.clear()
+                            out_provenance.update({
+                                "source": "soundcloud-search",
+                                "title": best_entry.get("title"),
+                                "channel": uploader,
+                                "url": track_url,
+                                "external_id": best_entry.get("id"),
+                                "rank_score": round(best_score, 2),
+                                "expected_duration": track.duration_sec,
+                                "actual_duration": dur,
+                            })
+                        return result
                 else:
                     print("[-] All SoundCloud candidates filtered out by bad markers.")
         except Exception as e:

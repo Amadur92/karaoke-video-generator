@@ -22,8 +22,46 @@ from .text_norm import normalize
 
 
 # страны, по которым ищем — RU покрывает русские релизы, US — международные.
-# Запросы идут последовательно, берётся первый результат с хорошим совпадением.
-_DEFAULT_COUNTRIES = ("RU", "US")
+# GB/DE/JP добавлены как fallback: в этих сторах часто доступен оригинальный
+# студийный релиз, тогда как RU-стор может содержать локальное переиздание/
+# сборник с другой длительностью. Запросы идут последовательно до первого
+# хорошего совпадения, поэтому дополнительные страны не замедляют типичный
+# случай (находится в RU/US), но спасают редкие кейсы.
+_DEFAULT_COUNTRIES = ("RU", "US", "GB", "DE", "JP")
+
+
+# Признаки «слабого» альбома — сборника/переиздания/live, у которого
+# длительность трека может отличаться от оригинального студийного релиза.
+# Если enrichment привязывается к такому альбому, последующий duration-фильтр
+# может ошибочно отсеивать настоящий оригинал (наблюдалось на пакетах с русскими
+# релизами: «Новое и Лучшее», «Дискотека 80-х», «Greatest Hits»).
+_WEAK_ALBUM_MARKERS: tuple[str, ...] = (
+    # сборники / «лучшее»
+    "best of", "the best", "greatest hits", "hits", "collection",
+    "золотые", "золотой", "essentials", "классика", "легенды",
+    "новое и лучшее", "лучшее", "избранное", "хиты",
+    # live / концертные альбомы
+    "live", "concert", "live at", "unplugged", "mtv",
+    "лайв", "концерт", "живой", "живой альбом",
+    # саундтреки / Various Artists-сборники
+    "various", "разные исполнители", "сборник", "diskoteka", "discotheque",
+    "дискотека", "авторадио", "супердискотека",
+    # переиздания / издания
+    "remastered", "reissue", "edition", "deluxe", "expanded",
+    "переиздание", "издание", "юбилейное",
+    # radio edit / remix-альбомы без слова «remix» в названии
+    "radio mix", "radio edit", "dfm mix", "dfm", "extended mix", "club mix",
+    # tribute
+    "tribute", "трибьют",
+)
+
+
+def is_weak_album(album_title: str | None) -> bool:
+    """True, если название альбома похоже на сборник/live/переиздание."""
+    if not album_title:
+        return False
+    lower = album_title.lower()
+    return any(marker in lower for marker in _WEAK_ALBUM_MARKERS)
 
 
 def _itunes_search(term: str, country: str, limit: int = 5) -> list[dict]:
@@ -92,6 +130,14 @@ def _pick_best(track: TrackMetadata, results: list[dict]) -> Optional[dict]:
                 score += 0.10
             elif diff > 20:
                 score -= 0.20
+
+        # Штраф за «слабый» альбом (сборник/live/переиздание). iTunes часто
+        # отдаёт несколько вариантов трека, и студийный релиз предпочтительнее:
+        # его длительность совпадает с оригиналом, тогда как у сборника может
+        # быть ремастер/radio edit/живая версия. Штраф небольшой (0.15), чтобы
+        # при отсутствии студийного варианта сборник всё же прошёл.
+        if is_weak_album(item.get("collectionName")):
+            score -= 0.15
 
         if score > best_score:
             best_score = score

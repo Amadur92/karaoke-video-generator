@@ -90,11 +90,18 @@ def score_candidate(track: TrackMetadata, candidate: Candidate) -> ScoredCandida
     score = title_score * 0.35 + artist_score * 0.25 + dur_score * 0.30 + album_score * 0.10
     flags: list[str] = []
 
-    # Критические bad-маркеры (караоке, минус, лайв, ремикс, кавер ...) — берём из единого модуля.
+    # Критические bad-маркеры (караоке, минус, лайв, ремикс, кавер ...) —
+    # жёсткое исключение: score прижимается к 0, чтобы версия с маркером
+    # НИКОГДА не могла обойти оригинал в ранжировании (даже при идеальном
+    # совпадении title/artist/duration). Раньше был штраф −80, и при слабой
+    # конкуренции (нет студийного кандидата) live мог формально «выиграть».
+    # Флаг critical_marker:* по-прежнему выставляется, чтобы download-loop и
+    # YouTube-fallback могли применить свою логику пропуска.
     critical_hits = find_critical_markers(candidate.title, track.title)
     for marker in critical_hits:
-        score -= 80
         flags.append(f"critical_marker:{marker}")
+    if critical_hits:
+        score = 0.0
 
     soft_hits = find_soft_markers(candidate.title, track.title)
     for marker in soft_hits:
