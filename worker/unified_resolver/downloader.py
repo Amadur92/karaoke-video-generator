@@ -495,6 +495,21 @@ class Downloader:
         # чем подсунуть extended/радио-edit другого размера.
         _ref_dur = track.duration_sec
         _actual = get_audio_duration(temp_audio)
+
+        # Абсолютный нижний порог: если длительность < 60с — это почти наверняка
+        # превью/сниппет/обрезок (SoundCloud previews, iTunes 30-сек паддинги,
+        # демо-фрагменты). Отвергаем независимо от эталона: когда валидаторы
+        # сбросили ref-duration в None (MB+YT conflict), относительный guard
+        # ниже не срабатывает, и без этой проверки 30-секундный превью мог
+        # пройти незамеченным (кейс Taylor Swift - Bad Blood в пакете 185).
+        if _actual and _actual < 60:
+            print(
+                f"[-] Final check failed: downloaded audio is only {_actual}s "
+                f"— likely a preview/snippet. Rejecting."
+            )
+            _safe_remove(temp_audio)
+            return False
+
         if _ref_dur and _actual and abs(_ref_dur - _actual) > self._duration_tolerance(40):
             print(
                 f"[-] Final check failed: downloaded {_actual}s vs reference {_ref_dur}s "

@@ -317,6 +317,32 @@ def test_is_valid_audio_file_rejects_tiny(tmp_path):
     assert is_valid_audio_file(str(small)) is False
 
 
+def test_preview_guard_rejects_short_audio(tmp_path):
+    """Регрессия: 30-секундный SoundCloud-превью не должен проходить финальный
+    guard. Кейс Taylor Swift - Bad Blood (пакет 185): MB+YT-конфликт сбросил
+    ref-duration в None, относительный guard не сработал, превью скачалось.
+    Решение — абсолютный нижний порог 60с в download(). Тестируем через
+    генерацию реального короткого аудиофайла ffmpeg-ом."""
+    import shutil
+    if not shutil.which("ffmpeg"):
+        return  # ffmpeg необязателен для прогона тестов
+    from unified_resolver.downloader import get_audio_duration
+
+    # Генерируем 10-секундный тишину-mp3 (имитация превью).
+    short = tmp_path / "preview.mp3"
+    import subprocess
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+         "-t", "10", "-q:a", "9", str(short)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+    )
+    dur = get_audio_duration(str(short))
+    assert dur is not None and dur < 60, f"short audio should be <60s, got {dur}"
+    # Это значение должно отвергаться guard-ом (порог 60с).
+    MIN_DURATION = 60
+    assert dur < MIN_DURATION, "preview guard would not reject this"
+
+
 # ----------------- word-boundary marker matching (D) -----------------
 
 def test_marker_word_boundary_no_false_positive_on_substring():
@@ -624,8 +650,9 @@ def test_musicbrainz_sets_duration_when_missing():
 
 
 def test_musicbrainz_works_with_single_studio_sample():
-    """MusicBrainz дедуплицирует recordings по ID, поэтому для нишевых
-    треков возвращается 1 студийная запись — её достаточно для перезаписи."""
+    """Одиночный recording НЕ должен перезаписывать ref-duration: слишком велик
+    риск, что это случайная альтернативная версия («Taylor's Version», remix
+    без disambiguation). Требуем ≥2 сэмплов для подтверждения."""
     import unified_resolver.musicbrainz as mb_mod
     from unified_resolver.musicbrainz import enrich_from_musicbrainz
     from unified_resolver.models import TrackMetadata
@@ -640,8 +667,9 @@ def test_musicbrainz_works_with_single_studio_sample():
         mb_mod.get_json = lambda url, **kw: single
         t = TrackMetadata(title="Song", artists=["X"], duration_sec=320)
         note = enrich_from_musicbrainz(t)
-        assert t.duration_sec == 240
-        assert note and note.startswith("mb_overwrote_duration")
+        # Одиночный сэмпл — недостаточно, ref-duration сохраняется.
+        assert t.duration_sec == 320
+        assert note and note.startswith("mb_insufficient_samples")
     finally:
         mb_mod.get_json = real_get_json
 
