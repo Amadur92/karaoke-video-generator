@@ -98,19 +98,49 @@ class DurationValidator:
             # Эталон согласуется с реальной выдачей — всё в порядке.
             return f"ok:median={median}s,deviation={deviation:.1f}%"
 
-        # Расхождение слишком велико: enrichment почти наверняка привязался
-        # к чужой версии. Обнуляем, чтобы duration-фильтр не убивал оригинал.
-        note = (
-            f"reference_duration_dropped:ref={ref}s,median={median}s,"
-            f"deviation={deviation:.1f}%,samples={len(valid)}"
-        )
-        track.duration_sec = None
+        # Расхождение слишком велико: enrichment привязался к чужой версии
+        # (сборник/переиздание/radio edit/live). Раньше просто обнуляли
+        # duration_sec, но без эталона fallback-поиск выбирает кандидатов
+        # только по title/official, и при отсутствии duration в выдаче может
+        # взять 30-сек превью (кейс Серёга - Чёрный бумер в пакете 186:
+        # MB переписал ref на 198, YT-медиана 267, validator сбросил в None,
+        # fallback взял SoundCloud-превью).
+        #
+        # Новое поведение: если YT-выдача консистентна (≥3 сэмпла в окне ±15с
+        # от медианы) — доверяем ей как новому эталону. Иначе возвращаемся к
+        # старой стратегии обнуления.
+        consistent = _is_consistent(valid, median)
+        if consistent:
+            note = (
+                f"reference_duration_replaced:ref={ref}s,median={median}s,"
+                f"deviation={deviation:.1f}%,samples={len(valid)}"
+            )
+            track.duration_sec = median
+        else:
+            note = (
+                f"reference_duration_dropped:ref={ref}s,median={median}s,"
+                f"deviation={deviation:.1f}%,samples={len(valid)}"
+            )
+            track.duration_sec = None
         if not getattr(track, "duration_note", None):
             try:
                 track.duration_note = note  # type: ignore[attr-defined]
             except Exception:
                 pass
         return note
+
+
+def _is_consistent(durations: list[int], median: int) -> bool:
+    """
+    True, если выборка длительностей достаточно консистентна, чтобы доверять
+    медиане как новому эталону. Критерий: хотя бы 3 значения попадают в окно
+    ±15 секунд от медианы. Иначе выдача разнородная (много live/extended/
+    radio-edit вперемешку) и медиане доверять нельзя.
+    """
+    if len(durations) < 3:
+        return False
+    in_window = sum(1 for d in durations if abs(d - median) <= 15)
+    return in_window >= 3
 
 
 def _default_youtube_durations(query: str) -> list[int]:

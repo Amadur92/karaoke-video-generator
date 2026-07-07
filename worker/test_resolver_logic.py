@@ -510,19 +510,21 @@ def test_deezer_enrich_falls_back_to_weak_when_no_strong():
 def test_duration_validator_drops_suspicious_reference():
     """Регрессия Vau_Muzloto_184 #29/#36: enrichment привязался к чужой
     длительности (318с), а реальный оригинал идёт ~257с. Медиана YouTube-
-    выдачи ~257 — расхождение >15%, эталон должен быть обнулён, чтобы
-    duration-фильтр не убивал настоящий оригинал."""
+    выдачи ~258 и выдача консистентна — эталон должен быть ЗАМЕНЁН на медиану
+    (не сброшен в None), чтобы duration-фильтр выбирал именно оригинал, а
+    не позволял 30-сек превью пройти без эталона."""
     from unified_resolver.duration_check import DurationValidator
     from unified_resolver.models import TrackMetadata
 
-    # Имитируем YouTube-выдачу: преобладают версии ~255–262с.
+    # Имитируем YouTube-выдачу: преобладают версии ~255–262с (консистентно).
     fake_durations = [257, 260, 255, 262, 273, 261, 258]
     validator = DurationValidator(search_fn=lambda q: fake_durations)
 
     t = TrackMetadata(title="Любочка", artists=["Маша и Медведи"], duration_sec=318)
     note = validator.validate(t)
-    assert t.duration_sec is None, "reference duration should have been dropped"
-    assert note and note.startswith("reference_duration_dropped")
+    # При консистентной выдаче эталон заменяется на медиану (260с), не None.
+    assert t.duration_sec == 260, f"expected 260, got {t.duration_sec}"
+    assert note and note.startswith("reference_duration_replaced")
     assert "deviation=" in note
 
 
@@ -538,6 +540,25 @@ def test_duration_validator_keeps_consistent_reference():
     note = validator.validate(t)
     assert t.duration_sec == 258
     assert note and note.startswith("ok:")
+
+
+def test_duration_validator_drops_when_yt_inconsistent():
+    """Если YT-выдача разнородна (много live/extended вперемешку, <3 значений
+    у медианы) — не доверяем медиане, сбрасываем эталон в None. Иначе медиана
+    могла бы оказаться усреднением нескольких разных версий."""
+    from unified_resolver.duration_check import DurationValidator
+    from unified_resolver.models import TrackMetadata
+
+    # Разнородная выдача с медианой ~240, но ref=300 (чтобы deviation>15%):
+    # значения разбросаны 150..400, у медианы только 1 значение в окне ±15.
+    fake_durations = [150, 180, 200, 240, 280, 320, 400]
+    validator = DurationValidator(search_fn=lambda q: fake_durations)
+
+    t = TrackMetadata(title="Песня", artists=["А"], duration_sec=300)
+    note = validator.validate(t)
+    # Выдача неконсистентна — эталон сбрасывается (не заменяется на медиану).
+    assert t.duration_sec is None
+    assert note and note.startswith("reference_duration_dropped")
 
 
 def test_duration_validator_skips_when_too_few_samples():
