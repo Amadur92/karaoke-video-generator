@@ -375,6 +375,22 @@ def test_marker_new_live_markers_detected():
            "session" in find_critical_markers("Song (BBC Session)", "Song")
 
 
+def test_marker_music_awards_and_tv_concerts_detected():
+    """Регрессия пакета 185: концертные версии с премий/телеконцертов без
+    слова «live» в названии пропускались. Реальные кейсы:
+    01 Сергей Лазарев — «Премия МузТВ-2025»
+    06 MIA BOYKA — «Музыкальная премия Виктория 2024»
+    99 NANSI & SIDOROV — «Жара Lite в Vegas Кунцево»"""
+    from unified_resolver.markers import find_critical_markers
+    assert find_critical_markers("Песня | Премия МузТВ-2025", "Песня")
+    assert find_critical_markers("Песня (Музыкальная премия Виктория 2024)", "Песня")
+    assert find_critical_markers("Песня (Жара Lite в Vegas Кунцево)", "Песня")
+    assert find_critical_markers("Песня (из видеоальбома)", "Песня")
+    # Но обычные студийные не должны матчиться:
+    assert find_critical_markers("Песня (Official Video)", "Песня") == []
+    assert find_critical_markers("Песня (Official Audio)", "Песня") == []
+
+
 def test_marker_ai_cover_detected():
     """AI-каверы и нейрогенерация — отдельный класс «не той версии»."""
     from unified_resolver.markers import find_critical_markers
