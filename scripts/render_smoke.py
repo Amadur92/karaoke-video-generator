@@ -8,6 +8,7 @@ import json
 import math
 import struct
 import subprocess
+import sys
 import tempfile
 import wave
 from pathlib import Path
@@ -81,6 +82,10 @@ def verify_output(ffprobe: str, output: Path, expected_fps: int) -> None:
 
 
 def main() -> int:
+    # The renderer emits UTF-8, including Russian status text. Windows CI pipes
+    # otherwise default to cp1252 and cannot print these successful diagnostics.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--renderer", required=True)
     parser.add_argument("--ffmpeg", required=True)
