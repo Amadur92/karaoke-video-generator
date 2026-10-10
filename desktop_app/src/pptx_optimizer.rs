@@ -669,27 +669,23 @@ pub fn optimize_pptx(
             while !results.is_empty() {
                 let result = results.remove(0);
                 reported += 1;
-                match result {
-                    Ok(row) => {
-                        let message = format!(
-                            "{} [{}] {:.1}MB -> {:.1}MB {:.1}s",
-                            Path::new(&row.name)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            row.source,
-                            row.before as f32 / 1024.0 / 1024.0,
-                            row.after as f32 / 1024.0 / 1024.0,
-                            row.seconds
-                        );
-                        on_event(OptimizerEvent::Done {
-                            index: reported,
-                            total: remaining,
-                            message,
-                        });
-                    }
-                    Err(err) => return Err(err),
-                }
+                let row = result?;
+                let message = format!(
+                    "{} [{}] {:.1}MB -> {:.1}MB {:.1}s",
+                    Path::new(&row.name)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    row.source,
+                    row.before as f32 / 1024.0 / 1024.0,
+                    row.after as f32 / 1024.0 / 1024.0,
+                    row.seconds
+                );
+                on_event(OptimizerEvent::Done {
+                    index: reported,
+                    total: remaining,
+                    message,
+                });
             }
         }
 

@@ -18,7 +18,7 @@ const RED: Color32 = Color32::from_rgb(246, 149, 157);
 fn card() -> egui::Frame {
     egui::Frame::none()
         .fill(Color32::from_rgb(23, 30, 40))
-        .stroke(egui::Stroke::new(1.0, LINE))
+        .stroke(egui::Stroke::new(1.0_f32, LINE))
         .rounding(8.0)
         .inner_margin(12.0)
 }
@@ -703,7 +703,7 @@ impl KaraokeApp {
         });
         egui::Frame::none()
             .fill(Color32::from_rgb(18, 25, 35))
-            .stroke(egui::Stroke::new(1.0, LINE))
+            .stroke(egui::Stroke::new(1.0_f32, LINE))
             .rounding(8.0)
             .inner_margin(8.0)
             .show(ui, |ui| {
@@ -1018,7 +1018,7 @@ impl KaraokeApp {
                 Color32::GRAY,
             );
         }
-        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, LINE));
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, LINE));
         if !excluded && !no_included_lines && !self.ui_frame_preview.error.is_empty() {
             ui.label(
                 RichText::new(&self.ui_frame_preview.error)
@@ -1548,7 +1548,7 @@ impl KaraokeApp {
                                 );
                                 p.line_segment(
                                     [rect.left_bottom(), rect.right_bottom()],
-                                    egui::Stroke::new(1.0, LINE),
+                                    egui::Stroke::new(1.0_f32, LINE),
                                 );
                                 response.widget_info(|| {
                                     egui::WidgetInfo::labeled(

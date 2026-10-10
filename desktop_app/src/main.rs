@@ -957,7 +957,7 @@ fn batch_trim_timeline_static_ui(
         };
         painter.line_segment(
             [egui::pos2(x, center_y - amp), egui::pos2(x, center_y + amp)],
-            egui::Stroke::new(2.0, waveform_color),
+            egui::Stroke::new(2.0_f32, waveform_color),
         );
     }
 
@@ -969,7 +969,7 @@ fn batch_trim_timeline_static_ui(
     painter.rect_stroke(
         selected_rect,
         4.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(85, 225, 231)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(85, 225, 231)),
     );
 
     let start_x = to_x(start_ms);
@@ -978,7 +978,7 @@ fn batch_trim_timeline_static_ui(
         let width = (value.chars().count() as f32 * 6.2 + 12.0).max(42.0);
         let label_rect = egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(width, 18.0));
         painter.rect_filled(label_rect, 5.0, egui::Color32::from_rgb(28, 33, 43));
-        painter.rect_stroke(label_rect, 5.0, egui::Stroke::new(1.0, color));
+        painter.rect_stroke(label_rect, 5.0, egui::Stroke::new(1.0_f32, color));
         painter.text(
             label_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -1005,7 +1005,7 @@ fn batch_trim_timeline_static_ui(
             egui::pos2(track_rect.left(), track_rect.bottom() + 10.0),
             egui::pos2(track_rect.right(), track_rect.bottom() + 10.0),
         ],
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(39, 47, 60)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(39, 47, 60)),
     );
     for tick in 0..=4 {
         let x = track_rect.left() + track_width * tick as f32 / 4.0;
@@ -1014,7 +1014,7 @@ fn batch_trim_timeline_static_ui(
                 egui::pos2(x, track_rect.bottom() + 14.0),
                 egui::pos2(x, track_rect.bottom() + 18.0),
             ],
-            egui::Stroke::new(1.0, muted),
+            egui::Stroke::new(1.0_f32, muted),
         );
     }
     painter.circle_filled(
@@ -1353,13 +1353,13 @@ impl KaraokeApp {
         visuals.widgets.open.rounding = 10.0.into();
 
         visuals.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-        visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
 
         visuals.widgets.inactive.fg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240));
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(226, 232, 240));
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
 
         visuals.extreme_bg_color = egui::Color32::from_rgb(11, 15, 25);
         visuals.window_fill = egui::Color32::from_rgb(11, 15, 25);
@@ -3359,13 +3359,13 @@ impl KaraokeApp {
                     egui::pos2(x, track.center().y - amplitude.max(0.5)),
                     egui::pos2(x, track.center().y + amplitude.max(0.5)),
                 ],
-                egui::Stroke::new(1.7, color),
+                egui::Stroke::new(1.7_f32, color),
             );
         }
         for x in [selected.left(), selected.right()] {
             painter.line_segment(
                 [egui::pos2(x, track.top()), egui::pos2(x, track.bottom())],
-                egui::Stroke::new(2.0, accent),
+                egui::Stroke::new(2.0_f32, accent),
             );
             painter.rect_filled(
                 egui::Rect::from_center_size(egui::pos2(x, track.top()), egui::vec2(7.0, 9.0)),
@@ -3402,7 +3402,7 @@ impl KaraokeApp {
                 egui::pos2(cursor, track.top() - 5.0),
                 egui::pos2(cursor, track.bottom()),
             ],
-            egui::Stroke::new(1.0, egui::Color32::WHITE),
+            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
         );
         for i in 0..=4 {
             let x = track.left() + track.width() * i as f32 / 4.0;
@@ -3953,7 +3953,7 @@ impl eframe::App for KaraokeApp {
         visuals.widgets.open.rounding = 8.0.into();
 
         visuals.selection.bg_fill = egui::Color32::from_rgb(76, 121, 195);
-        visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
 
         visuals.extreme_bg_color = egui::Color32::from_rgb(17, 22, 30);
         visuals.window_fill = egui::Color32::from_rgb(17, 22, 30);
@@ -3964,18 +3964,18 @@ impl eframe::App for KaraokeApp {
         visuals.widgets.active.bg_fill = egui::Color32::from_rgb(76, 121, 195);
 
         visuals.widgets.inactive.fg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 229, 236));
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(226, 229, 236));
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
         visuals.widgets.noninteractive.fg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(196, 202, 214));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(196, 202, 214));
 
         visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(32, 41, 54);
         visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(42, 55, 73);
         visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(44, 64, 94);
         visuals.widgets.inactive.bg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 52, 66));
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(43, 52, 66));
         ctx.set_visuals(visuals);
 
         // Опрос фоновой загрузки аудио: ffprobe не должен подвешивать интерфейс.
@@ -4473,7 +4473,10 @@ impl eframe::App for KaraokeApp {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(23, 30, 40))
                         .inner_margin(12.0)
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 52, 66))),
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgb(43, 52, 66),
+                        )),
                 )
                 .show(ctx, |ui| {
                     if self.active_tab == ActiveTab::Batch {
@@ -4490,17 +4493,17 @@ impl eframe::App for KaraokeApp {
 
             let card_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgb(19, 23, 31))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 44, 56)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 44, 56)))
                 .rounding(10.0)
                 .inner_margin(18.0);
 
             let drop_zone_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgb(15, 18, 24))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(54, 65, 82)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(54, 65, 82)))
                 .rounding(8.0).inner_margin(18.0);
             let log_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgb(10, 12, 17))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 40, 52)))
+                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(34, 40, 52)))
                 .rounding(8.0)
                 .inner_margin(12.0);
 
@@ -5061,7 +5064,7 @@ impl eframe::App for KaraokeApp {
                                         egui::Frame::none()
                                             .fill(egui::Color32::from_rgb(22, 29, 39))
                                             .stroke(egui::Stroke::new(
-                                                1.0,
+                                                1.0_f32,
                                                 egui::Color32::from_rgba_unmultiplied(
                                                     255, 255, 255, 20,
                                                 ),
