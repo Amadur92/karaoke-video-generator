@@ -1,0 +1,110 @@
+name: Publish verified desktop artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag
+        required: true
+      build_run:
+        description: Build run with successful quality, Windows and Apple Silicon jobs
+        required: true
+      intel_run:
+        description: Build run with a successful Intel job and matching application code
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Verify builds and application source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_RUN: ${{ inputs.build_run }}
+          INTEL_RUN: ${{ inputs.intel_run }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          def api(path):
+              return json.loads(subprocess.check_output(["gh", "api", f"repos/{os.environ['GH_REPO']}/{path}"]))
+
+          def verify(run_id, required_jobs):
+              run = api(f"actions/runs/{run_id}")
+              jobs = api(f"actions/runs/{run_id}/jobs?per_page=100")["jobs"]
+              for name in required_jobs:
+                  if not any(job["name"] == name and job["conclusion"] == "success" for job in jobs):
+                      raise SystemExit(f"Required build/check did not pass: {name}")
+              return run["head_sha"]
+
+          build_sha = verify(os.environ["BUILD_RUN"], [
+              "Tests and rendering checks / quality",
+              "Build Windows portable box",
+              "Build macOS portable box (Apple Silicon arm64)",
+          ])
+          intel_sha = verify(os.environ["INTEL_RUN"], ["Build macOS portable box (Intel x64)"])
+          tag_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if build_sha != tag_sha:
+              raise SystemExit("Release tag does not match the verified build")
+          # Only the console encoding of the smoke script may differ. Every
+          # application, worker, asset and packaging file must match the tag.
+          subprocess.run([
+              "git", "diff", "--exit-code", intel_sha, tag_sha, "--",
+              ".", ":(exclude)scripts/render_smoke.py",
+          ], check=True)
+          print(f"Verified release source {tag_sha}; Intel application source matches")
+          PY
+
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run }}
+          pattern: KaraokeGenerator-Windows-x64-portable
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run }}
+          pattern: KaraokeGenerator-macOS-AppleSilicon-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.intel_run }}
+          pattern: KaraokeGenerator-macOS-Intel-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify all release files are present
+        run: |
+          for file in \
+            KaraokeGenerator-Windows-x64-portable.zip \
+            KaraokeGenerator-macOS-AppleSilicon-arm64-portable.tar.gz \
+            KaraokeGenerator-macOS-AppleSilicon-arm64-app.dmg \
+            KaraokeGenerator-macOS-Intel-x64-portable.tar.gz \
+            KaraokeGenerator-macOS-Intel-x64-app.dmg; do
+            test -s "artifacts/$file"
+          done
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
