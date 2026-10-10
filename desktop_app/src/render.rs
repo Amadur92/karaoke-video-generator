@@ -855,7 +855,7 @@ fn write_ass_file(
         ass.push_str(&format!(
             "Dialogue: 0,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
             ass_time(start), ass_time(end), x, ev.y, ev.fs,
-            ass_color(color, 0), ev.alpha, &metrics[idx].text
+            ass_color(color, 0), ev.alpha, metrics[idx].text
         ));
     };
 
@@ -874,7 +874,7 @@ fn write_ass_file(
             "Dialogue: 1,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&\\clip({:.0},0,{:.0},{height})}}{}\n",
             ass_time(start), ass_time(end), x, ev.y, ev.fs,
             ass_color(active, 0), ev.alpha, ev.clip_left.max(0.0), ev.clip_right,
-            &metrics[idx].text
+            metrics[idx].text
         ));
     };
 
