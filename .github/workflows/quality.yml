@@ -32,6 +32,7 @@ jobs:
           python worker/test_karaoke_logic.py
           python worker/test_resolver_logic.py
           python worker/test_runtime_integrity.py
+          python packaging/macos/test_bundle_dylibs.py
           python -m compileall -q worker scripts
       - name: Rust formatting, lint and regression tests
         run: |
