@@ -14,7 +14,10 @@ from pathlib import Path
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=True, text=True, capture_output=True)
+    result = subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    if result.returncode:
+        raise RuntimeError(f"Command failed ({result.returncode}): {command}\n{result.stdout[-2000:]}\n{result.stderr[-4000:]}")
+    return result
 
 
 def write_audio(path: Path, duration: float = 2.0) -> None:
@@ -84,6 +87,9 @@ def main() -> int:
     parser.add_argument("--ffprobe", required=True)
     parser.add_argument("--engine", choices=("ass", "frames"), default="ass")
     args = parser.parse_args()
+    args.renderer = str(Path(args.renderer).resolve())
+    args.ffmpeg = str(Path(args.ffmpeg).resolve())
+    args.ffprobe = str(Path(args.ffprobe).resolve())
 
     expected_fps = 60 if args.engine == "ass" else 30
     with tempfile.TemporaryDirectory(prefix="karaoke-render-smoke-") as temp:
