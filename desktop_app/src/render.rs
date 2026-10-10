@@ -1202,7 +1202,7 @@ fn render_ass(
         .arg(crf)
         .arg("-bf")
         .arg("0")
-        .arg("-vsync")
+        .arg("-fps_mode")
         .arg("cfr")
         .arg("-avoid_negative_ts")
         .arg("make_zero")
@@ -1750,7 +1750,7 @@ fn render_unvalidated(config: RenderConfig) -> Result<(), String> {
             .arg("0");
     }
     let mut child = child
-        .arg("-vsync")
+        .arg("-fps_mode")
         .arg("cfr")
         .arg("-avoid_negative_ts")
         .arg("make_zero")

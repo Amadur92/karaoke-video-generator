@@ -2573,7 +2573,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             '-preset', preset,
             '-crf', crf,
             '-bf', '0',
-            '-vsync', 'cfr',
+            '-fps_mode', 'cfr',
             '-avoid_negative_ts', 'make_zero',
             '-af', audio_filter,
             '-c:a', 'aac',
