@@ -40,7 +40,6 @@ pub fn read_lyrics_file(path: &Path) -> Result<String, String> {
         .replace('\r', "\n"))
 }
 
-#[cfg(test)]
 pub fn parse_lrc_timestamp_ms(raw: &str) -> Option<i64> {
     let (minutes, rest) = raw.split_once(':')?;
     let minutes = minutes.trim().parse::<i64>().ok()?;
@@ -48,7 +47,6 @@ pub fn parse_lrc_timestamp_ms(raw: &str) -> Option<i64> {
     Some(minutes * 60_000 + (seconds * 1000.0).round() as i64)
 }
 
-#[cfg(test)]
 pub fn format_lrc_timestamp_ms(ms: i64) -> String {
     let ms = ms.max(0);
     let total_seconds = ms / 1000;
@@ -58,18 +56,23 @@ pub fn format_lrc_timestamp_ms(ms: i64) -> String {
     format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
 }
 
-#[cfg(test)]
+/// A timestamp at the end belongs to the following fragment, not this one.
+pub fn timestamp_in_trim(time_ms: i64, trim_start_ms: i64, trim_duration_ms: i64) -> bool {
+    time_ms >= trim_start_ms && time_ms < trim_start_ms.saturating_add(trim_duration_ms.max(0))
+}
+
 pub fn shift_lrc_for_trim(lyrics: &str, trim_start_ms: i64, trim_duration_ms: i64) -> String {
     if !lyrics.contains('[') {
         return lyrics.to_string();
     }
 
-    let trim_end_ms = trim_duration_ms.max(0);
     let mut shifted_lines = Vec::new();
 
     for raw_line in lyrics.lines() {
         let mut rest = raw_line;
         let mut timestamps = Vec::new();
+        let mut had_time = false;
+        let mut kept_time = false;
 
         while let Some(stripped) = rest.strip_prefix('[') {
             let Some(end_idx) = stripped.find(']') else {
@@ -77,8 +80,10 @@ pub fn shift_lrc_for_trim(lyrics: &str, trim_start_ms: i64, trim_duration_ms: i6
             };
             let tag = &stripped[..end_idx];
             if let Some(time_ms) = parse_lrc_timestamp_ms(tag) {
+                had_time = true;
                 let shifted = time_ms - trim_start_ms;
-                if shifted >= 0 && shifted <= trim_end_ms + 250 {
+                if timestamp_in_trim(time_ms, trim_start_ms, trim_duration_ms) {
+                    kept_time = true;
                     timestamps.push(format!("[{}]", format_lrc_timestamp_ms(shifted)));
                 }
             } else {
@@ -88,7 +93,7 @@ pub fn shift_lrc_for_trim(lyrics: &str, trim_start_ms: i64, trim_duration_ms: i6
         }
 
         if raw_line.trim_start().starts_with('[') {
-            if !timestamps.is_empty() {
+            if !timestamps.is_empty() && (!had_time || kept_time) {
                 shifted_lines.push(format!("{}{}", timestamps.join(""), rest));
             }
         } else {
@@ -197,6 +202,28 @@ mod tests {
     fn plain_text_without_timestamps_passes_through() {
         let text = "hello\nworld";
         assert_eq!(shift_lrc_for_trim(text, 1_000, 10_000), text);
+    }
+
+    #[test]
+    fn trim_keeps_start_and_excludes_end_and_later_tags() {
+        let source = "[ar:Artist]\n[00:02.49]before\n[00:02.50]first\n[00:04.00]middle\n[00:06.00]end\n[00:06.20]after";
+        assert_eq!(
+            shift_lrc_for_trim(source, 2500, 3500),
+            "[ar:Artist]\n[00:00.00]first\n[00:01.50]middle"
+        );
+        assert!(!timestamp_in_trim(2500, 2500, 0));
+    }
+
+    #[test]
+    fn trim_filters_repeated_timestamps_without_leaving_orphan_text() {
+        assert_eq!(
+            shift_lrc_for_trim(
+                "[00:01.00][00:04.00][00:08.00]chorus\n[ar:Artist][00:09.00]outside",
+                2500,
+                3500
+            ),
+            "[00:01.50]chorus"
+        );
     }
 
     #[test]

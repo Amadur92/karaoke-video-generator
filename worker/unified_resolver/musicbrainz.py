@@ -19,6 +19,8 @@ API публичное, без ключей, лимит — 1 запрос/се�
 from __future__ import annotations
 
 import statistics
+import threading
+import time
 import urllib.parse
 from typing import Optional
 
@@ -42,6 +44,19 @@ _MIN_SAMPLES = 2
 # при котором MusicBrainz переписывает enrichment-длительность.
 _OVERWRITE_DEVIATION_PCT = 10
 
+_RATE_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
+
+
+def _respect_rate_limit() -> None:
+    """Serialize MusicBrainz calls to the documented one request/second."""
+    global _LAST_REQUEST_AT
+    with _RATE_LOCK:
+        delay = 1.05 - (time.monotonic() - _LAST_REQUEST_AT)
+        if delay > 0:
+            time.sleep(delay)
+        _LAST_REQUEST_AT = time.monotonic()
+
 
 def _mb_get(path: str, params: dict[str, str]) -> Optional[dict]:
     """GET-запрос к MusicBrainz API (возвращает parsed JSON или None)."""
@@ -50,6 +65,7 @@ def _mb_get(path: str, params: dict[str, str]) -> Optional[dict]:
     query["fmt"] = "json"
     url += "?" + urllib.parse.urlencode(query)
     try:
+        _respect_rate_limit()
         return get_json(url, headers={"User-Agent": _MB_USER_AGENT}, timeout=15)
     except Exception:
         return None

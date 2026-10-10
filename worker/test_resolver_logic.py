@@ -7,7 +7,9 @@
 import os
 import sys
 import tempfile
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -16,14 +18,49 @@ from unified_resolver.markers import (  # noqa: E402
     has_critical_marker,
     is_official_channel,
 )
-from unified_resolver.models import Candidate, TrackMetadata  # noqa: E402
-from unified_resolver.scoring import partial_word_match, score_candidate  # noqa: E402
+from unified_resolver.__main__ import resolution_payload  # noqa: E402
+from unified_resolver.models import (  # noqa: E402
+    Candidate,
+    ProviderRun,
+    ResolutionReport,
+    ScoredCandidate,
+    TrackMetadata,
+)
+from unified_resolver.scoring import partial_word_match, score_candidate, title_match_score  # noqa: E402
 from unified_resolver.text_norm import (  # noqa: E402
     has_cyrillic,
     normalize,
     translit_lat_to_cyr,
 )
 from unified_resolver.downloader import is_valid_audio_file  # noqa: E402
+
+
+def test_resolution_payload_is_safe_and_ui_ready():
+    candidate = Candidate(
+        source="youtube",
+        title="Земфира — Искала (Official Video)",
+        artists=["Zemfira"],
+        duration_sec=211,
+        public_url="https://www.youtube.com/watch?v=example",
+        public_url_ok=True,
+        route_kind="resolvable_blocked",
+    )
+    scored = ScoredCandidate(candidate, 91.1, 100.0, 100.0, 87.0, 50.0)
+    report = ResolutionReport(
+        track=TrackMetadata("Искала", ["Земфира"], duration_sec=214),
+        candidates=[scored],
+        provider_runs=[ProviderRun("youtube", "ok", candidates=1)],
+    )
+
+    payload = resolution_payload(report)
+
+    assert payload["selected"]["rank"] == 1
+    assert payload["selected"]["public_url_ok"] is True
+    assert payload["providers"][0]["status"] == "ok"
+    assert payload["safe_mode"] == {
+        "download_performed": False,
+        "direct_media_url_requested": False,
+    }
 
 
 # ----------------- normalize / transliteration -----------------
@@ -86,6 +123,7 @@ def test_is_official_channel_keywords():
     assert is_official_channel("Zemfira - Topic") is True
     assert is_official_channel("somelabel Records") is True
     assert is_official_channel("ivan228") is False
+    assert is_official_channel("Best Music Channel") is False
 
 
 # ----------------- partial_word_match (багфикс) -----------------
@@ -113,6 +151,75 @@ def test_partial_word_match_fuzzy():
 def test_partial_word_match_below_threshold():
     # слишком разные слова (>0.8 ratio) не матчатся — защищает от ложных срабатываний
     assert partial_word_match("running", "runn") == 0.0
+
+
+def test_title_match_penalizes_unrelated_words_for_single_word_title():
+    track = TrackMetadata(title="Хочешь", artists=["Земфира"])
+    exact = Candidate(source="youtube", title="Земфира — Хочешь? (Official Video)")
+    unrelated = Candidate(source="youtube", title="Хочешь ли знать?")
+    assert title_match_score(track, exact) == 100.0
+    assert title_match_score(track, unrelated) < 70.0
+
+
+def test_best_route_rejects_known_dead_url():
+    from unified_resolver.__main__ import best_route
+
+    track = TrackMetadata(title="Song", artists=["Artist"], duration_sec=200)
+    dead = score_candidate(
+        track,
+        Candidate(
+            source="youtube",
+            title="Artist Song",
+            artists=["Artist"],
+            duration_sec=200,
+            public_url="https://www.youtube.com/watch?v=dead",
+            route_kind="resolvable_blocked",
+            public_url_ok=False,
+        ),
+    )
+    live = score_candidate(
+        track,
+        Candidate(
+            source="youtube",
+            title="Artist Song",
+            artists=["Artist"],
+            duration_sec=200,
+            public_url="https://www.youtube.com/watch?v=live",
+            route_kind="resolvable_blocked",
+            public_url_ok=True,
+        ),
+    )
+    rank, selected = best_route([dead, live])
+    assert rank == 2
+    assert selected is live
+
+
+def test_public_url_preflight_does_not_call_403_verified():
+    from unified_resolver.http import check_public_url
+
+    error = urllib.error.HTTPError(
+        "https://www.youtube.com/watch?v=x",
+        403,
+        "Forbidden",
+        hdrs=None,
+        fp=None,
+    )
+    with patch("unified_resolver.http.safe_urlopen", side_effect=error):
+        assert check_public_url("https://www.youtube.com/watch?v=x") is None
+
+
+def test_public_url_preflight_rejects_404():
+    from unified_resolver.http import check_public_url
+
+    error = urllib.error.HTTPError(
+        "https://www.youtube.com/watch?v=x",
+        404,
+        "Not Found",
+        hdrs=None,
+        fp=None,
+    )
+    with patch("unified_resolver.http.safe_urlopen", side_effect=error):
+        assert check_public_url("https://www.youtube.com/watch?v=x") is False
 
 
 # ----------------- score_candidate integration -----------------
@@ -145,6 +252,20 @@ def test_score_duration_mismatch_penalized():
     assert score_candidate(track, good).score > score_candidate(track, bad).score
 
 
+def test_artist_match_accepts_harmless_group_qualifier():
+    track = TrackMetadata(title="Группа крови", artists=["Кино"], duration_sec=284)
+    candidate = Candidate(
+        source="youtube",
+        title="Группа крови",
+        artists=["Группа КИНО"],
+        duration_sec=285,
+    )
+
+    scored = score_candidate(track, candidate)
+
+    assert scored.artist_score == 100.0
+
+
 def test_download_quality_summary_ok_for_clean_candidate():
     from unified_resolver.__main__ import download_quality_summary
 
@@ -166,6 +287,77 @@ def test_download_quality_summary_flags_live_candidate():
     assert quality == "suspicious"
     assert any("live" in reason for reason in reasons)
     assert any(reason.startswith("candidate:") for reason in reasons)
+
+
+def test_download_quality_summary_accepts_official_audio():
+    from unified_resolver.__main__ import download_quality_summary
+
+    track = _track(duration=234)
+    candidate = Candidate(
+        source="youtube",
+        title="Земфира - Хочешь (Official Audio)",
+        artists=["Земфира"],
+        duration_sec=234,
+    )
+    quality, reasons = download_quality_summary(score_candidate(track, candidate))
+
+    assert quality == "ok"
+    assert reasons == []
+
+
+def test_download_quality_summary_uses_actual_fallback_not_stale_candidate():
+    from unified_resolver.__main__ import download_quality_summary
+
+    track = _track(duration=234)
+    stale = score_candidate(
+        track,
+        Candidate(
+            source="youtube",
+            title="Земфира - Хочешь Live Version",
+            artists=["Земфира"],
+            duration_sec=260,
+        ),
+    )
+    outcome = {
+        "selected": {
+            "source": "youtube-search",
+            "title": "Земфира - Хочешь (Official Audio)",
+            "rank_score": 88.0,
+        },
+        "scored_candidate": None,
+        "expected_duration": 234,
+        "actual_duration": 234,
+    }
+
+    quality, reasons = download_quality_summary(stale, outcome)
+
+    assert quality == "ok"
+    assert reasons == []
+
+
+def test_download_quality_summary_uses_actual_direct_candidate():
+    from unified_resolver.__main__ import download_quality_summary
+
+    track = _track(duration=234)
+    stale = score_candidate(
+        track,
+        Candidate(source="youtube", title="Хочешь", artists=["Другой"], duration_sec=234),
+    )
+    actual = score_candidate(
+        track,
+        Candidate(source="youtube", title="Земфира - Хочешь", artists=["Земфира"], duration_sec=234),
+    )
+    outcome = {
+        "selected": {"source": "youtube", "title": actual.candidate.title},
+        "scored_candidate": actual,
+        "expected_duration": 234,
+        "actual_duration": 234,
+    }
+
+    quality, reasons = download_quality_summary(stale, outcome)
+
+    assert quality == "ok"
+    assert reasons == []
 
 
 # ----------------- YouTube/SoundCloud candidate ranking -----------------
@@ -226,6 +418,7 @@ def test_youtube_search_queries_adds_translit_and_topic():
     assert any(has_cyrillic(q) for q in queries)
     # topic-запрос должен присутствовать
     assert any(q.lower().endswith(" topic") for q in queries)
+    assert any(q.lower().endswith(" official audio") for q in queries)
 
 
 # ----------------- view_count signal (G) -----------------

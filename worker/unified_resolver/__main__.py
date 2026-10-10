@@ -87,33 +87,71 @@ def candidate_payload(rank: int, item) -> dict:
 def best_route(scored) -> tuple[int, object] | None:
     for rank, item in enumerate(scored, 1):
         c = item.candidate
-        if c.route_kind == "resolvable_blocked" and item.score >= 55:
-            return rank, item
-    return (1, scored[0]) if scored else None
-
-
-def download_quality_summary(scored_candidate) -> tuple[str, list[str]]:
-    reasons: list[str] = []
-    candidate = scored_candidate.candidate
-    if scored_candidate.score < 65:
-        reasons.append(f"low_score:{scored_candidate.score}")
-    if scored_candidate.title_score < 72:
-        reasons.append(f"title_match:{scored_candidate.title_score}")
-    if scored_candidate.artist_score < 72:
-        reasons.append(f"artist_match:{scored_candidate.artist_score}")
-    if scored_candidate.duration_score < 70:
-        reasons.append(f"duration_score:{scored_candidate.duration_score}")
-    if candidate.duration_sec is None:
-        reasons.append("duration_unknown")
-    for flag in scored_candidate.flags:
         if (
-            flag.startswith("marker:")
-            or flag.startswith("critical_marker:")
-            or flag.startswith("duration_diff:")
-            or flag in {"large_duration_mismatch", "weak_artist_match", "weak_title_match"}
+            c.route_kind == "resolvable_blocked"
+            and c.public_url_ok is not False
+            and item.score >= 55
         ):
-            reasons.append(flag)
-    title_lower = (candidate.title or "").lower()
+            return rank, item
+    for rank, item in enumerate(scored, 1):
+        if item.candidate.public_url_ok is not False:
+            return rank, item
+    return None
+
+
+def download_quality_summary(scored_candidate, outcome: dict | None = None) -> tuple[str, list[str]]:
+    """Assess the file that was actually saved, not only the initial rank-1.
+
+    ``Downloader`` may move to a later direct candidate or to YouTube/SoundCloud
+    search. Older code still assessed the pre-download candidate, producing
+    warnings unrelated to the resulting file. The optional outcome carries the
+    real selection and decoded duration.
+    """
+    reasons: list[str] = []
+    outcome = outcome or {}
+    actual_scored = outcome.get("scored_candidate") or scored_candidate
+    candidate = actual_scored.candidate
+    selected = outcome.get("selected") or {}
+    selected_title = selected.get("title") or candidate.title or ""
+    selected_source = selected.get("source") or candidate.source
+    is_search_fallback = str(selected_source).endswith("-search")
+    actual_duration = outcome.get("actual_duration")
+    expected_duration = outcome.get("expected_duration")
+
+    # Identity thresholds are intentionally below the pre-download selection
+    # thresholds: candidates weaker than these are no longer downloaded at all.
+    # A warning here therefore means a remaining ambiguity worth listening to,
+    # not a harmless presentation label such as "Official Audio".
+    if not is_search_fallback:
+        if actual_scored.score < 55:
+            reasons.append(f"low_score:{actual_scored.score}")
+        if actual_scored.title_score < 65:
+            reasons.append(f"title_match:{actual_scored.title_score}")
+        if actual_scored.artist_score < 60:
+            reasons.append(f"artist_match:{actual_scored.artist_score}")
+
+    if expected_duration and actual_duration:
+        actual_diff = abs(int(expected_duration) - int(actual_duration))
+        if actual_diff > 15:
+            reasons.append(f"actual_duration_diff:{actual_diff}s")
+    elif candidate.duration_sec is None and actual_duration is None:
+        reasons.append("duration_unknown")
+
+    if not is_search_fallback:
+        for flag in actual_scored.flags:
+            if (
+                flag.startswith("critical_marker:")
+                or flag in {"large_duration_mismatch", "weak_artist_match", "weak_title_match"}
+            ):
+                reasons.append(flag)
+
+    # Fallback search has its own score and no ScoredCandidate object. Only a
+    # genuinely weak fallback rank should trigger review.
+    fallback_rank_score = selected.get("rank_score")
+    if fallback_rank_score is not None and float(fallback_rank_score) < 55:
+        reasons.append(f"fallback_score:{fallback_rank_score}")
+
+    title_lower = selected_title.lower()
     source_markers = [
         "live",
         "concert",
@@ -133,10 +171,10 @@ def download_quality_summary(scored_candidate) -> tuple[str, list[str]]:
     for marker in source_markers:
         if marker in title_lower and not any(marker in reason for reason in reasons):
             reasons.append(f"title_marker:{marker}")
-    if reasons and candidate.source:
-        reasons.append(f"source:{candidate.source}")
-    if reasons and candidate.title:
-        reasons.append(f"candidate:{candidate.title[:80]}")
+    if reasons and selected_source:
+        reasons.append(f"source:{selected_source}")
+    if reasons and selected_title:
+        reasons.append(f"candidate:{selected_title[:80]}")
     return ("suspicious" if reasons else "ok", reasons)
 
 
@@ -179,6 +217,23 @@ def print_resolution_report(report) -> None:
             ensure_ascii=False,
         )
     )
+
+
+def resolution_payload(report) -> dict:
+    selected = best_route(report.candidates)
+    return {
+        "track": report.track.__dict__,
+        "providers": [run.__dict__ for run in report.provider_runs],
+        "selected": candidate_payload(*selected) if selected else None,
+        "candidates": [
+            candidate_payload(rank, item)
+            for rank, item in enumerate(report.candidates, 1)
+        ],
+        "safe_mode": {
+            "download_performed": False,
+            "direct_media_url_requested": False,
+        },
+    }
 
 
 def find_column_indices(headers: list[str]) -> tuple[int, int, int]:
@@ -351,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("--duration", type=int, help="expected duration in seconds")
     resolve.add_argument("--limit", type=int, default=5, help="limit per provider")
     resolve.add_argument("--no-url-check", action="store_true", help="skip public URL preflight checks")
+    resolve.add_argument("--json", action="store_true", help="print one machine-readable JSON object")
 
     lyrics = sub.add_parser("lyrics", help="safe lyrics search report without printing lyrics text")
     lyrics.add_argument("query", help="Spotify URL/ID or text query")
@@ -410,7 +466,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Could not resolve title. Pass --title/--artist for this input.", file=sys.stderr)
             return 2
         report = Resolver().resolve(meta, limit_per_provider=args.limit, check_urls=not args.no_url_check)
-        print_resolution_report(report)
+        if args.json:
+            print(json.dumps(resolution_payload(report), ensure_ascii=False))
+        else:
+            print_resolution_report(report)
         return 0
     if args.command == "lyrics":
         meta = metadata_from_args(args)
@@ -491,9 +550,10 @@ def main(argv: list[str] | None = None) -> int:
             cookies_from_browser=args.cookies_from_browser,
             duration_tolerance=args.duration_tolerance,
         )
-        success = dl.download(report.track, report.candidates)
+        outcome: dict = {}
+        success = dl.download(report.track, report.candidates, result_out=outcome)
         if success:
-            quality, reasons = download_quality_summary(scored_candidate)
+            quality, reasons = download_quality_summary(scored_candidate, outcome)
             detail = ", ".join(reasons) if reasons else "clean_match"
             print(f"[?] Download quality: {quality}; {detail}")
         return 0 if success else 4
@@ -566,10 +626,16 @@ def main(argv: list[str] | None = None) -> int:
                 rank, scored_candidate = selected
                 print(f"[+] [{pos}] Selected candidate: Rank {rank}, Score {scored_candidate.score} ({scored_candidate.candidate.source})")
                 
-                success = dl.download(report.track, report.candidates, override_dir=override_dir)
+                outcome: dict = {}
+                success = dl.download(
+                    report.track,
+                    report.candidates,
+                    override_dir=override_dir,
+                    result_out=outcome,
+                )
                 if success:
                     print(f"[+] [{pos}] Successfully downloaded and processed '{artist} - {title}'.")
-                    quality, reasons = download_quality_summary(scored_candidate)
+                    quality, reasons = download_quality_summary(scored_candidate, outcome)
                     detail = ", ".join(reasons) if reasons else "clean_match"
                     print(f"[?] [{pos}] Download quality: {quality}; {detail}")
                     return True

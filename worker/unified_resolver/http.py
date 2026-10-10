@@ -1,29 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.parse
 import urllib.request
 import urllib.error
 from typing import Any, Optional
 
+try:
+    import certifi
 
-import ssl
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    pass
+
 
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
 def safe_urlopen(req: Any, timeout: int = 10) -> Any:
-    try:
-        return urllib.request.urlopen(req, timeout=timeout)
-    except Exception as e:
-        err_str = str(e).lower()
-        if "cert" in err_str or "ssl" in err_str or "handshake" in err_str or isinstance(e, ssl.SSLError):
-            try:
-                ctx = ssl._create_unverified_context()
-                return urllib.request.urlopen(req, timeout=timeout, context=ctx)
-            except Exception:
-                pass
-        raise e
+    # TLS verification is deliberately never disabled here. Search metadata is
+    # part of the verification chain; accepting a forged API response would be
+    # worse than reporting a certificate configuration error to the user.
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def get_json(url: str, headers: Optional[dict[str, str]] = None, timeout: int = 30) -> Any:
@@ -86,7 +85,7 @@ def is_safe_public_page(url: str) -> bool:
     return (parsed.hostname or "").lower() in PUBLIC_PAGE_HOSTS
 
 
-def check_public_url(url: str, timeout: int = 10) -> bool:
+def check_public_url(url: str, timeout: int = 10) -> Optional[bool]:
     if not is_safe_public_page(url):
         return False
     headers = {"User-Agent": DEFAULT_UA}
@@ -97,7 +96,12 @@ def check_public_url(url: str, timeout: int = 10) -> bool:
                 return 200 <= resp.status < 400
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403, 405, 429}:
-                return True
+                # The resource may exist, but the generic preflight cannot
+                # prove it. Preserve that distinction instead of reporting a
+                # false positive.
+                return None
+            if exc.code in {404, 410}:
+                return False
         except Exception:
             pass
     return False

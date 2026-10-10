@@ -167,7 +167,6 @@ def _default_youtube_durations(query: str) -> list[int]:
         "quiet": True,
         "nooverwrites": True,
         "noplaylist": True,
-        "nocheckcertificate": True,
         "extract_flat": "in_playlist",
     }
     durations: list[int] = []

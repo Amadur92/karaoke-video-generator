@@ -1,12 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Скрывает консоль на Windows в релиз-сборке
 
+mod batch_pipeline;
+mod batch_project;
 mod ffmpeg;
 mod lyrics;
 mod paths;
 mod pptx_optimizer;
+mod workspace_ui;
 
+use desktop_app::{audio_loudness, audio_preview};
 use eframe::egui;
-use rodio::Source;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -144,6 +147,24 @@ fn open_path(path: &std::path::Path) {
     }
 }
 
+fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(url)
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).status();
+    }
+}
+
 fn scan_batch_folder(
     root: &Path,
     fade_in_ms: i32,
@@ -218,6 +239,7 @@ fn scan_batch_folder(
                 folder: folder.clone(),
                 audio_path,
                 lyrics_path,
+                lyrics_override: None,
                 artist,
                 title,
                 duration_ms,
@@ -230,6 +252,7 @@ fn scan_batch_folder(
                 output_path: None,
                 alignment_quality: None,
                 audit: None,
+                waveform: None,
             };
             refresh_batch_item_audit(&mut item, plain_lines);
             items.push(item);
@@ -300,15 +323,20 @@ fn batch_timings_path(audio_path: &Path) -> PathBuf {
     audio_path.with_file_name(format!("{}_timings.json", stem))
 }
 
+fn clamp_trim_window(start: i64, end: i64, duration: i64) -> (i64, i64) {
+    let duration = duration.max(0);
+    let gap = duration.min(1000);
+    let end = end.clamp(gap, duration);
+    (start.clamp(0, end - gap), end)
+}
+
 fn batch_item_trim_window(item: &BatchItem) -> (i64, i64, bool) {
     let start = item
         .trim_start_ms
         .clamp(0, item.duration_ms.saturating_sub(1000));
     let end = item.trim_end_ms.clamp(start + 1000, item.duration_ms);
-    let should_trim = start > 0
-        || end < item.duration_ms.saturating_sub(250)
-        || item.fade_in_ms > 0
-        || item.fade_out_ms > 0;
+    let should_trim =
+        start > 0 || end < item.duration_ms || item.fade_in_ms > 0 || item.fade_out_ms > 0;
     (start, end, should_trim)
 }
 
@@ -356,6 +384,38 @@ fn font_display_name(_font: &str) -> &'static str {
     "Montserrat"
 }
 
+fn audio_source_label(source: &str) -> &str {
+    match source {
+        "youtube" => "YouTube",
+        "soundcloud" => "SoundCloud",
+        "deezer-isrc" => "Deezer",
+        "qobuz-isrc" => "Qobuz",
+        "jiosaavn" => "JioSaavn",
+        "songlink" => "Songlink",
+        other => other,
+    }
+}
+
+fn format_audio_duration(duration_sec: Option<i64>) -> String {
+    duration_sec
+        .map(|seconds| format!("{}:{:02}", seconds / 60, seconds % 60))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn quality_display_name(quality: &str) -> &'static str {
+    match quality {
+        "high" => "Высокое · 1352×224 · 256 кбит/с",
+        "ultra" => "Мастер · 2704×448 · 320 кбит/с",
+        _ => "Стандарт · 1352×224 · 192 кбит/с",
+    }
+}
+
+fn split_panel_widths(total_width: f32, gap: f32, left_ratio: f32) -> (f32, f32) {
+    let usable = (total_width - gap.max(0.0)).max(0.0);
+    let left = usable * left_ratio.clamp(0.0, 1.0);
+    (left, usable - left)
+}
+
 fn normalized_font_choice(_font: &str) -> String {
     "montserrat".to_string()
 }
@@ -381,11 +441,14 @@ struct AppSettings {
     model: String,
     quality: String,
     font: String,
+    font_scale: f32,
     color_active: [u8; 3],
     color_inactive: [u8; 3],
     color_bg: [u8; 3],
     inactive_opacity: f32,
     audio_delay_ms: i32,
+    normalize_audio: bool,
+    loudness_target_db: i32,
     fade_in_ms: i32,
     fade_out_ms: i32,
     artist: String,
@@ -403,18 +466,21 @@ impl Default for AppSettings {
             model: "base".to_string(),
             quality: "medium".to_string(),
             font: "montserrat".to_string(),
+            font_scale: 1.0,
             color_active: [0, 0, 0],
             color_inactive: [180, 185, 195],
             color_bg: [255, 255, 255],
             inactive_opacity: 0.65,
             audio_delay_ms: 0,
+            normalize_audio: true,
+            loudness_target_db: audio_loudness::DEFAULT_TARGET_DB,
             fade_in_ms: 0,
             fade_out_ms: 0,
             artist: String::new(),
             title: String::new(),
             lyrics: String::new(),
             plain_lines: false,
-            verify_lrc_with_whisper: false,
+            verify_lrc_with_whisper: true,
             separate_vocals_for_word_level: false,
             batch_overwrite_timings: false,
         }
@@ -483,12 +549,25 @@ struct VideoFrame {
     pixels: Vec<u8>,
 }
 
+struct PreparedAudioPreview {
+    source: audio_preview::WavSource,
+    start_ms: i64,
+    end_ms: i64,
+    message: String,
+}
+struct PreparedVideoPreview {
+    path: String,
+    asset: audio_preview::Asset,
+    width: usize,
+    height: usize,
+    start_ms: i64,
+}
 struct AudioLoadUpdate {
     path: String,
     result: Result<i64, String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum BatchStatus {
     Ready,
     MissingLyrics,
@@ -522,6 +601,7 @@ impl AlignmentQuality {
     fn label(&self) -> &'static str {
         match self.summary.as_str() {
             "ok" => "OK",
+            "unverified" => "не проверено по аудио",
             "minor_warnings" => "есть замечания",
             "suspicious" => "проверить",
             "needs_repair" => "нужна правка",
@@ -532,6 +612,7 @@ impl AlignmentQuality {
     fn color(&self) -> egui::Color32 {
         match self.summary.as_str() {
             "ok" => egui::Color32::from_rgb(54, 211, 153),
+            "unverified" => egui::Color32::from_rgb(246, 181, 70),
             "minor_warnings" => egui::Color32::from_rgb(246, 181, 70),
             "suspicious" => egui::Color32::from_rgb(255, 137, 86),
             "needs_repair" => egui::Color32::from_rgb(255, 100, 100),
@@ -542,6 +623,7 @@ impl AlignmentQuality {
     fn icon(&self) -> &'static str {
         match self.summary.as_str() {
             "ok" => "✓",
+            "unverified" => "?",
             "minor_warnings" => "!",
             "suspicious" => "?",
             "needs_repair" => "!",
@@ -630,7 +712,13 @@ impl PackageAudit {
         let mut detected_output_path = None;
         let mut detected_alignment = None;
 
-        if item.status == BatchStatus::MissingLyrics || item.lyrics_path.as_os_str().is_empty() {
+        if let Some(text) = &item.lyrics_override {
+            if text.trim().is_empty() {
+                errors.push("нет текста песни".to_string());
+            }
+        } else if item.status == BatchStatus::MissingLyrics
+            || item.lyrics_path.as_os_str().is_empty()
+        {
             errors.push("нет файла текста .txt/.lrc".to_string());
         } else if let Ok(meta) = std::fs::metadata(&item.lyrics_path)
             && meta.len() < 16
@@ -667,6 +755,9 @@ impl PackageAudit {
                     match quality.summary.as_str() {
                         "needs_repair" => errors.push("отчёт таймингов: нужна правка".to_string()),
                         "suspicious" => warnings.push("отчёт таймингов: проверить".to_string()),
+                        "unverified" => warnings.push(
+                            "тайминги проверены только структурно, без сверки с аудио".to_string(),
+                        ),
                         "minor_warnings" => {
                             warnings.push("отчёт таймингов: есть мелкие замечания".to_string())
                         }
@@ -780,11 +871,13 @@ fn batch_audit_counts(items: &[BatchItem]) -> (usize, usize, usize, usize) {
     (ok, notice, warning, error)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct BatchItem {
     folder: PathBuf,
     audio_path: PathBuf,
     lyrics_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lyrics_override: Option<String>,
     artist: String,
     title: String,
     duration_ms: i64,
@@ -795,8 +888,26 @@ struct BatchItem {
     status: BatchStatus,
     progress: f32,
     output_path: Option<String>,
+    #[serde(skip)]
     alignment_quality: Option<AlignmentQuality>,
+    #[serde(skip)]
     audit: Option<PackageAudit>,
+    #[serde(skip)]
+    waveform: Option<Vec<f32>>,
+}
+
+fn waveform_peak(peaks: Option<&[f32]>, index: usize, bars: usize) -> f32 {
+    let Some(peaks) = peaks.filter(|p| !p.is_empty()) else {
+        return 0.0;
+    };
+    let start = index * peaks.len() / bars;
+    let end = ((index + 1) * peaks.len() / bars)
+        .max(start + 1)
+        .min(peaks.len());
+    peaks[start.min(peaks.len() - 1)..end]
+        .iter()
+        .copied()
+        .fold(0.0, f32::max)
 }
 
 fn batch_trim_timeline_static_ui(
@@ -837,10 +948,7 @@ fn batch_trim_timeline_static_ui(
             0.0
         };
         let x = track_rect.left() + ratio * track_width;
-        let wave = ((ratio * 18.0).sin().abs() * 0.55
-            + (ratio * 47.0).sin().abs() * 0.30
-            + (ratio * 91.0).sin().abs() * 0.15)
-            .clamp(0.15, 1.0);
+        let wave = waveform_peak(item.waveform.as_deref(), i, bar_count);
         let amp = max_amp * wave;
         let waveform_color = if selected_rect.contains(egui::pos2(x, center_y)) {
             egui::Color32::from_rgb(72, 222, 226)
@@ -946,6 +1054,46 @@ pub struct TrackItem {
     pub status: TrackStatus,
     #[serde(default, skip_serializing)]
     pub quality_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AudioSearchReport {
+    track: AudioSearchTrack,
+    providers: Vec<AudioProviderRun>,
+    selected: Option<AudioSearchCandidate>,
+    candidates: Vec<AudioSearchCandidate>,
+    safe_mode: AudioSafeMode,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AudioSearchTrack {
+    title: String,
+    artists: Vec<String>,
+    duration_sec: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AudioProviderRun {
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AudioSafeMode {
+    download_performed: bool,
+    direct_media_url_requested: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AudioSearchCandidate {
+    rank: usize,
+    score: f32,
+    source: String,
+    title: String,
+    artists: Vec<String>,
+    duration_sec: Option<i64>,
+    public_url: Option<String>,
+    public_url_ok: Option<bool>,
+    flags: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -1089,6 +1237,7 @@ struct KaraokeApp {
     model: String,
     quality: String,
     font: String,
+    font_scale: f32,
 
     // Цвета в формате RGB [r, g, b]
     color_active: [u8; 3],
@@ -1098,6 +1247,8 @@ struct KaraokeApp {
 
     // Сдвиг аудио (мс)
     audio_delay_ms: i32,
+    normalize_audio: bool,
+    loudness_target_db: i32,
 
     // Статус выполнения
     is_generating: bool,
@@ -1108,6 +1259,17 @@ struct KaraokeApp {
     // Канал получения прогресса из фонового потока
     rx: Option<Receiver<ProgressUpdate>>,
     audio_rx: Option<Receiver<AudioLoadUpdate>>,
+    audio_asset: Option<audio_preview::Asset>,
+    waveform_path: Option<String>,
+    waveform_stamp: Option<(u64, Option<std::time::SystemTime>)>,
+    waveform_cancel: Arc<AtomicBool>,
+    waveform_rx: Option<Receiver<Result<audio_preview::Asset, String>>>,
+    prepared_preview_rx: Option<Receiver<Result<PreparedAudioPreview, String>>>,
+    preview_cancel: Arc<AtomicBool>,
+    preview_normalized: bool,
+    prepared_video_rx: Option<Receiver<Result<PreparedVideoPreview, String>>>,
+    video_prepare_cancel: Arc<AtomicBool>,
+    video_asset: Option<(String, audio_preview::Asset)>,
 
     // Путь к сгенерированному видео-файлу
     generated_file: Option<String>,
@@ -1136,7 +1298,18 @@ struct KaraokeApp {
     batch_scan_rx: Option<Receiver<BatchScanResult>>,
     batch_single_mode: bool,
     batch_cancel: Arc<AtomicBool>,
+    batch_stop_after: Arc<AtomicBool>,
     active_tab: ActiveTab,
+    ui_frame_preview: workspace_ui::FramePreview,
+    ui_batch_filter: workspace_ui::BatchFilter,
+    ui_batch_search: String,
+    ui_lyrics_source: bool,
+    ui_advanced_open: bool,
+    ui_logs_open: bool,
+    ui_batch_editing: Option<usize>,
+    last_autosave: Instant,
+    saved_settings: Vec<u8>,
+    saved_project: Vec<u8>,
     dl_mode_excel: bool,
     dl_track_query: String,
     dl_excel_path: Option<PathBuf>,
@@ -1153,6 +1326,8 @@ struct KaraokeApp {
     dl_overwrite: bool,
     dl_max_workers: usize,
     dl_stop_requested: bool,
+    dl_search_only: bool,
+    dl_search_result: Option<AudioSearchReport>,
     dl_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
     batch_start_time: Option<Instant>,
     dl_start_time: Option<Instant>,
@@ -1221,14 +1396,45 @@ impl KaraokeApp {
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
             .insert(2, "montserrat_black".to_owned());
+        fonts.families.insert(
+            egui::FontFamily::Name("karaoke_preview".into()),
+            vec![
+                "montserrat_black".into(),
+                "montserrat_bold".into(),
+                "montserrat_regular".into(),
+            ],
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("karaoke_ui_bold".into()),
+            vec!["montserrat_bold".into(), "montserrat_regular".into()],
+        );
         cc.egui_ctx.set_fonts(fonts);
+        cc.egui_ctx.style_mut(|style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.spacing.interact_size = egui::vec2(30.0, 30.0);
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        });
 
         // 3. Загрузка сохраненных настроек
+        let restored_project = batch_project::Project::read(&batch_project::autosave_path()).ok();
         let settings: AppSettings = std::fs::read_to_string(paths::settings_path())
             .ok()
             .and_then(|data| serde_json::from_str(&data).ok())
             .unwrap_or_default();
 
+        let restored_count = restored_project
+            .as_ref()
+            .map(|p| p.items.len())
+            .unwrap_or(0);
         Self {
             audio_path: None,
             audio_duration_ms: None,
@@ -1249,17 +1455,33 @@ impl KaraokeApp {
             model: settings.model,
             quality: settings.quality,
             font: normalized_font_choice(&settings.font),
+            font_scale: settings.font_scale.clamp(0.7, 1.3),
             color_active: settings.color_active,
             color_inactive: settings.color_inactive,
             color_bg: settings.color_bg,
             inactive_opacity: settings.inactive_opacity.clamp(0.0, 1.0),
             audio_delay_ms: settings.audio_delay_ms,
+            normalize_audio: settings.normalize_audio,
+            loudness_target_db: settings
+                .loudness_target_db
+                .clamp(audio_loudness::MIN_TARGET_DB, audio_loudness::MAX_TARGET_DB),
             is_generating: false,
             progress: 0.0,
             status_text: "Готов к работе".to_string(),
             log_output: String::new(),
             rx: None,
             audio_rx: None,
+            audio_asset: None,
+            waveform_path: None,
+            waveform_stamp: None,
+            waveform_cancel: Arc::new(AtomicBool::new(false)),
+            waveform_rx: None,
+            prepared_preview_rx: None,
+            preview_cancel: Arc::new(AtomicBool::new(false)),
+            preview_normalized: false,
+            prepared_video_rx: None,
+            video_prepare_cancel: Arc::new(AtomicBool::new(false)),
+            video_asset: None,
             generated_file: None,
             video_rx: None,
             video_stop: None,
@@ -1275,18 +1497,33 @@ impl KaraokeApp {
             verify_lrc_with_whisper: settings.verify_lrc_with_whisper,
             separate_vocals_for_word_level: settings.separate_vocals_for_word_level,
             batch_overwrite_timings: settings.batch_overwrite_timings,
-            batch_root: None,
-            batch_items: Vec::new(),
+            batch_root: restored_project.as_ref().and_then(|p| p.root.clone()),
+            batch_items: restored_project.map(|p| p.items).unwrap_or_default(),
             batch_running: false,
             batch_stop_requested: false,
             batch_current_index: None,
             batch_selected_index: None,
-            batch_status_text: String::new(),
+            batch_status_text: if restored_count > 0 {
+                format!("Восстановлено {restored_count} треков. Можно продолжить пакет.")
+            } else {
+                String::new()
+            },
             batch_is_scanning: false,
             batch_scan_rx: None,
             batch_single_mode: false,
             batch_cancel: Arc::new(AtomicBool::new(false)),
+            batch_stop_after: Arc::new(AtomicBool::new(false)),
             active_tab: ActiveTab::SingleTrack,
+            ui_frame_preview: Default::default(),
+            ui_batch_filter: workspace_ui::BatchFilter::All,
+            ui_batch_search: String::new(),
+            ui_lyrics_source: false,
+            ui_advanced_open: false,
+            ui_logs_open: false,
+            ui_batch_editing: None,
+            last_autosave: Instant::now(),
+            saved_settings: Vec::new(),
+            saved_project: Vec::new(),
             dl_mode_excel: false,
             dl_track_query: String::new(),
             dl_excel_path: None,
@@ -1303,6 +1540,8 @@ impl KaraokeApp {
             dl_overwrite: false,
             dl_max_workers: 2,
             dl_stop_requested: false,
+            dl_search_only: false,
+            dl_search_result: None,
             dl_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
             batch_start_time: None,
             dl_start_time: None,
@@ -1318,14 +1557,106 @@ impl KaraokeApp {
         }
     }
 
+    fn settings_snapshot(&self) -> AppSettings {
+        AppSettings {
+            model: self.model.clone(),
+            quality: self.quality.clone(),
+            font: self.font.clone(),
+            font_scale: self.font_scale,
+            color_active: self.color_active,
+            color_inactive: self.color_inactive,
+            color_bg: self.color_bg,
+            inactive_opacity: self.inactive_opacity,
+            audio_delay_ms: self.audio_delay_ms,
+            normalize_audio: self.normalize_audio,
+            loudness_target_db: self.loudness_target_db,
+            fade_in_ms: self.fade_in_ms,
+            fade_out_ms: self.fade_out_ms,
+            artist: self.artist.clone(),
+            title: self.title.clone(),
+            lyrics: self.lyrics.clone(),
+            plain_lines: self.plain_lines,
+            verify_lrc_with_whisper: self.verify_lrc_with_whisper,
+            separate_vocals_for_word_level: self.separate_vocals_for_word_level,
+            batch_overwrite_timings: self.batch_overwrite_timings,
+        }
+    }
+
+    fn persist_state(&mut self) {
+        let settings = self.settings_snapshot();
+        if let Ok(bytes) = serde_json::to_vec_pretty(&settings)
+            && bytes != self.saved_settings
+        {
+            match desktop_app::cache::atomic_write(&paths::settings_path(), &bytes) {
+                Ok(()) => self.saved_settings = bytes,
+                Err(error) => paths::debug_log(format!("Настройки не сохранены: {error}")),
+            }
+        }
+        if !self.batch_items.is_empty() || !self.saved_project.is_empty() {
+            let project = batch_project::Project::new(
+                self.batch_root.clone(),
+                self.batch_items.clone(),
+                settings,
+            );
+            if let Ok(bytes) = project.bytes()
+                && bytes != self.saved_project
+            {
+                match desktop_app::cache::atomic_write(&batch_project::autosave_path(), &bytes) {
+                    Ok(()) => self.saved_project = bytes,
+                    Err(error) => paths::debug_log(format!("Проект не сохранён: {error}")),
+                }
+            }
+        }
+    }
+
+    fn open_batch_project(&mut self, path: &Path) {
+        self.ui_batch_editing = None;
+        self.ui_frame_preview.line_time_ms = None;
+        match batch_project::Project::read(path) {
+            Ok(project) => {
+                self.stop_preview();
+                self.batch_root = project.root;
+                self.batch_items = project.items;
+                self.batch_selected_index = None;
+                self.batch_current_index = None;
+                let s = project.settings;
+                self.model = s.model;
+                self.quality = s.quality;
+                self.font = normalized_font_choice(&s.font);
+                self.font_scale = s.font_scale.clamp(0.7, 1.3);
+                self.color_active = s.color_active;
+                self.color_inactive = s.color_inactive;
+                self.color_bg = s.color_bg;
+                self.inactive_opacity = s.inactive_opacity.clamp(0.0, 1.0);
+                self.audio_delay_ms = s.audio_delay_ms;
+                self.normalize_audio = s.normalize_audio;
+                self.loudness_target_db = s
+                    .loudness_target_db
+                    .clamp(audio_loudness::MIN_TARGET_DB, audio_loudness::MAX_TARGET_DB);
+                self.plain_lines = s.plain_lines;
+                self.verify_lrc_with_whisper = s.verify_lrc_with_whisper;
+                self.separate_vocals_for_word_level = s.separate_vocals_for_word_level;
+                self.batch_overwrite_timings = s.batch_overwrite_timings;
+                self.batch_status_text =
+                    format!("Восстановлен проект: {} треков", self.batch_items.len());
+                self.persist_state();
+            }
+            Err(error) => self.batch_status_text = format!("Не удалось открыть проект: {error}"),
+        }
+    }
+
     fn is_preview_playing(&self) -> bool {
-        self.preview_sink
-            .as_ref()
-            .map(|sink| !sink.empty())
-            .unwrap_or(false)
+        self.prepared_preview_rx.is_some()
+            || self
+                .preview_sink
+                .as_ref()
+                .map(|sink| !sink.empty())
+                .unwrap_or(false)
     }
 
     fn stop_preview(&mut self) {
+        self.preview_cancel.store(true, Ordering::Relaxed);
+        self.prepared_preview_rx = None;
         if let Some(sink) = self.preview_sink.take() {
             sink.stop();
         }
@@ -1335,32 +1666,22 @@ impl KaraokeApp {
         self.preview_end_ms = 0;
     }
 
-    fn play_audio_preview(
-        &mut self,
-        path: &Path,
-        start_ms: i64,
-        end_ms: i64,
-        skip_ms: i64,
-    ) -> Result<(), String> {
+    fn play_audio_preview(&mut self, ready: PreparedAudioPreview) -> Result<(), String> {
         self.stop_preview();
-
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("Не удалось открыть preview-аудио: {}", e))?;
-        let source = rodio::Decoder::new(std::io::BufReader::new(file))
-            .map_err(|e| format!("Не удалось декодировать preview-аудио: {}", e))?;
         let (stream, stream_handle) = rodio::OutputStream::try_default()
             .map_err(|e| format!("Не удалось открыть аудиовыход: {}", e))?;
         let sink = rodio::Sink::try_new(&stream_handle)
             .map_err(|e| format!("Не удалось создать аудио-плеер: {}", e))?;
 
-        sink.append(source.skip_duration(Duration::from_millis(skip_ms.max(0) as u64)));
+        sink.append(ready.source);
         sink.play();
 
         self.preview_stream = Some(stream);
         self.preview_sink = Some(sink);
         self.preview_started_at = Some(Instant::now());
-        self.preview_started_ms = start_ms;
-        self.preview_end_ms = end_ms;
+        self.preview_started_ms = ready.start_ms;
+        self.preview_end_ms = ready.end_ms;
+        self.trim_status = ready.message;
         Ok(())
     }
 
@@ -1403,6 +1724,8 @@ impl KaraokeApp {
     }
 
     fn halt_video_preview(&mut self) {
+        self.video_prepare_cancel.store(true, Ordering::Relaxed);
+        self.prepared_video_rx = None;
         if let Some(stop) = self.video_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
@@ -1437,31 +1760,78 @@ impl KaraokeApp {
     fn start_video_preview(&mut self, path: &str, ctx: &egui::Context) -> Result<(), String> {
         self.halt_video_preview();
         self.video_status = "Готовим встроенный предпросмотр...".to_string();
+        let path = path.to_string();
+        let cached = self
+            .video_asset
+            .as_ref()
+            .filter(|(name, _)| name == &path)
+            .map(|(_, asset)| asset.clone());
+        let requested_position = self.video_position_ms;
+        self.video_prepare_cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = self.video_prepare_cancel.clone();
+        let (tx, rx) = channel();
+        self.prepared_video_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let asset = match cached {
+                    Some(asset) => asset,
+                    None => audio_preview::prepare(
+                        Path::new(&path),
+                        &paths::tool_path("ffmpeg"),
+                        cancelled.clone(),
+                    )?,
+                };
+                let (width, height) = ffmpeg::preview_video_size(&path)?;
+                let start_ms = if requested_position >= asset.duration_ms - 250 {
+                    0
+                } else {
+                    requested_position.clamp(0, asset.duration_ms)
+                };
+                Ok(PreparedVideoPreview {
+                    path,
+                    asset,
+                    width,
+                    height,
+                    start_ms,
+                })
+            })();
+            if !cancelled.load(Ordering::Relaxed) {
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            }
+        });
+        Ok(())
+    }
 
-        if self.video_duration_ms <= 0 {
-            self.video_duration_ms = ffmpeg::probe_audio_duration_ms(path).unwrap_or(0);
-        }
-        if self.video_duration_ms > 0 && self.video_position_ms >= self.video_duration_ms - 250 {
-            self.video_position_ms = 0;
-        }
-        let start_ms = self
-            .video_position_ms
-            .clamp(0, self.video_duration_ms.max(0));
-
-        let (width, height) = ffmpeg::preview_video_size(path)?;
-        let audio_path = paths::temp_dir().join("karaoke_video_preview.wav");
-        ffmpeg::render_video_preview_audio(path, &audio_path, start_ms)?;
-
-        let audio_file = std::fs::File::open(&audio_path)
-            .map_err(|e| format!("Не удалось открыть звук видео: {}", e))?;
-        let source = rodio::Decoder::new(std::io::BufReader::new(audio_file))
-            .map_err(|e| format!("Не удалось декодировать звук видео: {}", e))?;
+    fn play_video_ready(
+        &mut self,
+        ready: PreparedVideoPreview,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let PreparedVideoPreview {
+            path,
+            asset,
+            width,
+            height,
+            start_ms,
+        } = ready;
+        let source = audio_preview::WavSource::new(
+            &asset.path,
+            (0, asset.duration_ms),
+            start_ms,
+            (0, 0),
+            0.0,
+        )?;
+        self.video_duration_ms = asset.duration_ms;
+        self.video_position_ms = start_ms;
+        self.video_asset = Some((path.clone(), asset));
         let (stream, stream_handle) = rodio::OutputStream::try_default()
             .map_err(|e| format!("Не удалось открыть аудиовыход: {}", e))?;
         let sink = rodio::Sink::try_new(&stream_handle)
             .map_err(|e| format!("Не удалось создать аудио-плеер: {}", e))?;
 
-        let (tx, rx) = channel::<VideoFrame>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<VideoFrame>(2);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let ctx_thread = ctx.clone();
@@ -1495,17 +1865,18 @@ impl KaraokeApp {
 
             let Some(mut stdout) = child.stdout.take() else {
                 let _ = child.kill();
+                let _ = child.wait();
                 return;
             };
 
             let frame_len = width.saturating_mul(height).saturating_mul(4);
-            let frame_duration = Duration::from_millis(1000 / 24);
             let started_at = Instant::now();
             let mut frame_index = 0u32;
 
             loop {
                 if stop_thread.load(Ordering::Relaxed) {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return;
                 }
 
@@ -1514,21 +1885,22 @@ impl KaraokeApp {
                     break;
                 }
 
-                let target_at = started_at + frame_duration * frame_index;
+                let target_at = started_at + Duration::from_secs_f64(frame_index as f64 / 24.0);
                 let now = Instant::now();
                 if target_at > now {
                     std::thread::sleep(target_at - now);
                 }
 
-                if tx
-                    .send(VideoFrame {
+                if matches!(
+                    tx.try_send(VideoFrame {
                         width,
                         height,
-                        pixels,
-                    })
-                    .is_err()
-                {
+                        pixels
+                    }),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_))
+                ) {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return;
                 }
                 ctx_thread.request_repaint();
@@ -1644,8 +2016,11 @@ impl KaraokeApp {
         }
 
         if let Some(rx) = &self.video_rx {
-            let mut got_frame = false;
+            let mut latest = None;
             while let Ok(frame) = rx.try_recv() {
+                latest = Some(frame);
+            }
+            if let Some(frame) = latest {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [frame.width, frame.height],
                     &frame.pixels,
@@ -1654,9 +2029,6 @@ impl KaraokeApp {
                     ctx.load_texture("video_preview", image.clone(), egui::TextureOptions::LINEAR)
                 });
                 texture.set(image, egui::TextureOptions::LINEAR);
-                got_frame = true;
-            }
-            if got_frame {
                 ctx.request_repaint();
             }
         }
@@ -1685,6 +2057,8 @@ impl KaraokeApp {
     }
 
     fn set_audio_file(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.ui_batch_editing = None;
+        self.ui_frame_preview.line_time_ms = None;
         self.stop_preview();
         let path_str = path.to_string_lossy().to_string();
         self.audio_path = Some(path_str.clone());
@@ -2003,12 +2377,15 @@ impl KaraokeApp {
     }
 
     fn apply_batch_item_to_single_state(&mut self, index: usize) -> Result<(), String> {
+        self.ui_frame_preview.line_time_ms = None;
         let item = self
             .batch_items
             .get(index)
             .cloned()
             .ok_or_else(|| "Задание не найдено".to_string())?;
-        let lyrics = if item.status == BatchStatus::MissingLyrics
+        let lyrics = if let Some(text) = item.lyrics_override.clone() {
+            text
+        } else if item.status == BatchStatus::MissingLyrics
             || item.lyrics_path.as_os_str().is_empty()
         {
             String::new()
@@ -2033,7 +2410,11 @@ impl KaraokeApp {
         self.artist = item.artist;
         self.title = item.title;
         self.lyrics = lyrics;
-        self.generated_file = None;
+        self.generated_file = item.output_path.filter(|path| Path::new(path).is_file());
+        self.video_texture = None;
+        self.video_asset = None;
+        self.video_position_ms = 0;
+        self.video_duration_ms = 0;
         Ok(())
     }
 
@@ -2102,12 +2483,16 @@ impl KaraokeApp {
         });
     }
 
-    fn start_download(&mut self, ctx: &egui::Context, continue_only: bool) {
+    fn start_download(&mut self, ctx: &egui::Context, continue_only: bool, search_only: bool) {
         if self.dl_is_running {
             return;
         }
 
         self.dl_stop_requested = false;
+        self.dl_search_only = search_only;
+        if search_only {
+            self.dl_search_result = None;
+        }
         self.dl_start_time = Some(Instant::now());
         let mode_excel = self.dl_mode_excel;
         let query = self.dl_track_query.trim().to_string();
@@ -2118,13 +2503,11 @@ impl KaraokeApp {
         let overwrite = self.dl_overwrite;
         let max_workers = self.dl_max_workers;
 
-        let output_path = match output_dir {
-            Some(p) => p,
-            None => {
-                self.dl_status_text = "Ошибка: не выбрана папка сохранения".to_string();
-                return;
-            }
-        };
+        let output_path = output_dir.unwrap_or_default();
+        if !search_only && output_path.as_os_str().is_empty() {
+            self.dl_status_text = "Ошибка: не выбрана папка сохранения".to_string();
+            return;
+        }
 
         let mut tracks_file_path = None;
         if mode_excel {
@@ -2205,8 +2588,16 @@ impl KaraokeApp {
         };
 
         self.dl_is_running = true;
-        self.dl_status_text = "Запуск процесса загрузки...".to_string();
-        self.dl_log_output.push_str("🚀 Запуск загрузчика...\n");
+        self.dl_status_text = if search_only {
+            "Ищу и проверяю варианты...".to_string()
+        } else {
+            "Запуск процесса загрузки...".to_string()
+        };
+        self.dl_log_output.push_str(if search_only {
+            "🔎 Запуск безопасного поиска без загрузки...\n"
+        } else {
+            "🚀 Запуск загрузчика...\n"
+        });
 
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         self.dl_rx = Some(rx);
@@ -2268,6 +2659,17 @@ impl KaraokeApp {
                     project_id,
                     output_path.to_string_lossy()
                 ));
+            } else if search_only {
+                cmd.arg("resolve")
+                    .arg(&query)
+                    .arg("--limit")
+                    .arg(limit.to_string())
+                    .arg("--json");
+
+                let _ = tx.send(format!(
+                    "🔎 Поиск и проверка без загрузки.\nЗапрос: {}",
+                    query
+                ));
             } else {
                 cmd.arg("download")
                     .arg(&query)
@@ -2279,7 +2681,7 @@ impl KaraokeApp {
                     .arg(&format);
 
                 let _ = tx.send(format!(
-                    "🎵 Одиночный режим.\nТрек: {}\nПапка сохранения: {}",
+                    "🎵 Загрузка лучшего проверенного варианта.\nТрек: {}\nПапка сохранения: {}",
                     query,
                     output_path.to_string_lossy()
                 ));
@@ -2419,525 +2821,73 @@ impl KaraokeApp {
         if self.batch_items.is_empty() || self.is_generating || self.batch_running {
             return;
         }
-        let worker_path = match paths::find_worker() {
-            Some(path) => path,
-            None => {
-                self.log_output
-                    .push_str("❌ Batch: не найден karaoke_worker.\n");
+        let Some(worker) = paths::find_worker() else {
+            self.batch_status_text = "Не найден worker".into();
+            return;
+        };
+        let Some(renderer) = paths::find_rust_renderer() else {
+            self.batch_status_text = "Не найден Rust-рендерер".into();
+            return;
+        };
+        let engine = match paths::render_engine() {
+            Ok(engine) => engine,
+            Err(message) => {
+                self.batch_status_text = message;
                 return;
             }
         };
-        let renderer_path = match paths::find_rust_renderer() {
-            Some(path) => path,
-            None => {
-                self.log_output
-                    .push_str("❌ Batch: не найден Rust-рендер karaoke_render.\n");
-                return;
-            }
-        };
-
+        self.batch_cancel.store(false, Ordering::Release);
+        self.batch_stop_after.store(false, Ordering::Release);
+        self.batch_stop_requested = false;
+        let stop_file = paths::temp_dir().join("batch/stop_after_current");
+        let _ = std::fs::remove_file(&stop_file);
         self.batch_running = true;
         self.batch_start_time = Some(Instant::now());
-        self.batch_stop_requested = false;
         self.batch_current_index = None;
-        self.batch_cancel.store(false, Ordering::Relaxed);
-        self.progress = 0.0;
-        self.status_text = "Batch: подготовка очереди...".to_string();
         self.batch_status_text = if resume {
-            "Batch: продолжение очереди...".to_string()
+            "Продолжение пакета"
         } else {
-            format!("В очереди {} заданий", self.batch_items.len())
-        };
+            "Подготовка пакета"
+        }
+        .into();
         self.log_output.push_str(&format!(
-            "🚀 Batch: {} {} заданий через общий align-процесс\n",
-            if resume {
-                "продолжение"
-            } else {
-                "запуск"
-            },
-            self.batch_items.len()
+            "Batch: движок {engine}; один align-процесс и один рендерер\n"
         ));
-
-        let items = self.batch_items.clone();
-        let model = self.model.clone();
-        let quality = self.quality.clone();
-        let font = normalized_font_choice(&self.font);
-        let active_hex = format!(
-            "#{:02X}{:02X}{:02X}",
-            self.color_active[0], self.color_active[1], self.color_active[2]
-        );
-        let inactive_hex = format!(
-            "#{:02X}{:02X}{:02X}",
-            self.color_inactive[0], self.color_inactive[1], self.color_inactive[2]
-        );
-        let bg_hex = format!(
-            "#{:02X}{:02X}{:02X}",
-            self.color_bg[0], self.color_bg[1], self.color_bg[2]
-        );
-        let inactive_opacity = self.inactive_opacity.clamp(0.0, 1.0);
-        let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
-        let plain_lines = self.plain_lines;
-        let verify_lrc_with_whisper = self.verify_lrc_with_whisper;
-        let separate_vocals_for_word_level = self.separate_vocals_for_word_level;
-        let cancel = self.batch_cancel.clone();
-        let temp = paths::temp_dir().join("batch");
-        let (tx, rx) = channel::<ProgressUpdate>();
+        let config = batch_pipeline::Config {
+            items: self.batch_items.clone(),
+            settings: self.settings_snapshot(),
+            worker,
+            renderer,
+            engine,
+            stop_after: self.batch_stop_after.clone(),
+            cancel: self.batch_cancel.clone(),
+            stop_file,
+        };
+        let (tx, rx) = channel();
         self.rx = Some(rx);
         let ctx = ctx.clone();
-
-        std::thread::spawn(move || {
-            #[derive(Serialize)]
-            struct AlignQueueEntry {
-                index: usize,
-                audio: String,
-                artist: String,
-                title: String,
-                lyrics_file: String,
-                timings_output: String,
-            }
-
-            #[derive(Clone)]
-            struct RenderTask {
-                index: usize,
-                audio_path: PathBuf,
-                timings_path: PathBuf,
-                output_path: PathBuf,
-                duration_ms: i64,
-            }
-
-            let _ = std::fs::create_dir_all(&temp);
-            let mut align_queue = Vec::new();
-            let mut render_tasks = Vec::new();
-
-            for (idx, item) in items.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ProgressUpdate::RawLog("⏸ Batch остановлен.".to_string()));
-                    let _ = tx.send(ProgressUpdate::BatchFinished);
-                    ctx.request_repaint();
-                    return;
-                }
-
-                if item.status == BatchStatus::Done || item.status == BatchStatus::MissingLyrics {
-                    continue;
-                }
-
-                let item_temp = temp.join(format!("{:03}", idx + 1));
-                let _ = std::fs::create_dir_all(&item_temp);
-                let timings_path = batch_timings_path_for_item(item);
-                let mut render_audio_path = item.audio_path.clone();
-                let lyrics_text =
-                    std::fs::read_to_string(&item.lyrics_path).unwrap_or_else(|_| String::new());
-
-                let (start, end, should_trim) = batch_item_trim_window(item);
-
-                if should_trim {
-                    let trimmed_path = item_temp.join("audio.wav");
-                    match ffmpeg::render_trimmed_audio(
-                        &item.audio_path.to_string_lossy(),
-                        start,
-                        end,
-                        item.fade_in_ms as i64,
-                        item.fade_out_ms as i64,
-                        &trimmed_path,
-                    ) {
-                        Ok(()) => {
-                            render_audio_path = trimmed_path;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(ProgressUpdate::BatchProgress {
-                                index: idx,
-                                status: BatchStatus::Error(err.clone()),
-                                progress: 0.0,
-                                message: err,
-                                output_path: None,
-                                alignment: None,
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                let lyrics_path = item_temp.join("lyrics.txt");
-                if let Err(err) = std::fs::write(&lyrics_path, lyrics_text) {
-                    let message = format!("Не удалось подготовить текст: {err}");
-                    let _ = tx.send(ProgressUpdate::BatchProgress {
-                        index: idx,
-                        status: BatchStatus::Error(message.clone()),
-                        progress: 0.0,
-                        message,
-                        output_path: None,
-                        alignment: None,
-                    });
-                    continue;
-                }
-
-                if timings_path.exists() {
-                    let _ = tx.send(ProgressUpdate::BatchProgress {
-                        index: idx,
-                        status: BatchStatus::ReadyToRender,
-                        progress: 1.0,
-                        message: "Тайминги уже есть, Whisper пропущен.".to_string(),
-                        output_path: None,
-                        alignment: None,
-                    });
-                } else {
-                    align_queue.push(AlignQueueEntry {
-                        index: idx,
-                        audio: render_audio_path.to_string_lossy().to_string(),
-                        artist: item.artist.clone(),
-                        title: item.title.clone(),
-                        lyrics_file: lyrics_path.to_string_lossy().to_string(),
-                        timings_output: timings_path.to_string_lossy().to_string(),
-                    });
-                }
-
-                render_tasks.push(RenderTask {
-                    index: idx,
-                    audio_path: render_audio_path,
-                    timings_path,
-                    output_path: batch_output_path(item, plain_lines),
-                    duration_ms: (end - start).max(1),
-                });
-            }
-
-            if !align_queue.is_empty() {
-                let queue_path = temp.join("align_queue.json");
-                match serde_json::to_string_pretty(&align_queue)
-                    .map_err(|err| err.to_string())
-                    .and_then(|data| {
-                        std::fs::write(&queue_path, data).map_err(|err| err.to_string())
-                    }) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        let _ = tx.send(ProgressUpdate::Error(format!(
-                            "Batch: не удалось записать очередь align: {err}"
-                        )));
-                        let _ = tx.send(ProgressUpdate::BatchFinished);
-                        return;
-                    }
-                }
-
-                let _ = tx.send(ProgressUpdate::RawLog(format!(
-                    "🧠 Batch align: {} треков, модель загрузится один раз.",
-                    align_queue.len()
-                )));
-
-                let mut cmd = if paths::is_python_worker(&worker_path) {
-                    let mut cmd = std::process::Command::new("python3");
-                    cmd.arg(&worker_path);
-                    cmd
-                } else {
-                    std::process::Command::new(&worker_path)
-                };
-                ffmpeg::hide_subprocess_window(&mut cmd);
-                if let Some(bin_dir) = paths::bundled_bin_dir() {
-                    let old_path = std::env::var_os("PATH").unwrap_or_default();
-                    let mut paths = vec![bin_dir];
-                    paths.extend(std::env::split_paths(&old_path));
-                    if let Ok(joined) = std::env::join_paths(paths) {
-                        cmd.env("PATH", joined);
-                    }
-                }
-                cmd.env("PYTHONUTF8", "1")
-                    .env("PYTHONIOENCODING", "utf-8")
-                    .arg("--cli")
-                    .arg("--batch-align-queue")
-                    .arg(&queue_path)
-                    .arg("--model")
-                    .arg(&model)
-                    .arg("--quality")
-                    .arg(&quality)
-                    .arg("--font")
-                    .arg(&font)
-                    .arg("--color-active")
-                    .arg(&active_hex)
-                    .arg("--color-inactive")
-                    .arg(&inactive_hex)
-                    .arg("--color-bg")
-                    .arg(&bg_hex)
-                    .arg("--inactive-opacity")
-                    .arg(inactive_opacity.to_string())
-                    .arg("--audio-delay")
-                    .arg(audio_delay_seconds.to_string())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                if plain_lines {
-                    cmd.arg("--plain-lines");
-                }
-                if verify_lrc_with_whisper {
-                    cmd.arg("--verify-lrc-with-whisper");
-                }
-                if separate_vocals_for_word_level && !plain_lines {
-                    cmd.arg("--separate-vocals-for-alignment");
-                }
-
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        let tx_err = tx.clone();
-                        let ctx_err = ctx.clone();
-                        let stderr_handle = child.stderr.take().map(|stderr| {
-                            std::thread::spawn(move || {
-                                use std::io::{BufRead, BufReader};
-                                let reader = BufReader::new(stderr);
-                                for line in reader.lines().map_while(Result::ok) {
-                                    let trimmed = line.trim();
-                                    if !trimmed.is_empty() && !ffmpeg::is_ffmpeg_noise(trimmed) {
-                                        let _ = tx_err.send(ProgressUpdate::RawLog(format!(
-                                            "[LOG] {}",
-                                            trimmed
-                                        )));
-                                        ctx_err.request_repaint();
-                                    }
-                                }
-                            })
-                        });
-
-                        if let Some(stdout) = child.stdout.take() {
-                            use std::io::{BufRead, BufReader};
-                            let reader = BufReader::new(stdout);
-                            for line in reader.lines().map_while(Result::ok) {
-                                if cancel.load(Ordering::Relaxed) {
-                                    let _ = child.kill();
-                                    break;
-                                }
-                                let trimmed = line.trim();
-                                if trimmed.starts_with('{')
-                                    && trimmed.ends_with('}')
-                                    && let Ok(update) = serde_json::from_str::<CLIProgress>(trimmed)
-                                    && let Some(index) = update.batch_align_index
-                                {
-                                    let status = if update.error.is_some() {
-                                        BatchStatus::Error(
-                                            update
-                                                .error
-                                                .clone()
-                                                .unwrap_or_else(|| "Ошибка".to_string()),
-                                        )
-                                    } else if update.done {
-                                        BatchStatus::ReadyToRender
-                                    } else {
-                                        BatchStatus::Aligning
-                                    };
-                                    let alignment = AlignmentQuality::from_progress(&update);
-                                    let _ = tx.send(ProgressUpdate::BatchProgress {
-                                        index,
-                                        status,
-                                        progress: update.progress.clamp(0.0, 1.0),
-                                        message: update.status,
-                                        output_path: None,
-                                        alignment,
-                                    });
-                                    ctx.request_repaint();
-                                    continue;
-                                }
-                                if !trimmed.is_empty() {
-                                    let _ = tx.send(ProgressUpdate::RawLog(trimmed.to_string()));
-                                    ctx.request_repaint();
-                                }
-                            }
-                        }
-                        if let Some(handle) = stderr_handle {
-                            let _ = handle.join();
-                        }
-                        let success = child.wait().map(|status| status.success()).unwrap_or(false);
-                        if !success && !cancel.load(Ordering::Relaxed) {
-                            let _ = tx.send(ProgressUpdate::RawLog(
-                                "❌ Batch align завершился с ошибкой.".to_string(),
-                            ));
-                        }
-                    }
-                    Err(err) => {
-                        let _ = tx.send(ProgressUpdate::Error(format!(
-                            "Batch: не удалось запустить align worker: {err}"
-                        )));
-                        let _ = tx.send(ProgressUpdate::BatchFinished);
-                        return;
-                    }
-                }
-            }
-
-            if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressUpdate::RawLog("⏸ Batch остановлен.".to_string()));
-                let _ = tx.send(ProgressUpdate::BatchFinished);
-                ctx.request_repaint();
-                return;
-            }
-
-            let _ = tx.send(ProgressUpdate::RawLog(
-                "🎬 Batch render: рендерим видео по готовым таймингам.".to_string(),
-            ));
-
-            for task in render_tasks {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                if !task.timings_path.exists() {
-                    let _ = tx.send(ProgressUpdate::BatchProgress {
-                        index: task.index,
-                        status: BatchStatus::Error("Нет файла таймингов".to_string()),
-                        progress: 0.0,
-                        message: "Нет файла таймингов".to_string(),
-                        output_path: None,
-                        alignment: None,
-                    });
-                    continue;
-                }
-
-                let _ = tx.send(ProgressUpdate::BatchProgress {
-                    index: task.index,
-                    status: BatchStatus::Rendering,
-                    progress: 0.0,
-                    message: "Рендеринг".to_string(),
-                    output_path: None,
-                    alignment: None,
-                });
-
-                let mut render_cmd = std::process::Command::new(&renderer_path);
-                ffmpeg::hide_subprocess_window(&mut render_cmd);
-                if let Some(bin_dir) = paths::bundled_bin_dir() {
-                    let old_path = std::env::var_os("PATH").unwrap_or_default();
-                    let mut paths = vec![bin_dir];
-                    paths.extend(std::env::split_paths(&old_path));
-                    if let Ok(joined) = std::env::join_paths(paths) {
-                        render_cmd.env("PATH", joined);
-                    }
-                }
-                render_cmd
-                    .arg("--timings")
-                    .arg(&task.timings_path)
-                    .arg("--audio")
-                    .arg(&task.audio_path)
-                    .arg("--output")
-                    .arg(&task.output_path)
-                    .arg("--quality")
-                    .arg(&quality)
-                    .arg("--font")
-                    .arg(&font)
-                    .arg("--color-active")
-                    .arg(&active_hex)
-                    .arg("--color-inactive")
-                    .arg(&inactive_hex)
-                    .arg("--color-bg")
-                    .arg(&bg_hex)
-                    .arg("--inactive-opacity")
-                    .arg(inactive_opacity.to_string())
-                    .arg("--engine")
-                    .arg(
-                        std::env::var("KARAOKE_RENDER_ENGINE")
-                            .unwrap_or_else(|_| "ass".to_string()),
-                    )
-                    .arg("--audio-delay")
-                    .arg(audio_delay_seconds.to_string())
-                    .arg("--ffmpeg")
-                    .arg(paths::tool_path("ffmpeg"))
-                    .arg("--ffprobe")
-                    .arg(paths::tool_path("ffprobe"))
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped());
-                if plain_lines {
-                    render_cmd.arg("--plain-lines");
-                }
-
-                match render_cmd.spawn() {
-                    Ok(mut child) => {
-                        if let Some(stderr) = child.stderr.take() {
-                            use std::io::{BufRead, BufReader};
-                            let reader = BufReader::new(stderr);
-                            for line in reader.lines().map_while(Result::ok) {
-                                if cancel.load(Ordering::Relaxed) {
-                                    let _ = child.kill();
-                                    break;
-                                }
-                                let trimmed = line.trim();
-                                let progress = ffmpeg::parse_ffmpeg_time_ms(trimmed)
-                                    .map(|time_ms| {
-                                        (time_ms as f32 / task.duration_ms as f32).clamp(0.0, 0.98)
-                                    })
-                                    .or_else(|| {
-                                        trimmed.strip_prefix("render ").and_then(|percent| {
-                                            percent
-                                                .trim_end_matches('%')
-                                                .parse::<f32>()
-                                                .ok()
-                                                .map(|value| (value / 100.0).clamp(0.0, 0.98))
-                                        })
-                                    });
-                                if let Some(progress) = progress {
-                                    let _ = tx.send(ProgressUpdate::BatchProgress {
-                                        index: task.index,
-                                        status: BatchStatus::Rendering,
-                                        progress,
-                                        message: format!(
-                                            "Рендеринг: {}%",
-                                            (progress * 100.0).round() as i32
-                                        ),
-                                        output_path: None,
-                                        alignment: None,
-                                    });
-                                    ctx.request_repaint();
-                                    continue;
-                                }
-                                if ffmpeg::is_ffmpeg_progress_key(trimmed) {
-                                    continue;
-                                }
-                                if !trimmed.is_empty() {
-                                    let _ = tx.send(ProgressUpdate::RawLog(format!(
-                                        "[Rust] {}",
-                                        trimmed
-                                    )));
-                                }
-                            }
-                        }
-                        let success = child.wait().map(|status| status.success()).unwrap_or(false);
-                        if success && !cancel.load(Ordering::Relaxed) {
-                            let output = task.output_path.to_string_lossy().to_string();
-                            let _ = tx.send(ProgressUpdate::BatchProgress {
-                                index: task.index,
-                                status: BatchStatus::Done,
-                                progress: 1.0,
-                                message: "Готово".to_string(),
-                                output_path: Some(output),
-                                alignment: None,
-                            });
-                        } else if !cancel.load(Ordering::Relaxed) {
-                            let _ = tx.send(ProgressUpdate::BatchProgress {
-                                index: task.index,
-                                status: BatchStatus::Error(
-                                    "Rust-рендер завершился с ошибкой".to_string(),
-                                ),
-                                progress: 0.0,
-                                message: "Rust-рендер завершился с ошибкой".to_string(),
-                                output_path: None,
-                                alignment: None,
-                            });
-                        }
-                    }
-                    Err(err) => {
-                        let message = format!("Ошибка запуска Rust-рендера: {err}");
-                        let _ = tx.send(ProgressUpdate::BatchProgress {
-                            index: task.index,
-                            status: BatchStatus::Error(message.clone()),
-                            progress: 0.0,
-                            message,
-                            output_path: None,
-                            alignment: None,
-                        });
-                    }
-                }
-            }
-
-            let _ = tx.send(ProgressUpdate::BatchFinished);
-            ctx.request_repaint();
-        });
+        std::thread::spawn(move || batch_pipeline::run(config, tx, ctx));
     }
 
     fn request_stop_batch(&mut self) {
         self.batch_stop_requested = true;
-        self.batch_cancel.store(true, Ordering::Relaxed);
-        self.batch_status_text =
-            "Остановка запрошена: текущее видео будет завершено, новые не начнутся.".to_string();
-        self.log_output
-            .push_str("⏸ Batch: остановка после текущего задания.\n");
+        self.batch_stop_after.store(true, Ordering::Release);
+        let stop_file = paths::temp_dir().join("batch/stop_after_current");
+        if let Some(parent) = stop_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(stop_file, b"stop") {
+            self.log_output.push_str(&format!(
+                "Не удалось уведомить worker об остановке: {error}\n"
+            ));
+        }
+        self.batch_status_text = "Завершаем текущие операции, новые задания не начнутся".into();
+    }
+
+    fn cancel_batch_now(&mut self) {
+        self.batch_stop_requested = true;
+        self.batch_cancel.store(true, Ordering::Release);
+        self.batch_status_text = "Отмена текущих операций...".into();
     }
 
     fn start_next_batch_item(&mut self, ctx: &egui::Context) {
@@ -3084,32 +3034,18 @@ impl KaraokeApp {
 
     fn clamped_trim_bounds(&self) -> Option<(i64, i64)> {
         let duration = self.audio_duration_ms?;
-        let mut start = self.trim_start_ms.clamp(0, duration.saturating_sub(1000));
-        let mut end = self.trim_end_ms.clamp(1000, duration);
-        if end - start < 1000 {
-            if start + 1000 <= duration {
-                end = start + 1000;
-            } else {
-                start = duration.saturating_sub(1000);
-                end = duration;
-            }
-        }
-        Some((start, end))
+        Some(clamp_trim_window(
+            self.trim_start_ms,
+            self.trim_end_ms,
+            duration,
+        ))
     }
 
     fn normalize_trim_state(&mut self) {
         if let Some(duration) = self.audio_duration_ms {
-            let min_gap = 1000;
-            self.trim_start_ms = self
-                .trim_start_ms
-                .clamp(0, duration.saturating_sub(min_gap));
-            self.trim_end_ms = self.trim_end_ms.clamp(min_gap, duration);
-            if self.trim_end_ms - self.trim_start_ms < min_gap {
-                self.trim_end_ms = (self.trim_start_ms + min_gap).min(duration);
-                if self.trim_end_ms - self.trim_start_ms < min_gap {
-                    self.trim_start_ms = self.trim_end_ms.saturating_sub(min_gap);
-                }
-            }
+            let min_gap = duration.clamp(0, 1000);
+            (self.trim_start_ms, self.trim_end_ms) =
+                clamp_trim_window(self.trim_start_ms, self.trim_end_ms, duration);
             let selected_ms = (self.trim_end_ms - self.trim_start_ms).max(min_gap);
             let max_fade_ms = (selected_ms / 2).min(30_000) as i32;
             self.fade_in_ms = self.fade_in_ms.clamp(0, max_fade_ms);
@@ -3120,41 +3056,210 @@ impl KaraokeApp {
         }
     }
 
-    fn preview_trimmed_audio(&mut self) {
-        let audio_path = match &self.audio_path {
-            Some(path) => path.clone(),
-            None => return,
+    fn loudness_controls(&mut self, ui: &mut egui::Ui) {
+        let before = (self.normalize_audio, self.loudness_target_db);
+        ui.add_enabled_ui(!self.is_generating && !self.batch_running, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.normalize_audio, "Выравнивать громкость")
+                    .on_hover_text("Цель ReplayGain для готового видео, с защитой от перегрузки");
+                if ui.button("Сброс").clicked() {
+                    self.loudness_target_db = audio_loudness::DEFAULT_TARGET_DB;
+                }
+            });
+            ui.add_enabled_ui(self.normalize_audio, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().slider_width = (ui.available_width() - 85.0).max(80.0);
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.loudness_target_db,
+                            audio_loudness::MIN_TARGET_DB..=audio_loudness::MAX_TARGET_DB,
+                        )
+                        .show_value(false),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.loudness_target_db)
+                            .range(audio_loudness::MIN_TARGET_DB..=audio_loudness::MAX_TARGET_DB)
+                            .suffix(" дБ"),
+                    );
+                });
+            });
+            ui.label(
+                egui::RichText::new("Цель ReplayGain · усиление ограничено пиками")
+                    .size(12.0)
+                    .weak(),
+            );
+        });
+        if before != (self.normalize_audio, self.loudness_target_db) {
+            self.stop_preview();
+        }
+    }
+
+    fn preview_trimmed_audio(&mut self, ctx: &egui::Context) {
+        let Some(audio_path) = self.audio_path.clone() else {
+            return;
         };
-        let (start, end) = match self.clamped_trim_bounds() {
-            Some(bounds) => bounds,
-            None => {
-                self.trim_status = "Сначала выберите аудио с читаемой длительностью.".to_string();
-                return;
-            }
+        let Some((start, end)) = self.clamped_trim_bounds() else {
+            return;
         };
         self.normalize_trim_state();
         let play_start = self.trim_playhead_ms.clamp(start, end.saturating_sub(500));
-
-        let preview_path = paths::temp_dir().join("karaoke_trim_preview.wav");
-        match ffmpeg::render_trimmed_audio(
-            &audio_path,
-            start,
-            end,
-            self.fade_in_ms as i64,
-            self.fade_out_ms as i64,
-            &preview_path,
-        )
-        .and_then(|_| self.play_audio_preview(&preview_path, play_start, end, play_start - start))
-        {
-            Ok(()) => {
-                self.trim_status = format!(
-                    "Проигрывается предпросмотр: {} - {}",
-                    ffmpeg::format_time_ms(play_start),
-                    ffmpeg::format_time_ms(end)
-                );
+        self.stop_preview();
+        self.trim_status = "Готовим звук в фоне...".into();
+        self.preview_cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = self.preview_cancel.clone();
+        let cached = self.audio_asset.clone();
+        let fades = (self.fade_in_ms, self.fade_out_ms);
+        let normalized = self.preview_normalized && self.normalize_audio;
+        let target = self.loudness_target_db;
+        let (tx, rx) = channel();
+        self.prepared_preview_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let ffmpeg_path = paths::tool_path("ffmpeg");
+                let asset = match cached {
+                    Some(asset) => asset,
+                    None => audio_preview::prepare(
+                        Path::new(&audio_path),
+                        &ffmpeg_path,
+                        cancelled.clone(),
+                    )?,
+                };
+                let (source, message) = if normalized {
+                    let key = desktop_app::cache::bytes_sha256(
+                        format!("{}:{start}:{end}:{}:{}", asset.identity, fades.0, fades.1)
+                            .as_bytes(),
+                    );
+                    let trim_path = asset.path.with_file_name(format!("normalized-{key}.wav"));
+                    if !trim_path.exists() {
+                        ffmpeg::render_trimmed_audio_cancellable(
+                            &asset.path.to_string_lossy(),
+                            start,
+                            end,
+                            fades.0 as i64,
+                            fades.1 as i64,
+                            &trim_path,
+                            cancelled.clone(),
+                        )?;
+                    }
+                    let plan = audio_loudness::normalization_plan_cancellable(
+                        &ffmpeg_path,
+                        &trim_path,
+                        target,
+                        cancelled.clone(),
+                    )?;
+                    let limited = if plan.applied_db < plan.requested_db - 0.01 {
+                        " · ограничено пиками"
+                    } else {
+                        ""
+                    };
+                    (
+                        audio_preview::WavSource::new(
+                            &trim_path,
+                            (0, end - start),
+                            play_start - start,
+                            (0, 0),
+                            plan.applied_db,
+                        )?,
+                        format!(
+                            "Цель {target} дБ · поправка {:+.2} дБ{limited}",
+                            plan.applied_db
+                        ),
+                    )
+                } else {
+                    (
+                        audio_preview::WavSource::new(
+                            &asset.path,
+                            (start, end),
+                            play_start,
+                            fades,
+                            0.0,
+                        )?,
+                        "Прослушивается исходная громкость".into(),
+                    )
+                };
+                Ok(PreparedAudioPreview {
+                    source,
+                    start_ms: play_start,
+                    end_ms: end,
+                    message,
+                })
+            })();
+            if !cancelled.load(Ordering::Relaxed) {
+                let _ = tx.send(result);
+                ctx.request_repaint();
             }
-            Err(err) => {
-                self.trim_status = err;
+        });
+    }
+
+    fn poll_previews(&mut self, ctx: &egui::Context) {
+        let stamp = self
+            .audio_path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|m| (m.len(), m.modified().ok()));
+        if self.waveform_path != self.audio_path || self.waveform_stamp != stamp {
+            self.waveform_stamp = stamp;
+            self.waveform_cancel.store(true, Ordering::Relaxed);
+            self.audio_asset = None;
+            self.waveform_path = self.audio_path.clone();
+            self.waveform_rx = None;
+            self.stop_preview();
+            if let Some(path) = self.audio_path.clone() {
+                self.waveform_cancel = Arc::new(AtomicBool::new(false));
+                let cancelled = self.waveform_cancel.clone();
+                let (tx, rx) = channel();
+                self.waveform_rx = Some(rx);
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let result = audio_preview::prepare(
+                        Path::new(&path),
+                        &paths::tool_path("ffmpeg"),
+                        cancelled.clone(),
+                    );
+                    if !cancelled.load(Ordering::Relaxed) {
+                        let _ = tx.send(result);
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
+        if let Some(result) = self.waveform_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.waveform_rx = None;
+            match result {
+                Ok(asset) => {
+                    for item in &mut self.batch_items {
+                        if Some(item.audio_path.to_string_lossy().as_ref())
+                            == self.audio_path.as_deref()
+                        {
+                            item.waveform = Some(asset.peaks.clone());
+                        }
+                    }
+                    self.audio_asset = Some(asset);
+                }
+                Err(error) => {
+                    self.trim_status = error;
+                }
+            }
+        }
+        if let Some(result) = self
+            .prepared_preview_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.prepared_preview_rx = None;
+            if let Err(error) = result.and_then(|ready| self.play_audio_preview(ready)) {
+                self.trim_status = error;
+            }
+        }
+        if let Some(result) = self
+            .prepared_video_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.prepared_video_rx = None;
+            if let Err(error) = result.and_then(|ready| self.play_video_ready(ready, ctx)) {
+                self.video_status = error;
             }
         }
     }
@@ -3164,54 +3269,40 @@ impl KaraokeApp {
         ui: &mut egui::Ui,
         duration_ms: i64,
         accent: egui::Color32,
-        success: egui::Color32,
+        _success: egui::Color32,
         muted: egui::Color32,
     ) {
         self.normalize_trim_state();
-
-        let desired_size = egui::vec2(ui.available_width(), 86.0);
-        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
-        let track_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 8.0, rect.center().y - 16.0),
-            egui::pos2(rect.right() - 8.0, rect.center().y + 18.0),
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(
+                ui.available_width(),
+                if ui.available_width() < 360.0 {
+                    84.0
+                } else {
+                    108.0
+                },
+            ),
+            egui::Sense::click_and_drag(),
         );
-        let track_width = track_rect.width().max(1.0);
-
-        let to_x = |ms: i64| -> f32 {
-            track_rect.left() + (ms as f32 / duration_ms.max(1) as f32) * track_width
-        };
-        let from_x = |x: f32| -> i64 {
-            let ratio = ((x - track_rect.left()) / track_width).clamp(0.0, 1.0);
-            (ratio * duration_ms as f32).round() as i64
-        };
-
-        if (response.dragged() || response.clicked())
-            && !self.is_generating
+        let track = egui::Rect::from_min_max(
+            rect.min + egui::vec2(7.0, 12.0),
+            rect.max - egui::vec2(7.0, 25.0),
+        );
+        let to_x = |ms: i64| track.left() + (ms as f32 / duration_ms.max(1) as f32) * track.width();
+        let start_x = to_x(self.trim_start_ms);
+        let end_x = to_x(self.trim_end_ms);
+        let drag_id = response.id.with("timeline_target");
+        if !self.is_generating
+            && !self.batch_running
+            && (response.clicked() || response.dragged())
             && let Some(pointer) = response.interact_pointer_pos()
         {
+            self.ui_frame_preview.line_time_ms = None;
             if self.is_preview_playing() {
                 self.stop_preview();
             }
-
-            let selected_ms = (self.trim_end_ms - self.trim_start_ms).max(1000);
-            let fade_in_x = to_x(self.trim_start_ms + self.fade_in_ms as i64);
-            let fade_out_x = to_x(self.trim_end_ms - self.fade_out_ms as i64);
-            let target_ms = from_x(pointer.x);
-            let nearest = if track_rect.expand2(egui::vec2(0.0, 10.0)).contains(pointer)
-                && (fade_in_x - pointer.x)
-                    .abs()
-                    .min((fade_out_x - pointer.x).abs())
-                    <= 16.0
-            {
-                if (fade_in_x - pointer.x).abs() <= (fade_out_x - pointer.x).abs() {
-                    3
-                } else {
-                    4
-                }
-            } else if pointer.y <= track_rect.top() {
-                if (to_x(self.trim_start_ms) - pointer.x).abs()
-                    <= (to_x(self.trim_end_ms) - pointer.x).abs()
-                {
+            let nearest = if (pointer.x - start_x).abs().min((pointer.x - end_x).abs()) <= 14.0 {
+                if (pointer.x - start_x).abs() <= (pointer.x - end_x).abs() {
                     0
                 } else {
                     1
@@ -3219,245 +3310,116 @@ impl KaraokeApp {
             } else {
                 2
             };
-
-            match nearest {
-                0 => self.trim_start_ms = target_ms.min(self.trim_end_ms - 1000).max(0),
-                1 => self.trim_end_ms = target_ms.max(self.trim_start_ms + 1000).min(duration_ms),
-                3 => {
-                    self.fade_in_ms = (target_ms - self.trim_start_ms)
-                        .clamp(0, selected_ms / 2)
-                        .min(30_000) as i32
-                }
-                4 => {
-                    self.fade_out_ms = (self.trim_end_ms - target_ms)
-                        .clamp(0, selected_ms / 2)
-                        .min(30_000) as i32
-                }
-                _ => self.trim_playhead_ms = target_ms.clamp(self.trim_start_ms, self.trim_end_ms),
+            if response.drag_started() || response.clicked() {
+                ui.data_mut(|data| data.insert_temp(drag_id, nearest));
+            }
+            let target = ui
+                .data(|data| data.get_temp::<i32>(drag_id))
+                .unwrap_or(nearest);
+            let ms = (((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0)
+                * duration_ms as f32)
+                .round() as i64;
+            match target {
+                0 => self.trim_start_ms = ms.min(self.trim_end_ms - 1000).max(0),
+                1 => self.trim_end_ms = ms.max(self.trim_start_ms + 1000).min(duration_ms),
+                _ => self.trim_playhead_ms = ms.clamp(self.trim_start_ms, self.trim_end_ms),
             }
             self.normalize_trim_state();
         }
-
-        let painter = ui.painter();
-        painter.rect_filled(track_rect, 4.0, egui::Color32::from_rgb(20, 28, 34));
-
-        let selected_rect = egui::Rect::from_min_max(
-            egui::pos2(to_x(self.trim_start_ms), track_rect.top()),
-            egui::pos2(to_x(self.trim_end_ms), track_rect.bottom()),
-        );
-
-        let center_y = track_rect.center().y;
-        let max_amp = track_rect.height() * 0.42;
-        let bar_count = (track_width / 5.0).round().clamp(18.0, 220.0) as usize;
-        for i in 0..bar_count {
-            let ratio = if bar_count > 1 {
-                i as f32 / (bar_count - 1) as f32
-            } else {
-                0.0
-            };
-            let x = track_rect.left() + ratio * track_width;
-            let wave = ((ratio * 18.0).sin().abs() * 0.55
-                + (ratio * 47.0).sin().abs() * 0.30
-                + (ratio * 91.0).sin().abs() * 0.15)
-                .clamp(0.15, 1.0);
-            let amp = max_amp * wave;
-            let waveform_color = if selected_rect.contains(egui::pos2(x, center_y)) {
-                egui::Color32::from_rgb(72, 222, 226)
-            } else {
-                egui::Color32::from_rgb(43, 94, 103)
-            };
-            painter.line_segment(
-                [egui::pos2(x, center_y - amp), egui::pos2(x, center_y + amp)],
-                egui::Stroke::new(2.0, waveform_color),
-            );
+        if response.drag_stopped() {
+            ui.data_mut(|data| data.remove::<i32>(drag_id));
         }
-
-        painter.rect_filled(
-            selected_rect,
-            4.0,
-            egui::Color32::from_rgba_unmultiplied(13, 120, 128, 58),
+        response.on_hover_text("Тяните границы фрагмента; нажмите на волну для перемотки. Точное время — в полях ниже.");
+        let painter = ui.painter();
+        let selected = egui::Rect::from_min_max(
+            egui::pos2(to_x(self.trim_start_ms), track.top()),
+            egui::pos2(to_x(self.trim_end_ms), track.bottom()),
         );
-        painter.rect_stroke(
-            selected_rect,
-            4.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(85, 225, 231)),
-        );
-
-        painter.line_segment(
-            [
-                egui::pos2(track_rect.left(), track_rect.top() - 10.0),
-                egui::pos2(track_rect.right(), track_rect.top() - 10.0),
-            ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 66, 82)),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(track_rect.left(), track_rect.bottom() + 10.0),
-                egui::pos2(track_rect.right(), track_rect.bottom() + 10.0),
-            ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(39, 47, 60)),
-        );
-
-        for tick in 0..=4 {
-            let x = track_rect.left() + track_width * tick as f32 / 4.0;
+        painter.rect_filled(selected, 3.0, accent.gamma_multiply(0.10));
+        let peaks = self
+            .audio_asset
+            .as_ref()
+            .map(|asset| asset.peaks.as_slice());
+        let peak_scale = peaks
+            .map(|peaks| peaks.iter().copied().fold(0.0f32, f32::max))
+            .unwrap_or(1.0)
+            .max(0.02);
+        let bars = (track.width() / 4.0).clamp(18.0, 250.0) as usize;
+        for i in 0..bars {
+            let x = track.left() + i as f32 / (bars - 1) as f32 * track.width();
+            let amplitude =
+                (waveform_peak(peaks, i, bars) / peak_scale).min(1.0) * track.height() * 0.45;
+            let color = if x >= selected.left() && x <= selected.right() {
+                accent
+            } else {
+                muted.gamma_multiply(0.50)
+            };
             painter.line_segment(
                 [
-                    egui::pos2(x, track_rect.bottom() + 14.0),
-                    egui::pos2(x, track_rect.bottom() + 18.0),
+                    egui::pos2(x, track.center().y - amplitude.max(0.5)),
+                    egui::pos2(x, track.center().y + amplitude.max(0.5)),
                 ],
-                egui::Stroke::new(1.0, muted),
+                egui::Stroke::new(1.7, color),
             );
         }
-
-        let start_x = to_x(self.trim_start_ms);
-        let end_x = to_x(self.trim_end_ms);
-        let play_x = to_x(self.trim_playhead_ms);
-        let fade_in_x = to_x(self.trim_start_ms + self.fade_in_ms as i64);
-        let fade_out_x = to_x(self.trim_end_ms - self.fade_out_ms as i64);
-
-        let fade_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(238, 244, 245));
-        if self.fade_in_ms > 0 {
-            painter.add(egui::Shape::CubicBezier(
-                egui::epaint::CubicBezierShape::from_points_stroke(
-                    [
-                        egui::pos2(start_x, selected_rect.bottom() - 2.0),
-                        egui::pos2(
-                            start_x + (fade_in_x - start_x) * 0.32,
-                            selected_rect.bottom() - 1.0,
-                        ),
-                        egui::pos2(
-                            start_x + (fade_in_x - start_x) * 0.68,
-                            selected_rect.top() + 3.0,
-                        ),
-                        egui::pos2(fade_in_x, selected_rect.top() + 3.0),
-                    ],
-                    false,
-                    egui::Color32::TRANSPARENT,
-                    fade_stroke,
-                ),
-            ));
+        for x in [selected.left(), selected.right()] {
+            painter.line_segment(
+                [egui::pos2(x, track.top()), egui::pos2(x, track.bottom())],
+                egui::Stroke::new(2.0, accent),
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(egui::pos2(x, track.top()), egui::vec2(7.0, 9.0)),
+                2.0,
+                accent,
+            );
         }
-        if self.fade_out_ms > 0 {
-            painter.add(egui::Shape::CubicBezier(
-                egui::epaint::CubicBezierShape::from_points_stroke(
-                    [
-                        egui::pos2(fade_out_x, selected_rect.top() + 3.0),
-                        egui::pos2(
-                            fade_out_x + (end_x - fade_out_x) * 0.32,
-                            selected_rect.top() + 3.0,
-                        ),
-                        egui::pos2(
-                            fade_out_x + (end_x - fade_out_x) * 0.68,
-                            selected_rect.bottom() - 1.0,
-                        ),
-                        egui::pos2(end_x, selected_rect.bottom() - 2.0),
-                    ],
-                    false,
-                    egui::Color32::TRANSPARENT,
-                    fade_stroke,
-                ),
-            ));
-        }
-
-        let draw_label = |x: f32, y: f32, text_value: String, color: egui::Color32| {
-            let char_w = 6.2;
-            let width = (text_value.chars().count() as f32 * char_w + 12.0).max(42.0);
-            let label_rect =
-                egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(width, 18.0));
-            painter.rect_filled(label_rect, 5.0, egui::Color32::from_rgb(28, 33, 43));
-            painter.rect_stroke(label_rect, 5.0, egui::Stroke::new(1.0, color));
-            painter.text(
-                label_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                text_value,
-                egui::FontId::proportional(10.0),
-                egui::Color32::from_rgb(238, 241, 247),
-            );
-        };
-
-        let draw_fade_handle = |x: f32, label: &str, ms: i32| {
-            let handle = egui::Rect::from_center_size(
-                egui::pos2(x, selected_rect.top() + 2.0),
-                egui::vec2(9.0, 9.0),
-            );
-            painter.rect_filled(handle, 1.5, egui::Color32::from_rgb(220, 230, 232));
-            painter.rect_stroke(
-                handle,
-                1.5,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 66, 72)),
-            );
-            draw_label(
-                x,
-                selected_rect.top() - 12.0,
-                format!("{} {}", label, ffmpeg::format_time_ms(ms as i64)),
-                egui::Color32::from_rgb(220, 230, 232),
-            );
-        };
-        draw_fade_handle(fade_in_x, "↑", self.fade_in_ms);
-        draw_fade_handle(fade_out_x, "↓", self.fade_out_ms);
-
-        let draw_pin =
-            |x: f32, color: egui::Color32, label: &str, time: Option<String>, above: bool| {
-                let tip_y = if above {
-                    track_rect.top() - 1.0
+        for (fade, left) in [(self.fade_in_ms, true), (self.fade_out_ms, false)] {
+            if fade > 0 {
+                let inner = if left {
+                    to_x(self.trim_start_ms + fade as i64)
                 } else {
-                    track_rect.bottom() + 1.0
+                    to_x(self.trim_end_ms - fade as i64)
                 };
-                let head_y = if above { tip_y - 22.0 } else { tip_y + 22.0 };
-                let head_rect = egui::Rect::from_center_size(
-                    egui::pos2(x, head_y),
-                    egui::vec2(if label == "▶" { 22.0 } else { 18.0 }, 18.0),
-                );
-                let stem = if above {
-                    vec![
-                        egui::pos2(x - 6.0, head_rect.bottom() - 2.0),
-                        egui::pos2(x + 6.0, head_rect.bottom() - 2.0),
-                        egui::pos2(x, tip_y),
-                    ]
+                let outer = if left {
+                    selected.left()
                 } else {
-                    vec![
-                        egui::pos2(x - 6.0, head_rect.top() + 2.0),
-                        egui::pos2(x, tip_y),
-                        egui::pos2(x + 6.0, head_rect.top() + 2.0),
-                    ]
+                    selected.right()
                 };
-                painter.add(egui::Shape::convex_polygon(stem, color, egui::Stroke::NONE));
-                painter.rect_filled(head_rect, 5.0, color);
-                painter.text(
-                    head_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    label,
-                    egui::FontId::proportional(10.0),
-                    egui::Color32::WHITE,
-                );
-                if let Some(time) = time {
-                    draw_label(x, head_rect.top() - 11.0, time, color);
-                }
-            };
-
-        draw_pin(
-            start_x,
-            success,
-            "S",
-            Some(ffmpeg::format_time_ms(self.trim_start_ms)),
-            true,
-        );
-        draw_pin(
-            end_x,
-            success,
-            "E",
-            Some(ffmpeg::format_time_ms(self.trim_end_ms)),
-            true,
-        );
-        draw_pin(play_x, accent, "▶", None, false);
-
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(outer, track.top()),
+                        egui::pos2(inner, track.top()),
+                        egui::pos2(outer, track.bottom()),
+                    ],
+                    egui::Color32::from_white_alpha(30),
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+        let cursor = to_x(self.trim_playhead_ms);
         painter.line_segment(
             [
-                egui::pos2(play_x, track_rect.top() - 1.0),
-                egui::pos2(play_x, track_rect.bottom() + 1.0),
+                egui::pos2(cursor, track.top() - 5.0),
+                egui::pos2(cursor, track.bottom()),
             ],
-            egui::Stroke::new(1.0, accent),
+            egui::Stroke::new(1.0, egui::Color32::WHITE),
         );
+        for i in 0..=4 {
+            let x = track.left() + track.width() * i as f32 / 4.0;
+            painter.text(
+                egui::pos2(x, rect.bottom() - 8.0),
+                if i == 0 {
+                    egui::Align2::LEFT_CENTER
+                } else if i == 4 {
+                    egui::Align2::RIGHT_CENTER
+                } else {
+                    egui::Align2::CENTER_CENTER
+                },
+                ffmpeg::format_time_ms(duration_ms * i / 4),
+                egui::FontId::proportional(10.0),
+                muted,
+            );
+        }
     }
 
     fn start_generation(&mut self, ctx: egui::Context) {
@@ -3498,11 +3460,14 @@ impl KaraokeApp {
         let model = self.model.clone();
         let quality = self.quality.clone();
         let font = normalized_font_choice(&self.font);
+        let font_scale = self.font_scale;
         let active_color = self.color_active;
         let inactive_color = self.color_inactive;
         let bg_color = self.color_bg;
         let inactive_opacity = self.inactive_opacity.clamp(0.0, 1.0);
         let audio_delay_seconds = self.audio_delay_ms as f32 / 1000.0;
+        let normalize_audio = self.normalize_audio;
+        let loudness_target_db = self.loudness_target_db;
         let fade_in_ms = self.fade_in_ms;
         let fade_out_ms = self.fade_out_ms;
         let plain_lines = self.plain_lines;
@@ -3518,6 +3483,14 @@ impl KaraokeApp {
             .unwrap_or(default_exports);
         let uploads = paths::upload_dir();
         let worker_path_for_log = worker_path.to_string_lossy().to_string();
+        let render_engine = match paths::render_engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.is_generating = false;
+                self.status_text = error;
+                return;
+            }
+        };
         let use_rust_renderer = rust_renderer_path.is_some();
         let renderer_path_for_log = rust_renderer_path
             .as_ref()
@@ -3573,7 +3546,7 @@ impl KaraokeApp {
             let worker_audio_path = if let Some((start, end)) = trim_bounds {
                 let should_trim = start > 0
                     || ffmpeg::probe_audio_duration_ms(&audio_path)
-                        .map(|duration| end < duration - 250)
+                        .map(|duration| end < duration)
                         .unwrap_or(false)
                     || fade_in_ms > 0
                     || fade_out_ms > 0;
@@ -3611,6 +3584,11 @@ impl KaraokeApp {
                 audio_path.clone()
             };
 
+            let lyrics = if let Some((start, end)) = trim_bounds {
+                lyrics::shift_lrc_for_trim(&lyrics, start, end - start)
+            } else {
+                lyrics
+            };
             if let Err(e) = std::fs::write(&temp_lyrics_path, &lyrics) {
                 let _ = tx.send(ProgressUpdate::Error(format!(
                     "Не удалось записать временный файл текста: {}",
@@ -3657,6 +3635,8 @@ impl KaraokeApp {
                 .arg(&quality)
                 .arg("--font")
                 .arg(&font)
+                .arg("--font-scale")
+                .arg(font_scale.to_string())
                 .arg("--color-active")
                 .arg(&active_hex)
                 .arg("--color-inactive")
@@ -3668,6 +3648,11 @@ impl KaraokeApp {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
+            cmd.arg("--loudness-target-db")
+                .arg(loudness_target_db.to_string());
+            if !normalize_audio {
+                cmd.arg("--no-normalize-audio");
+            }
             if plain_lines {
                 cmd.arg("--plain-lines");
             }
@@ -3806,6 +3791,8 @@ impl KaraokeApp {
                     .arg(&quality)
                     .arg("--font")
                     .arg(&font)
+                    .arg("--font-scale")
+                    .arg(font_scale.to_string())
                     .arg("--color-active")
                     .arg(&active_hex)
                     .arg("--color-inactive")
@@ -3815,12 +3802,11 @@ impl KaraokeApp {
                     .arg("--inactive-opacity")
                     .arg(inactive_opacity.to_string())
                     .arg("--engine")
-                    .arg(
-                        std::env::var("KARAOKE_RENDER_ENGINE")
-                            .unwrap_or_else(|_| "ass".to_string()),
-                    )
+                    .arg(render_engine.clone())
                     .arg("--audio-delay")
                     .arg(audio_delay_seconds.to_string())
+                    .arg("--loudness-target-db")
+                    .arg(loudness_target_db.to_string())
                     .arg("--ffmpeg")
                     .arg(paths::tool_path("ffmpeg"))
                     .arg("--ffprobe")
@@ -3828,6 +3814,9 @@ impl KaraokeApp {
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped());
 
+                if !normalize_audio {
+                    render_cmd.arg("--no-normalize-audio");
+                }
                 if plain_lines {
                     render_cmd.arg("--plain-lines");
                 }
@@ -3951,28 +3940,9 @@ impl KaraokeApp {
 
 impl eframe::App for KaraokeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_previews(ctx);
         self.sync_preview_playhead(ctx);
         self.sync_video_preview(ctx);
-
-        let old_settings = AppSettings {
-            model: self.model.clone(),
-            quality: self.quality.clone(),
-            font: self.font.clone(),
-            color_active: self.color_active,
-            color_inactive: self.color_inactive,
-            color_bg: self.color_bg,
-            inactive_opacity: self.inactive_opacity,
-            audio_delay_ms: self.audio_delay_ms,
-            fade_in_ms: self.fade_in_ms,
-            fade_out_ms: self.fade_out_ms,
-            artist: self.artist.clone(),
-            title: self.title.clone(),
-            lyrics: self.lyrics.clone(),
-            plain_lines: self.plain_lines,
-            verify_lrc_with_whisper: self.verify_lrc_with_whisper,
-            separate_vocals_for_word_level: self.separate_vocals_for_word_level,
-            batch_overwrite_timings: self.batch_overwrite_timings,
-        };
 
         // Единая современная темная тема для всех стандартных виджетов egui.
         let mut visuals = egui::Visuals::dark();
@@ -3982,16 +3952,16 @@ impl eframe::App for KaraokeApp {
         visuals.widgets.inactive.rounding = 8.0.into();
         visuals.widgets.open.rounding = 8.0.into();
 
-        visuals.selection.bg_fill = egui::Color32::from_rgb(45, 118, 255);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(76, 121, 195);
         visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
-        visuals.extreme_bg_color = egui::Color32::from_rgb(12, 14, 18);
-        visuals.window_fill = egui::Color32::from_rgb(12, 14, 18);
-        visuals.panel_fill = egui::Color32::from_rgb(12, 14, 18);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(17, 22, 30);
+        visuals.window_fill = egui::Color32::from_rgb(17, 22, 30);
+        visuals.panel_fill = egui::Color32::from_rgb(17, 22, 30);
         visuals.faint_bg_color = egui::Color32::from_rgb(24, 28, 36);
         visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(28, 33, 43);
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(39, 46, 60);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(45, 118, 255);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(76, 121, 195);
 
         visuals.widgets.inactive.fg_stroke =
             egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 229, 236));
@@ -4001,6 +3971,11 @@ impl eframe::App for KaraokeApp {
         visuals.widgets.noninteractive.fg_stroke =
             egui::Stroke::new(1.0, egui::Color32::from_rgb(196, 202, 214));
 
+        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(32, 41, 54);
+        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(42, 55, 73);
+        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(44, 64, 94);
+        visuals.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 52, 66));
         ctx.set_visuals(visuals);
 
         // Опрос фоновой загрузки аудио: ffprobe не должен подвешивать интерфейс.
@@ -4153,6 +4128,7 @@ impl eframe::App for KaraokeApp {
                         self.video_duration_ms =
                             ffmpeg::probe_audio_duration_ms(&full_path).unwrap_or(0);
                         self.video_position_ms = 0;
+                        self.video_asset = None;
                         self.generated_file = Some(full_path);
                         if let Some(index) = self.batch_current_index
                             && let Some(item) = self.batch_items.get_mut(index)
@@ -4197,6 +4173,9 @@ impl eframe::App for KaraokeApp {
                         ));
                     }
                     if let Some(path) = output_path {
+                        self.stop_video_preview();
+                        self.video_asset = None;
+                        self.video_duration_ms = 0;
                         self.generated_file = Some(path.clone());
                         self.log_output
                             .push_str(&format!("🎉 Batch сохранено: {}\n", path));
@@ -4260,6 +4239,24 @@ impl eframe::App for KaraokeApp {
                     }
                 }
                 ProgressUpdate::BatchFinished => {
+                    let completion = if self.batch_cancel.load(Ordering::Acquire) {
+                        "Пакет отменён"
+                    } else if self.batch_stop_requested {
+                        "Пакет остановлен"
+                    } else {
+                        "Пакет завершён"
+                    };
+                    for item in &mut self.batch_items {
+                        if matches!(
+                            item.status,
+                            BatchStatus::Aligning
+                                | BatchStatus::Rendering
+                                | BatchStatus::ReadyToRender
+                        ) {
+                            item.status = BatchStatus::Ready;
+                            item.progress = 0.0;
+                        }
+                    }
                     self.batch_running = false;
                     self.batch_current_index = None;
                     self.batch_stop_requested = false;
@@ -4281,11 +4278,11 @@ impl eframe::App for KaraokeApp {
                         .filter(|item| matches!(item.status, BatchStatus::Error(_)))
                         .count();
                     self.batch_status_text = format!(
-                        "Batch завершен: готово {}, ошибок {}, без текста {}",
+                        "{completion}: готово {}, ошибок {}, без текста {}",
                         done, failed, missing
                     );
                     self.log_output.push_str(&format!(
-                        "✅ Batch завершен: готово {}, ошибок {}, без текста {}\n",
+                        "{completion}: готово {}, ошибок {}, без текста {}\n",
                         done, failed, missing
                     ));
                 }
@@ -4396,11 +4393,23 @@ impl eframe::App for KaraokeApp {
             let Some(log_line) = update else {
                 break;
             };
-            if log_line == "___FINISHED_SUCCESS___" {
+            if self.dl_search_only
+                && let Ok(report) = serde_json::from_str::<AudioSearchReport>(&log_line)
+            {
+                self.dl_search_result = Some(report);
+                self.dl_status_text = "Результаты получены и проверены".to_string();
+            } else if log_line == "___FINISHED_SUCCESS___" {
                 self.dl_is_running = false;
-                self.dl_status_text = "Загрузка успешно завершена!".to_string();
-                self.dl_log_output
-                    .push_str("\n🎉 Загрузка успешно завершена!\n");
+                self.dl_status_text = if self.dl_search_only {
+                    "Поиск и проверка завершены".to_string()
+                } else {
+                    "Загрузка успешно завершена!".to_string()
+                };
+                self.dl_log_output.push_str(if self.dl_search_only {
+                    "\n✅ Поиск и проверка завершены. Файлы не загружались.\n"
+                } else {
+                    "\n🎉 Загрузка успешно завершена!\n"
+                });
             } else if log_line == "___FINISHED_FAILURE___" {
                 self.dl_is_running = false;
                 if self.dl_stop_requested {
@@ -4409,9 +4418,16 @@ impl eframe::App for KaraokeApp {
                         .push_str("\n🛑 Загрузка остановлена пользователем.\n");
                     self.dl_stop_requested = false;
                 } else {
-                    self.dl_status_text = "Загрузка завершилась с ошибкой".to_string();
-                    self.dl_log_output
-                        .push_str("\n❌ Загрузка прервана из-за ошибки.\n");
+                    self.dl_status_text = if self.dl_search_only {
+                        "Поиск завершился с ошибкой".to_string()
+                    } else {
+                        "Загрузка завершилась с ошибкой".to_string()
+                    };
+                    self.dl_log_output.push_str(if self.dl_search_only {
+                        "\n❌ Поиск прерван из-за ошибки.\n"
+                    } else {
+                        "\n❌ Загрузка прервана из-за ошибки.\n"
+                    });
                 }
             } else {
                 parse_log_line_and_update_status(&log_line, &mut self.dl_tracks);
@@ -4445,9 +4461,32 @@ impl eframe::App for KaraokeApp {
             }
         }
 
+        if matches!(self.active_tab, ActiveTab::SingleTrack | ActiveTab::Batch) {
+            egui::TopBottomPanel::bottom("workspace_actions_v2")
+                .exact_height(if self.active_tab == ActiveTab::Batch {
+                    94.0
+                } else {
+                    78.0
+                })
+                .resizable(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(23, 30, 40))
+                        .inner_margin(12.0)
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 52, 66))),
+                )
+                .show(ctx, |ui| {
+                    if self.active_tab == ActiveTab::Batch {
+                        self.batch_footer_ui(ui, ctx);
+                    } else {
+                        self.single_footer_ui(ui, ctx);
+                    }
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.max_rect();
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 14, 18));
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(17, 22, 30));
 
             let card_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgb(19, 23, 31))
@@ -4458,1402 +4497,23 @@ impl eframe::App for KaraokeApp {
             let drop_zone_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgb(15, 18, 24))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(54, 65, 82)))
-                .rounding(8.0)
-                .inner_margin(18.0);
-
+                .rounding(8.0).inner_margin(18.0);
             let log_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgb(10, 12, 17))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 40, 52)))
                 .rounding(8.0)
                 .inner_margin(12.0);
 
-            let page_margin = 24.0;
             let muted = egui::Color32::from_rgb(145, 154, 171);
             let text = egui::Color32::from_rgb(238, 241, 247);
             let accent = egui::Color32::from_rgb(88, 166, 255);
             let success = egui::Color32::from_rgb(54, 211, 153);
 
-            ui.add_space(page_margin - 6.0);
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Караоке-Видео Генератор v{}", APP_VERSION))
-                            .strong()
-                            .size(27.0)
-                            .color(text)
-                    );
-                    ui.add_space(3.0);
-                    ui.label(
-                        egui::RichText::new("Соберите MP4 с пословной подсветкой, Whisper-синхронизацией и аккуратной типографикой.")
-                            .size(13.0)
-                            .color(muted)
-                    );
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let status_color = if self.is_generating {
-                        accent
-                    } else if self.generated_file.is_some() {
-                        success
-                    } else {
-                        muted
-                    };
-                    let status = if self.is_generating {
-                        "Генерация"
-                    } else if self.generated_file.is_some() {
-                        "Готово"
-                    } else {
-                        "Ожидание"
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("v{} · {}", APP_VERSION, status))
-                            .strong()
-                            .size(13.0)
-                            .color(status_color)
-                    );
-                });
-            });
-            ui.add_space(18.0);
-
-             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.active_tab == ActiveTab::SingleTrack, egui::RichText::new("Один трек").strong())
-                    .clicked()
-                    && !self.batch_running
-                {
-                    self.active_tab = ActiveTab::SingleTrack;
-                }
-                if ui
-                    .selectable_label(self.active_tab == ActiveTab::Batch, egui::RichText::new("Пакетный рендеринг").strong())
-                    .clicked()
-                {
-                    self.active_tab = ActiveTab::Batch;
-                }
-                if ui
-                    .selectable_label(self.active_tab == ActiveTab::Downloader, egui::RichText::new("Загрузчик аудио").strong())
-                    .clicked()
-                {
-                    self.active_tab = ActiveTab::Downloader;
-                }
-                if ui
-                    .selectable_label(self.active_tab == ActiveTab::PptxOptimizer, egui::RichText::new("Оптимизация PPTX").strong())
-                    .clicked()
-                {
-                    self.active_tab = ActiveTab::PptxOptimizer;
-                }
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(match self.active_tab {
-                        ActiveTab::SingleTrack => "Обычный режим создания караоке-видео для одного трека.",
-                        ActiveTab::Batch => "Массовая генерация: каждая подпапка получает свой MP4 рядом с MP3/LRC.",
-                        ActiveTab::Downloader => "Загрузка аудио: скачивание музыки по названию или списку из Excel.",
-                        ActiveTab::PptxOptimizer => "Сжатие презентаций Музлото: уменьшает встроенные MP4 без изменения слайдов.",
-                    })
-                    .size(12.0)
-                    .color(muted),
-                );
-            });
-            ui.add_space(14.0);
+            self.workspace_header(ui);
+            ui.add_space(10.0);
 
             if self.active_tab == ActiveTab::Batch {
-                let batch_margin = 14.0;
-                let content_width = ui.available_width() - batch_margin * 2.0;
-                ui.horizontal(|ui| {
-                    ui.add_space(batch_margin);
-                    ui.vertical(|ui| {
-                        ui.set_width(content_width.max(520.0));
-
-                        card_frame.show(ui, |ui| {
-                            let top_inner_width = (content_width - 36.0).max(760.0);
-                            ui.set_min_width(top_inner_width);
-
-                            let top_gap = 24.0;
-                            let available_top_width = top_inner_width - top_gap;
-                            let left_panel_width = (available_top_width * 0.36).floor().max(430.0);
-                            let right_panel_width =
-                                (available_top_width - left_panel_width).floor().max(360.0);
-                            let done = self
-                                .batch_items
-                                .iter()
-                                .filter(|item| item.status == BatchStatus::Done)
-                                .count();
-                            let failed = self
-                                .batch_items
-                                .iter()
-                                .filter(|item| matches!(item.status, BatchStatus::Error(_)))
-                                .count();
-                            let missing_lyrics = self
-                                .batch_items
-                                .iter()
-                                .filter(|item| item.status == BatchStatus::MissingLyrics)
-                                .count();
-                            let (_audit_ok, _audit_notice, audit_warning, audit_error) =
-                                batch_audit_counts(&self.batch_items);
-
-                            ui.horizontal(|ui| {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(left_panel_width, 132.0),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Массовая генерация")
-                                                .strong()
-                                                .size(18.0)
-                                                .color(text),
-                                        );
-                                        ui.add_space(10.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    !self.is_generating && !self.batch_running && !self.batch_is_scanning,
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Выбрать папку")
-                                                            .size(13.0)
-                                                            .strong(),
-                                                    ),
-                                                )
-                                                .clicked()
-                                                && let Some(path) =
-                                                    rfd::FileDialog::new().pick_folder()
-                                                {
-                                                    self.load_batch_folder(path, ctx);
-                                                }
-
-                                            let can_start_batch = !self.batch_items.is_empty()
-                                                && !self.is_generating
-                                                && !self.batch_running;
-                                            if ui
-                                                .add_enabled(
-                                                    can_start_batch,
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Запустить сначала")
-                                                            .size(13.0)
-                                                            .strong(),
-                                                    )
-                                                    .fill(egui::Color32::from_rgb(45, 118, 255)),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.start_batch_queue(ctx);
-                                            }
-
-                                            let can_continue_batch = !self.batch_items.is_empty()
-                                                && !self.is_generating
-                                                && !self.batch_running
-                                                && self
-                                                    .batch_items
-                                                    .iter()
-                                                    .any(|item| {
-                                                        item.status == BatchStatus::Ready
-                                                            || item.status == BatchStatus::ReadyToRender
-                                                    });
-                                            if ui
-                                                .add_enabled(
-                                                    can_continue_batch,
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Продолжить")
-                                                            .size(13.0)
-                                                            .strong(),
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.continue_batch_queue(ctx);
-                                            }
-
-                                            let can_gen_selected = !self.batch_items.is_empty()
-                                                && !self.is_generating
-                                                && !self.batch_running
-                                                && self.batch_selected_index.is_some();
-                                            let selected_can_generate = self
-                                                .batch_selected_index
-                                                .and_then(|idx| self.batch_items.get(idx))
-                                                .map(|item| item.status != BatchStatus::MissingLyrics)
-                                                .unwrap_or(false);
-                                            if ui
-                                                .add_enabled(
-                                                    can_gen_selected && selected_can_generate,
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Сгенерировать выбранный")
-                                                            .size(13.0)
-                                                            .strong(),
-                                                    ).fill(egui::Color32::from_rgb(168, 85, 247)),
-                                                )
-                                                .clicked()
-                                                && let Some(idx) = self.batch_selected_index {
-                                                    self.start_single_batch_item(idx, ctx);
-                                                }
-
-                                            if ui
-                                                .add_enabled(
-                                                    self.batch_running
-                                                        && !self.batch_stop_requested,
-                                                    egui::Button::new(
-                                                        egui::RichText::new(
-                                                            "Остановить после текущего",
-                                                        )
-                                                        .size(13.0),
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.request_stop_batch();
-                                            }
-                                        });
-                                        ui.add_space(12.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} / {} готово",
-                                                    done,
-                                                    self.batch_items.len()
-                                                ))
-                                                .strong()
-                                                .size(13.0)
-                                                .color(muted),
-                                            );
-                                            ui.separator();
-                                            ui.label(
-                                                egui::RichText::new(format!("{} ошибок", failed))
-                                                    .strong()
-                                                    .size(13.0)
-                                                    .color(if failed > 0 {
-                                                        egui::Color32::from_rgb(255, 176, 96)
-                                                    } else {
-                                                        muted
-                                                    }),
-                                            );
-                                            ui.separator();
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} без текста",
-                                                    missing_lyrics
-                                                ))
-                                                .strong()
-                                                .size(13.0)
-                                                .color(if missing_lyrics > 0 {
-                                                    egui::Color32::from_rgb(255, 176, 96)
-                                                } else {
-                                                    muted
-                                                }),
-                                            );
-                                            ui.separator();
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} проверить",
-                                                    audit_warning
-                                                ))
-                                                .strong()
-                                                .size(13.0)
-                                                .color(if audit_warning > 0 {
-                                                    egui::Color32::from_rgb(246, 181, 70)
-                                                } else {
-                                                    muted
-                                                }),
-                                            );
-                                            ui.separator();
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} аудит ошибок",
-                                                    audit_error
-                                                ))
-                                                .strong()
-                                                .size(13.0)
-                                                .color(if audit_error > 0 {
-                                                    egui::Color32::from_rgb(255, 100, 100)
-                                                } else {
-                                                    muted
-                                                }),
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-
-                                        let batch_video_dir = self
-                                            .batch_root
-                                            .clone()
-                                            .unwrap_or_else(paths::exports_dir);
-                                        if batch_video_dir.exists() {
-                                            if ui.button("📁 Открыть папку с видео").clicked() {
-                                                open_in_explorer(&batch_video_dir);
-                                            }
-                                            ui.add_space(4.0);
-                                        }
-
-                                        if self.batch_running
-                                            && let Some(start_time) = self.batch_start_time {
-                                                let elapsed = start_time.elapsed().as_secs();
-                                                let elapsed_str = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
-
-                                                let mut time_str = format!("⏱️ Прошло: {}", elapsed_str);
-
-                                                let n = self.batch_items.len();
-                                                if n > 0 {
-                                                    let current_idx = self.batch_current_index.unwrap_or(0);
-                                                    let current_progress = self.progress;
-                                                    let total_progress = (current_idx as f32 + current_progress) / n as f32;
-
-                                                    if total_progress > 0.001 && total_progress < 1.0 {
-                                                        let total_est = elapsed as f32 / total_progress;
-                                                        let rem = (total_est - elapsed as f32).round() as u64;
-                                                        let rem_str = format!("{:02}:{:02}", rem / 60, rem % 60);
-                                                        time_str.push_str(&format!("  |  ⏳ Осталось ~{}", rem_str));
-                                                    }
-                                                }
-                                                ui.label(egui::RichText::new(time_str).size(12.0).color(muted));
-                                                ui.add_space(4.0);
-                                            }
-
-                                        let folder_label = self
-                                            .batch_root
-                                            .as_ref()
-                                            .map(|path| lyrics::display_file_name(path))
-                                            .unwrap_or_else(|| "Папка не выбрана".to_string());
-                                        ui.label(
-                                            egui::RichText::new(folder_label)
-                                                .size(12.0)
-                                                .color(muted),
-                                        );
-                                    },
-                                );
-
-                                ui.add_space(top_gap);
-
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(right_panel_width, 132.0),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Настройки генерации")
-                                                .strong()
-                                                .size(18.0)
-                                                .color(text),
-                                        );
-                                        ui.add_space(10.0);
-                                        ui.horizontal(|ui| {
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Модель")
-                                                        .size(11.0)
-                                                        .color(muted),
-                                                );
-                                                egui::ComboBox::from_id_salt("batch_model_combo")
-                                                    .selected_text(match self.model.as_str() {
-                                                        "medium" => "medium",
-                                                        "small" => "small",
-                                                        _ => "base",
-                                                    })
-                                                    .width(170.0)
-                                                    .show_ui(ui, |ui| {
-                                                        ui.selectable_value(
-                                                            &mut self.model,
-                                                            "base".to_string(),
-                                                            "base",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.model,
-                                                            "small".to_string(),
-                                                            "small",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.model,
-                                                            "medium".to_string(),
-                                                            "medium",
-                                                        );
-                                                    });
-                                            });
-                                            ui.add_space(12.0);
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Качество")
-                                                        .size(11.0)
-                                                        .color(muted),
-                                                );
-                                                egui::ComboBox::from_id_salt("batch_quality_combo")
-                                                    .selected_text(match self.quality.as_str() {
-                                                        "ultra" => "Ультра",
-                                                        "high" => "Высокое",
-                                                        _ => "Стандарт",
-                                                    })
-                                                    .width(170.0)
-                                                    .show_ui(ui, |ui| {
-                                                        ui.selectable_value(
-                                                            &mut self.quality,
-                                                            "medium".to_string(),
-                                                            "Стандарт",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.quality,
-                                                            "high".to_string(),
-                                                            "Высокое",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut self.quality,
-                                                            "ultra".to_string(),
-                                                            "Ультра",
-                                                        );
-                                                    });
-                                            });
-                                            ui.add_space(12.0);
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new("Шрифт")
-                                                        .size(11.0)
-                                                        .color(muted),
-                                                );
-                                                egui::ComboBox::from_id_salt("batch_font_combo")
-                                                    .selected_text(font_display_name(&self.font))
-                                                    .width(170.0)
-                                                    .show_ui(ui, |ui| {
-                                                        ui.selectable_value(
-                                                            &mut self.font,
-                                                            "montserrat".to_string(),
-                                                            "Montserrat",
-                                                        );
-                                                    });
-                                            });
-                                        });
-                                        ui.add_space(12.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("Цвета")
-                                                    .size(11.0)
-                                                    .color(muted),
-                                            );
-                                            ui.add_space(4.0);
-                                            ui.color_edit_button_srgb(&mut self.color_active);
-                                            ui.label(
-                                                egui::RichText::new("Активный")
-                                                    .size(11.0)
-                                                    .color(text),
-                                            );
-                                            ui.add_space(8.0);
-                                            ui.color_edit_button_srgb(&mut self.color_inactive);
-                                            ui.label(
-                                                egui::RichText::new("Будущий")
-                                                    .size(11.0)
-                                                    .color(text),
-                                            );
-                                            ui.add_space(8.0);
-                                            ui.color_edit_button_srgb(&mut self.color_bg);
-                                            ui.label(
-                                                egui::RichText::new("Фон")
-                                                    .size(11.0)
-                                                    .color(text),
-                                            );
-                                            ui.separator();
-                                            ui.label(
-                                                egui::RichText::new("Прозрачность")
-                                                    .size(11.0)
-                                                    .color(muted),
-                                            );
-                                            ui.add_sized(
-                                                egui::vec2(110.0, 18.0),
-                                                egui::Slider::new(
-                                                    &mut self.inactive_opacity,
-                                                    0.2..=1.0,
-                                                )
-                                                .show_value(false),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{}%",
-                                                    (self.inactive_opacity * 100.0).round()
-                                                        as i32
-                                                ))
-                                                .size(11.0)
-                                                .color(accent),
-                                            );
-                                            ui.checkbox(&mut self.plain_lines, "Только строки");
-                                            ui.checkbox(
-                                                &mut self.verify_lrc_with_whisper,
-                                                "Проверять LRC в режиме строк",
-                                            );
-                                            ui.checkbox(
-                                                &mut self.separate_vocals_for_word_level,
-                                                "Вокал для слов (Demucs, точнее, но дольше)",
-                                            );
-                                            ui.checkbox(
-                                                &mut self.batch_overwrite_timings,
-                                                "Перезаписывать тайминги Whisper (всегда распознавать заново)",
-                                            );
-                                        });
-                                    },
-                                );
-                            });
-                        });
-
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Очередь").strong().size(16.0).color(text));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new("Слева список, справа текст выбранного трека.").size(11.0).color(muted));
-                            });
-                        });
-                        ui.add_space(6.0);
-
-                        if self.batch_is_scanning {
-                            drop_zone_frame.show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(30.0);
-                                    ui.add(egui::widgets::Spinner::new().size(30.0));
-                                    ui.add_space(12.0);
-                                    ui.label(
-                                        egui::RichText::new("Сканирование папки, считывание длительности аудио...")
-                                            .size(14.0)
-                                            .strong()
-                                            .color(accent),
-                                    );
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new("Пожалуйста, подождите. Для больших папок это может занять несколько секунд.")
-                                            .size(11.0)
-                                            .color(muted),
-                                    );
-                                    ui.add_space(30.0);
-                                });
-                            });
-                        } else if self.batch_items.is_empty() {
-                            drop_zone_frame.show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(20.0);
-                                    ui.label(
-                                        egui::RichText::new("Перетащите сюда папку batch или выберите ее кнопкой выше")
-                                            .size(14.0)
-                                            .color(muted),
-                                    );
-                                    ui.add_space(20.0);
-                                });
-                            });
-                        } else {
-                            let selected_index = self
-                                .batch_selected_index
-                                .filter(|idx| *idx < self.batch_items.len())
-                                .unwrap_or(0);
-                            self.batch_selected_index = Some(selected_index);
-
-                            let selected_snapshot = self.batch_items[selected_index].clone();
-                            let should_load = self.audio_path.as_deref()
-                                != Some(&selected_snapshot.audio_path.to_string_lossy());
-                            if should_load && !self.is_generating && !self.batch_running {
-                                let _ = self.apply_batch_item_to_single_state(selected_index);
-                            }
-
-                            let column_gap = 18.0;
-                            let available_width = ui.available_width();
-                            let column_width = ((available_width - column_gap) / 2.0)
-                                .floor()
-                                .max(360.0);
-                            let bottom_margin = 30.0;
-                            let column_height =
-                                (ctx.screen_rect().bottom() - ui.cursor().top() - bottom_margin)
-                                    .max(320.0);
-                            let header_height = 28.0;
-                            let body_height = (column_height - header_height).max(260.0);
-                            let list_inner_width = column_width - 20.0;
-                            let mut select_request = None;
-                            let mut remove_request = None;
-
-                            ui.horizontal(|ui| {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(column_width, column_height),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("Список")
-                                                    .strong()
-                                                    .size(14.0)
-                                                    .color(text),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "{} треков",
-                                                            self.batch_items.len()
-                                                        ))
-                                                        .size(12.0)
-                                                        .color(muted),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(6.0);
-
-                                        let (body_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(column_width, body_height),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            body_rect,
-                                            6.0,
-                                            egui::Color32::from_rgb(12, 15, 21),
-                                        );
-                                        ui.painter().rect_stroke(
-                                            body_rect,
-                                            6.0,
-                                            egui::Stroke::new(
-                                                1.0,
-                                                egui::Color32::from_rgb(34, 40, 52),
-                                            ),
-                                        );
-                                        let inner_rect = body_rect.shrink(8.0);
-                                        ui.allocate_new_ui(
-                                            egui::UiBuilder::new().max_rect(inner_rect),
-                                            |ui| {
-                                                egui::ScrollArea::vertical()
-                                                    .id_salt("batch_track_list_simple")
-                                                    .max_height(inner_rect.height())
-                                                    .auto_shrink([false, false])
-                                                    .show(ui, |ui| {
-                                                        for idx in 0..self.batch_items.len() {
-                                                            let item =
-                                                                self.batch_items[idx].clone();
-                                                            let selected =
-                                                                self.batch_selected_index
-                                                                    == Some(idx);
-                                                            let is_running = matches!(
-                                                                item.status,
-                                                                BatchStatus::Aligning
-                                                                    | BatchStatus::Rendering
-                                                            );
-                                                            let row_fill = if is_running {
-                                                                egui::Color32::from_rgb(24, 39, 66)
-                                                            } else if selected {
-                                                                egui::Color32::from_rgb(32, 39, 52)
-                                                            } else {
-                                                                egui::Color32::from_rgb(15, 18, 24)
-                                                            };
-                                                            let row_stroke = if selected {
-                                                                accent
-                                                            } else {
-                                                                egui::Color32::from_rgb(34, 40, 52)
-                                                            };
-                                                            let name = if item.artist.is_empty() {
-                                                                item.title.clone()
-                                                            } else {
-                                                                format!(
-                                                                    "{} - {}",
-                                                                    item.artist, item.title
-                                                                )
-                                                            };
-
-                                                            let row_response = egui::Frame::none()
-                                                                .fill(row_fill)
-                                                                .stroke(egui::Stroke::new(
-                                                                    1.0, row_stroke,
-                                                                ))
-                                                                .rounding(5.0)
-                                                                .inner_margin(egui::vec2(8.0, 6.0))
-                                                                .show(ui, |ui| {
-                                                                    ui.set_min_width(
-                                                                        list_inner_width - 16.0,
-                                                                    );
-                                                                    ui.horizontal(|ui| {
-                                                                        ui.label(
-                                                                            egui::RichText::new(
-                                                                                format!(
-                                                                                    "{:03}",
-                                                                                    idx + 1
-                                                                                ),
-                                                                            )
-                                                                            .monospace()
-                                                                            .size(10.5)
-                                                                            .color(muted),
-                                                                        );
-                                                                        ui.vertical(|ui| {
-                                                                            ui.set_width(
-                                                                                list_inner_width
-                                                                                    - 250.0,
-                                                                            );
-                                                                            ui.label(
-                                                                                egui::RichText::new(
-                                                                                    name,
-                                                                                )
-                                                                                .size(12.0)
-                                                                                .strong()
-                                                                                .color(text),
-                                                                            );
-                                                                        });
-                                                                        if let Some(audit) =
-                                                                            &item.audit
-                                                                        {
-                                                                            let audit_response =
-                                                                                ui.label(
-                                                                                    egui::RichText::new(
-                                                                                        audit.level
-                                                                                            .label(),
-                                                                                    )
-                                                                                    .size(10.5)
-                                                                                    .strong()
-                                                                                    .color(
-                                                                                        audit
-                                                                                            .level
-                                                                                            .color(),
-                                                                                    ),
-                                                                                );
-                                                                            if !audit
-                                                                                .issues
-                                                                                .is_empty()
-                                                                            {
-                                                                                audit_response
-                                                                                    .on_hover_text(
-                                                                                        audit
-                                                                                            .tooltip(),
-                                                                                    );
-                                                                            }
-                                                                        } else {
-                                                                            ui.label(
-                                                                                egui::RichText::new(
-                                                                                    "аудит",
-                                                                                )
-                                                                                .size(10.5)
-                                                                                .color(muted),
-                                                                            );
-                                                                        }
-                                                                        ui.vertical(|ui| {
-                                                                            ui.set_width(108.0);
-                                                                            ui.with_layout(
-                                                                                egui::Layout::right_to_left(
-                                                                                    egui::Align::Center,
-                                                                                ),
-                                                                                |ui| {
-                                                                                    if matches!(
-                                                                                        item.status,
-                                                                                        BatchStatus::Aligning
-                                                                                            | BatchStatus::Rendering
-                                                                                    ) {
-                                                                                        let percent =
-                                                                                            ((item.progress * 100.0).round() as i32)
-                                                                                                .clamp(0, 100);
-                                                                                        ui.label(
-                                                                                            egui::RichText::new(format!(
-                                                                                                "{}%",
-                                                                                                percent
-                                                                                            ))
-                                                                                            .monospace()
-                                                                                            .size(11.0)
-                                                                                            .color(accent),
-                                                                                        );
-                                                                                    } else if item.status
-                                                                                        == BatchStatus::MissingLyrics
-                                                                                    {
-                                                                                        ui.label(
-                                                                                            egui::RichText::new("нет текста")
-                                                                                                .size(10.5)
-                                                                                                .color(egui::Color32::from_rgb(
-                                                                                                    255, 176, 96,
-                                                                                                )),
-                                                                                        );
-                                                                                    } else {
-                                                                                        ui.add_space(30.0);
-                                                                                    }
-                                                                                },
-                                                                            );
-                                                                        });
-                                                                    });
-                                                                })
-                                                                .response;
-                                                            let control_y =
-                                                                row_response.rect.center().y;
-                                                            let remove_rect =
-                                                                egui::Rect::from_center_size(
-                                                                    egui::pos2(
-                                                                        row_response.rect.right()
-                                                                            - 24.0,
-                                                                        control_y,
-                                                                    ),
-                                                                    egui::vec2(24.0, 24.0),
-                                                                );
-                                                            let status_rect =
-                                                                egui::Rect::from_center_size(
-                                                                    egui::pos2(
-                                                                        row_response.rect.right()
-                                                                            - 58.0,
-                                                                        control_y,
-                                                                    ),
-                                                                    egui::vec2(22.0, 22.0),
-                                                                );
-                                                            let painter = ui.painter();
-                                                            let status_center =
-                                                                status_rect.center();
-                                                            match &item.status {
-                                                                BatchStatus::Done => {
-                                                                    let quality =
-                                                                        item.alignment_quality
-                                                                            .as_ref();
-                                                                    let fill = quality
-                                                                        .map(|q| q.color())
-                                                                        .unwrap_or(success);
-                                                                    let icon = quality
-                                                                        .map(|q| q.icon())
-                                                                        .unwrap_or("✓");
-                                                                    painter.circle_filled(
-                                                                        status_center,
-                                                                        8.0,
-                                                                        fill,
-                                                                    );
-                                                                    if icon == "✓" {
-                                                                        painter.line_segment(
-                                                                            [
-                                                                                egui::pos2(
-                                                                                    status_center.x
-                                                                                        - 4.0,
-                                                                                    status_center.y,
-                                                                                ),
-                                                                                egui::pos2(
-                                                                                    status_center.x
-                                                                                        - 1.0,
-                                                                                    status_center.y
-                                                                                        + 3.0,
-                                                                                ),
-                                                                            ],
-                                                                            egui::Stroke::new(
-                                                                                1.8,
-                                                                                egui::Color32::from_rgb(
-                                                                                    8, 18, 14,
-                                                                                ),
-                                                                            ),
-                                                                        );
-                                                                        painter.line_segment(
-                                                                            [
-                                                                                egui::pos2(
-                                                                                    status_center.x
-                                                                                        - 1.0,
-                                                                                    status_center.y
-                                                                                        + 3.0,
-                                                                                ),
-                                                                                egui::pos2(
-                                                                                    status_center.x
-                                                                                        + 5.0,
-                                                                                    status_center.y
-                                                                                        - 4.0,
-                                                                                ),
-                                                                            ],
-                                                                            egui::Stroke::new(
-                                                                                1.8,
-                                                                                egui::Color32::from_rgb(
-                                                                                    8, 18, 14,
-                                                                                ),
-                                                                            ),
-                                                                        );
-                                                                    } else {
-                                                                        painter.text(
-                                                                            status_center,
-                                                                            egui::Align2::CENTER_CENTER,
-                                                                            icon,
-                                                                            egui::FontId::proportional(
-                                                                                10.0,
-                                                                            ),
-                                                                            egui::Color32::from_rgb(
-                                                                                18, 16, 10,
-                                                                            ),
-                                                                        );
-                                                                    }
-                                                                }
-                                                                BatchStatus::Aligning
-                                                                | BatchStatus::Rendering => {
-                                                                    painter.circle_stroke(
-                                                                        status_center,
-                                                                        11.5,
-                                                                        egui::Stroke::new(
-                                                                            1.5, accent,
-                                                                        ),
-                                                                    );
-                                                                    painter.circle_filled(
-                                                                        status_center,
-                                                                        4.0,
-                                                                        accent,
-                                                                    );
-                                                                }
-                                                                BatchStatus::ReadyToRender => {
-                                                                    painter.circle_filled(
-                                                                        status_center,
-                                                                        8.0,
-                                                                        egui::Color32::from_rgb(
-                                                                            246, 181, 70,
-                                                                        ),
-                                                                    );
-                                                                    painter.text(
-                                                                        status_center,
-                                                                        egui::Align2::CENTER_CENTER,
-                                                                        "R",
-                                                                        egui::FontId::monospace(8.0),
-                                                                        egui::Color32::from_rgb(
-                                                                            18, 16, 10,
-                                                                        ),
-                                                                    );
-                                                                }
-                                                                BatchStatus::Error(_) => {
-                                                                    painter.circle_filled(
-                                                                        status_center,
-                                                                        8.0,
-                                                                        egui::Color32::from_rgb(
-                                                                            255, 100, 100,
-                                                                        ),
-                                                                    );
-                                                                    painter.text(
-                                                                        status_center,
-                                                                        egui::Align2::CENTER_CENTER,
-                                                                        "!",
-                                                                        egui::FontId::proportional(
-                                                                            10.0,
-                                                                        ),
-                                                                        egui::Color32::WHITE,
-                                                                    );
-                                                                }
-                                                                BatchStatus::Ready => {
-                                                                    painter.circle_stroke(
-                                                                        status_center,
-                                                                        8.0,
-                                                                        egui::Stroke::new(
-                                                                            1.0,
-                                                                            egui::Color32::from_rgb(
-                                                                                42, 52, 68,
-                                                                            ),
-                                                                        ),
-                                                                    );
-                                                                }
-                                                                BatchStatus::MissingLyrics => {
-                                                                    painter.circle_filled(
-                                                                        status_center,
-                                                                        8.0,
-                                                                        egui::Color32::from_rgb(
-                                                                            255, 176, 96,
-                                                                        ),
-                                                                    );
-                                                                    painter.text(
-                                                                        status_center,
-                                                                        egui::Align2::CENTER_CENTER,
-                                                                        "T",
-                                                                        egui::FontId::monospace(8.0),
-                                                                        egui::Color32::from_rgb(
-                                                                            24, 18, 8,
-                                                                        ),
-                                                                    );
-                                                                }
-                                                            }
-                                                            let status_hover = item
-                                                                .alignment_quality
-                                                                .as_ref()
-                                                                .map(|quality| quality.tooltip())
-                                                                .unwrap_or_else(|| match &item.status {
-                                                                    BatchStatus::Done => {
-                                                                        "Готово".to_string()
-                                                                    }
-                                                                    BatchStatus::ReadyToRender => {
-                                                                        "Тайминги готовы к рендеру".to_string()
-                                                                    }
-                                                                    BatchStatus::Aligning => {
-                                                                        "Создание таймингов".to_string()
-                                                                    }
-                                                                    BatchStatus::Rendering => {
-                                                                        "Рендеринг видео".to_string()
-                                                                    }
-                                                                    BatchStatus::MissingLyrics => {
-                                                                        "Нет файла текста".to_string()
-                                                                    }
-                                                                    BatchStatus::Ready => {
-                                                                        "Готово к обработке".to_string()
-                                                                    }
-                                                                    BatchStatus::Error(err) => {
-                                                                        format!("Ошибка: {err}")
-                                                                    }
-                                                                });
-                                                            ui.interact(
-                                                                status_rect,
-                                                                ui.id().with((
-                                                                    "batch-status",
-                                                                    idx,
-                                                                )),
-                                                                egui::Sense::hover(),
-                                                            )
-                                                            .on_hover_text(status_hover);
-                                                            painter.rect_filled(
-                                                                remove_rect,
-                                                                9.0,
-                                                                egui::Color32::from_rgb(
-                                                                    34, 24, 28,
-                                                                ),
-                                                            );
-                                                            painter.text(
-                                                                remove_rect.center(),
-                                                                egui::Align2::CENTER_CENTER,
-                                                                "×",
-                                                                egui::FontId::proportional(13.0),
-                                                                egui::Color32::from_rgb(
-                                                                    205, 178, 184,
-                                                                ),
-                                                            );
-                                                            let remove_response = ui
-                                                                .interact(
-                                                                    remove_rect,
-                                                                    ui.id().with((
-                                                                        "batch-remove",
-                                                                        idx,
-                                                                    )),
-                                                                    egui::Sense::click(),
-                                                                )
-                                                                .on_hover_text(
-                                                                    "Убрать из текущего списка",
-                                                                );
-                                                            if remove_response.clicked()
-                                                                && !self.batch_running
-                                                                && !self.is_generating
-                                                            {
-                                                                remove_request = Some(idx);
-                                                            }
-                                                            let click_rect =
-                                                                egui::Rect::from_min_max(
-                                                                    row_response.rect.min,
-                                                                    egui::pos2(
-                                                                        row_response.rect.right()
-                                                                            - 94.0,
-                                                                        row_response.rect.bottom(),
-                                                                    ),
-                                                                );
-                                                            let response = ui.interact(
-                                                                click_rect,
-                                                                ui.id().with(("batch-row", idx)),
-                                                                egui::Sense::click(),
-                                                            );
-
-                                                            if response.clicked() {
-                                                                select_request = Some(idx);
-                                                            }
-
-                                                            if selected {
-                                                                egui::Frame::none()
-                                                                    .fill(egui::Color32::from_rgb(
-                                                                        10, 13, 19,
-                                                                    ))
-                                                                    .stroke(egui::Stroke::new(
-                                                                        1.0,
-                                                                        egui::Color32::from_rgb(
-                                                                            48, 58, 76,
-                                                                        ),
-                                                                    ))
-                                                                    .rounding(6.0)
-                                                                    .inner_margin(10.0)
-                                                                    .show(ui, |ui| {
-                                                                        ui.set_min_width(
-                                                                            list_inner_width - 30.0,
-                                                                        );
-                                                                        let duration_ms = item
-                                                                            .duration_ms
-                                                                            .max(1000);
-                                                                        if self.batch_running
-                                                                            || self.is_generating
-                                                                        {
-                                                                            batch_trim_timeline_static_ui(
-                                                                                ui, &item, accent,
-                                                                                success, muted,
-                                                                            );
-                                                                        } else {
-                                                                            self.trim_timeline_ui(
-                                                                                ui,
-                                                                                duration_ms,
-                                                                                accent,
-                                                                                success,
-                                                                                muted,
-                                                                            );
-                                                                        }
-                                                                        ui.horizontal(|ui| {
-                                                                            if let Some(quality) =
-                                                                                &item.alignment_quality
-                                                                            {
-                                                                                ui.label(
-                                                                                    egui::RichText::new(
-                                                                                        quality.log_text(),
-                                                                                    )
-                                                                                    .color(quality.color())
-                                                                                    .size(11.0),
-                                                                                );
-                                                                                if let Some(path) =
-                                                                                    &quality.report_path
-                                                                                    && ui
-                                                                                        .button("Открыть отчёт")
-                                                                                        .on_hover_text(path)
-                                                                                        .clicked()
-                                                                                {
-                                                                                    open_path(Path::new(path));
-                                                                                }
-                                                                            }
-                                                                            ui.with_layout(
-                                                                                egui::Layout::right_to_left(
-                                                                                    egui::Align::Center,
-                                                                                ),
-                                                                                |ui| {
-                                                                                    let is_playing = self
-                                                                                        .is_preview_playing();
-                                                                                    if ui
-                                                                                        .add_enabled(
-                                                                                            !self.batch_running
-                                                                                                && !self.is_generating,
-                                                                                            egui::Button::new(if is_playing {
-                                                                                                "Стоп"
-                                                                                            } else {
-                                                                                                "Прослушать"
-                                                                                            }),
-                                                                                        )
-                                                                                        .clicked()
-                                                                                    {
-                                                                                        if is_playing {
-                                                                                            self.stop_preview();
-                                                                                            self.trim_status = "Предпросмотр остановлен.".to_string();
-                                                                                        } else {
-                                                                                            self.preview_trimmed_audio();
-                                                                                        }
-                                                                                    }
-                                                                                    if ui
-                                                                                        .add_enabled(
-                                                                                            !self.batch_running
-                                                                                                && !self.is_generating,
-                                                                                            egui::Button::new("Сбросить"),
-                                                                                        )
-                                                                                        .clicked()
-                                                                                    {
-                                                                                        self.stop_preview();
-                                                                                        self.trim_start_ms = 0;
-                                                                                        self.trim_end_ms = duration_ms;
-                                                                                        self.trim_playhead_ms = 0;
-                                                                                        self.fade_in_ms = 0;
-                                                                                        self.fade_out_ms = 0;
-                                                                                        self.trim_status = format!(
-                                                                                            "Обрезка сброшена: {}",
-                                                                                            ffmpeg::format_time_ms(duration_ms)
-                                                                                        );
-                                                                                    }
-                                                                                },
-                                                                            );
-                                                                        });
-                                                                        if let Some(audit) =
-                                                                            &item.audit
-                                                                        {
-                                                                            ui.add_space(4.0);
-                                                                            ui.label(
-                                                                                egui::RichText::new(
-                                                                                    format!(
-                                                                                        "Аудит пакета: {} — {}",
-                                                                                        audit.level
-                                                                                            .label(),
-                                                                                        audit.summary
-                                                                                    ),
-                                                                                )
-                                                                                .size(11.0)
-                                                                                .color(
-                                                                                    audit
-                                                                                        .level
-                                                                                        .color(),
-                                                                                ),
-                                                                            );
-                                                                            for issue in audit
-                                                                                .issues
-                                                                                .iter()
-                                                                                .skip(1)
-                                                                                .take(4)
-                                                                            {
-                                                                                ui.label(
-                                                                                    egui::RichText::new(
-                                                                                        format!(
-                                                                                            "• {}",
-                                                                                            issue
-                                                                                        ),
-                                                                                    )
-                                                                                    .size(10.5)
-                                                                                    .color(muted),
-                                                                                );
-                                                                            }
-                                                                        }
-                                                                        if !self.trim_status.is_empty() {
-                                                                            ui.label(
-                                                                                egui::RichText::new(
-                                                                                    &self
-                                                                                        .trim_status,
-                                                                                )
-                                                                                .size(10.5)
-                                                                                .color(muted),
-                                                                            );
-                                                                        }
-                                                                        if !self.batch_running
-                                                                            && !self.is_generating
-                                                                            && let Some(item_mut) =
-                                                                                self.batch_items
-                                                                                    .get_mut(idx)
-                                                                            {
-                                                                                item_mut
-                                                                                    .trim_start_ms =
-                                                                                    self.trim_start_ms;
-                                                                                item_mut
-                                                                                    .trim_end_ms =
-                                                                                    self.trim_end_ms;
-                                                                                item_mut
-                                                                                    .fade_in_ms =
-                                                                                    self.fade_in_ms;
-                                                                                item_mut
-                                                                                    .fade_out_ms =
-                                                                                    self.fade_out_ms;
-                                                                            }
-                                                                    });
-                                                            }
-                                                            ui.add_space(4.0);
-                                                        }
-                                                    });
-                                            },
-                                        );
-                                    },
-                                );
-
-                                ui.add_space(column_gap);
-
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(column_width, column_height),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        if let Some(index) = select_request {
-                                            self.batch_selected_index = Some(index);
-                                            let _ = self.apply_batch_item_to_single_state(index);
-                                        }
-
-                                        let index = self
-                                            .batch_selected_index
-                                            .filter(|idx| *idx < self.batch_items.len())
-                                            .unwrap_or(0);
-                                        let item_snapshot = self.batch_items[index].clone();
-                                        let name = if item_snapshot.artist.is_empty() {
-                                            item_snapshot.title.clone()
-                                        } else {
-                                            format!(
-                                                "{} - {}",
-                                                item_snapshot.artist, item_snapshot.title
-                                            )
-                                        };
-
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("Текст")
-                                                    .strong()
-                                                    .size(14.0)
-                                                    .color(text),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "{:03}",
-                                                            index + 1
-                                                        ))
-                                                        .monospace()
-                                                        .size(12.0)
-                                                        .color(muted),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(6.0);
-
-                                        let (body_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(column_width, body_height),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            body_rect,
-                                            6.0,
-                                            egui::Color32::from_rgb(12, 15, 21),
-                                        );
-                                        ui.painter().rect_stroke(
-                                            body_rect,
-                                            6.0,
-                                            egui::Stroke::new(
-                                                1.0,
-                                                egui::Color32::from_rgb(34, 40, 52),
-                                            ),
-                                        );
-                                        let inner_rect = body_rect.shrink(10.0);
-                                        ui.allocate_new_ui(
-                                            egui::UiBuilder::new().max_rect(inner_rect),
-                                            |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(name)
-                                                        .strong()
-                                                        .size(14.0)
-                                                        .color(text),
-                                                );
-                                                let lyrics_path_label =
-                                                    if item_snapshot.lyrics_path.as_os_str().is_empty() {
-                                                        "LRC/TXT не найден".to_string()
-                                                    } else {
-                                                        item_snapshot.lyrics_path.to_string_lossy().to_string()
-                                                    };
-                                                ui.label(
-                                                    egui::RichText::new(lyrics_path_label)
-                                                        .size(10.0)
-                                                        .color(muted),
-                                                );
-                                                ui.add_space(8.0);
-                                                let text_top = ui.cursor().top();
-                                                let text_height =
-                                                    (inner_rect.bottom() - text_top).max(160.0);
-                                                egui::ScrollArea::vertical()
-                                                    .id_salt("batch_lyrics_text_simple")
-                                                    .max_height(text_height)
-                                                    .auto_shrink([false, false])
-                                                    .show(ui, |ui| {
-                                                        let edit_response = ui.add(
-                                                            egui::TextEdit::multiline(&mut self.lyrics)
-                                                                .font(egui::TextStyle::Monospace)
-                                                                .desired_width(ui.available_width())
-                                                                .desired_rows(16)
-                                                        );
-                                                        if edit_response.changed()
-                                                            && let Some(selected_idx) = self.batch_selected_index
-                                                                && let Some(item) = self.batch_items.get_mut(selected_idx) {
-                                                                    let path = if item.lyrics_path.as_os_str().is_empty() {
-                                                                        item.folder.join("lyrics.txt")
-                                                                    } else {
-                                                                        item.lyrics_path.clone()
-                                                                    };
-                                                                    if std::fs::write(&path, &self.lyrics).is_ok() {
-                                                                        item.lyrics_path = path;
-                                                                        if item.status == BatchStatus::MissingLyrics
-                                                                            && !self.lyrics.trim().is_empty()
-                                                                        {
-                                                                            item.status = BatchStatus::Ready;
-                                                                            item.progress = 0.0;
-                                                                        }
-                                                                    }
-                                                                }
-                                                    });
-                                            },
-                                        );
-                                    },
-                                );
-                            });
-
-                            if let Some(index) = remove_request
-                                && index < self.batch_items.len()
-                                    && !self.batch_running
-                                    && !self.is_generating
-                                {
-                                    self.batch_items.remove(index);
-                                    self.batch_selected_index = if self.batch_items.is_empty() {
-                                        None
-                                    } else {
-                                        Some(index.min(self.batch_items.len() - 1))
-                                    };
-                                    if let Some(selected) = self.batch_selected_index {
-                                        let _ = self.apply_batch_item_to_single_state(selected);
-                                    } else {
-                                        self.audio_path = None;
-                                        self.lyrics.clear();
-                                    }
-                                }
-                        }
-                    });
-                    ui.add_space(page_margin);
-                });
+                self.batch_workspace_ui(ui, ctx);
             } else if self.active_tab == ActiveTab::Downloader {
                 let batch_margin = 14.0;
                 let content_width = ui.available_width() - batch_margin * 2.0;
@@ -5969,9 +4629,9 @@ impl eframe::App for KaraokeApp {
 
                                             if ui.add_enabled(
                                                 can_start,
-                                                egui::Button::new(egui::RichText::new("▶ Начать заново").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
+                                                egui::Button::new(egui::RichText::new("▶ Начать заново").strong()).fill(egui::Color32::from_rgb(76, 121, 195))
                                             ).clicked() {
-                                                self.start_download(ctx, false);
+                                                self.start_download(ctx, false, false);
                                             }
 
                                             let has_incomplete = self.dl_tracks.iter().any(|t| {
@@ -5983,7 +4643,7 @@ impl eframe::App for KaraokeApp {
                                                 can_continue,
                                                 egui::Button::new(egui::RichText::new("⏯ Продолжить").strong()).fill(egui::Color32::from_rgb(34, 197, 94))
                                             ).clicked() {
-                                                self.start_download(ctx, true);
+                                                self.start_download(ctx, true, false);
                                             }
                                         }
 
@@ -6196,16 +4856,23 @@ impl eframe::App for KaraokeApp {
                     } else {
                         // ОДИНОЧНЫЙ РЕЖИМ (Старый одноколоночный макет)
                         ui.vertical(|ui| {
-                            ui.set_width(content_width.max(520.0));
+                            ui.set_width(content_width.max(280.0));
                             card_frame.show(ui, |ui| {
-                                let inner_width = (content_width - 36.0).max(760.0);
-                                ui.set_min_width(inner_width);
+                                let inner_width = ui.available_width().max(240.0);
+                                ui.set_width(inner_width);
 
                                 ui.label(
-                                    egui::RichText::new("Загрузчик аудио")
+                                    egui::RichText::new("Поиск и проверка аудио")
                                         .strong()
                                         .size(18.0)
                                         .color(text),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Безопасный режим только анализирует кандидатов, проверяет совпадение и доступность URL — без загрузки файлов.",
+                                    )
+                                    .size(12.0)
+                                    .color(muted),
                                 );
                                 ui.add_space(14.0);
 
@@ -6222,15 +4889,77 @@ impl eframe::App for KaraokeApp {
                                 ui.add_space(12.0);
 
                                 // Одиночный трек
-                                ui.horizontal(|ui| {
-                                    ui.label("Название трека/запрос:");
-                                    ui.text_edit_singleline(&mut self.dl_track_query);
-                                });
-                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new("Исполнитель и название").strong().color(text));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.dl_track_query)
+                                        .hint_text("Например: Земфира — Искала")
+                                        .margin(egui::vec2(10.0, 9.0))
+                                        .desired_width(ui.available_width()),
+                                );
+                                ui.add_space(12.0);
+
+                                let has_query = !self.dl_track_query.trim().is_empty();
+                                if self.dl_is_running {
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(ui.available_width(), 40.0),
+                                            egui::Button::new(
+                                                egui::RichText::new("Остановить текущую операцию").strong(),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.request_stop_download();
+                                    }
+                                } else {
+                                    let search_button = egui::Button::new(
+                                        egui::RichText::new("Найти и проверить — без загрузки")
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(76, 121, 195))
+                                    .rounding(8.0);
+                                    if ui
+                                        .add_enabled_ui(has_query, |ui| {
+                                            ui.add_sized(
+                                                egui::vec2(ui.available_width(), 42.0),
+                                                search_button,
+                                            )
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.start_download(ctx, false, true);
+                                    }
+                                }
+                                if !has_query {
+                                    ui.label(
+                                        egui::RichText::new("Введите запрос, чтобы начать проверку.")
+                                            .size(11.0)
+                                            .color(muted),
+                                    );
+                                }
+                                ui.add_space(18.0);
+                                ui.separator();
+                                ui.add_space(14.0);
+                                ui.label(
+                                    egui::RichText::new("Загрузка проверенного варианта")
+                                        .strong()
+                                        .size(14.0)
+                                        .color(text),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Необязательный следующий шаг. Используйте только для материалов, на которые у вас есть права.",
+                                    )
+                                    .size(11.0)
+                                    .color(muted),
+                                );
+                                ui.add_space(8.0);
 
                                 // Папка сохранения
                                 ui.horizontal(|ui| {
-                                    ui.label("Папка для сохранения:");
+                                    ui.label("Папка:");
                                     if ui.button("Выбрать папку").clicked() && !self.dl_is_running
                                         && let Some(path) = rfd::FileDialog::new().pick_folder() {
                                             self.dl_output_dir = Some(path);
@@ -6238,7 +4967,7 @@ impl eframe::App for KaraokeApp {
                                     if let Some(path) = &self.dl_output_dir {
                                         ui.label(path.to_string_lossy());
                                     } else {
-                                        ui.label("Папка не выбрана");
+                                        ui.label(egui::RichText::new("не выбрана").color(muted));
                                     }
                                 });
                                 ui.add_space(12.0);
@@ -6260,46 +4989,281 @@ impl eframe::App for KaraokeApp {
                                 });
                                 ui.add_space(16.0);
 
-                                // Кнопки
-                                ui.horizontal(|ui| {
-                                    if self.dl_is_running {
-                                        if ui.button(egui::RichText::new("⏹ Остановить загрузку").strong()).clicked() {
-                                            self.request_stop_download();
-                                        }
-                                    } else {
-                                        let can_start = !self.dl_track_query.trim().is_empty()
-                                            && self.dl_output_dir.is_some();
-
-                                        if ui.add_enabled(
-                                            can_start,
-                                            egui::Button::new(egui::RichText::new("Начать загрузку").strong()).fill(egui::Color32::from_rgb(45, 118, 255))
-                                        ).clicked() {
-                                            self.start_download(ctx, false);
-                                        }
+                                if !self.dl_is_running {
+                                    let can_download = has_query && self.dl_output_dir.is_some();
+                                    if ui
+                                        .add_enabled(
+                                            can_download,
+                                            egui::Button::new(
+                                                egui::RichText::new("Скачать лучший проверенный вариант")
+                                                    .strong(),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.start_download(ctx, false, false);
                                     }
-
-                                    if ui.button("Очистить лог").clicked() {
-                                        self.dl_log_output.clear();
-                                    }
-                                });
+                                }
                                 ui.add_space(14.0);
 
-                                // Поле логов и статус
-                                ui.label(egui::RichText::new(&self.dl_status_text).strong().color(accent));
-                                ui.add_space(8.0);
-
-                                let logs_height = (ui.available_height() - 36.0).max(200.0);
-                                egui::ScrollArea::vertical()
-                                    .max_height(logs_height)
-                                    .id_salt("dl_log_scroll_single")
-                                    .show(ui, |ui| {
-                                        ui.add(
-                                            egui::TextEdit::multiline(&mut self.dl_log_output)
-                                                .font(egui::TextStyle::Monospace)
-                                                .desired_width(f32::INFINITY)
-                                                .desired_rows(12)
-                                                .lock_focus(true)
+                                ui.label(
+                                    egui::RichText::new(&self.dl_status_text)
+                                        .strong()
+                                        .color(if self.dl_status_text.contains("Ошибка") {
+                                            egui::Color32::from_rgb(239, 96, 96)
+                                        } else {
+                                            accent
+                                        }),
+                                );
+                                if let Some(report) = self.dl_search_result.clone() {
+                                    ui.add_space(10.0);
+                                    let providers_ok = report
+                                        .providers
+                                        .iter()
+                                        .filter(|provider| provider.status == "ok")
+                                        .count();
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} — {}",
+                                                report.track.artists.join(", "),
+                                                report.track.title
+                                            ))
+                                            .strong()
+                                            .size(14.0)
+                                            .color(text),
                                         );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} · {} источников",
+                                                        format_audio_duration(report.track.duration_sec),
+                                                        providers_ok
+                                                    ))
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(muted),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+
+                                    if let Some(candidate) = report.selected.clone() {
+                                        let verified = candidate.public_url_ok == Some(true);
+                                        let candidate_color = if verified && candidate.flags.is_empty() {
+                                            success
+                                        } else {
+                                            egui::Color32::from_rgb(246, 181, 70)
+                                        };
+                                        egui::Frame::none()
+                                            .fill(egui::Color32::from_rgb(22, 29, 39))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, 20,
+                                                ),
+                                            ))
+                                            .rounding(12.0)
+                                            .inner_margin(14.0)
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new("Лучший доступный вариант")
+                                                                .size(11.0)
+                                                                .strong()
+                                                                .color(candidate_color),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(&candidate.title)
+                                                                .strong()
+                                                                .size(14.0)
+                                                                .color(text),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{} · {} · {}",
+                                                                candidate.artists.join(", "),
+                                                                audio_source_label(&candidate.source),
+                                                                format_audio_duration(candidate.duration_sec)
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(muted),
+                                                        );
+                                                    });
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(egui::Align::Center),
+                                                        |ui| {
+                                                            ui.vertical(|ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(format!(
+                                                                        "{:.0}%",
+                                                                        candidate.score
+                                                                    ))
+                                                                    .monospace()
+                                                                    .strong()
+                                                                    .size(17.0)
+                                                                    .color(candidate_color),
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(if verified {
+                                                                        "URL проверен"
+                                                                    } else {
+                                                                        "URL не подтверждён"
+                                                                    })
+                                                                    .size(10.0)
+                                                                    .color(muted),
+                                                                );
+                                                            });
+                                                        },
+                                                    );
+                                                });
+                                                if !candidate.flags.is_empty() {
+                                                    ui.add_space(8.0);
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "Обратите внимание: {}",
+                                                            candidate.flags.join(", ")
+                                                        ))
+                                                        .size(10.5)
+                                                        .color(candidate_color),
+                                                    );
+                                                }
+                                                if let Some(url) = &candidate.public_url {
+                                                    ui.add_space(10.0);
+                                                    if ui
+                                                        .add_sized(
+                                                            egui::vec2(150.0, 40.0),
+                                                            egui::Button::new("Открыть страницу"),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        open_url(url);
+                                                    }
+                                                }
+                                            });
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("Подходящий доступный вариант не найден.")
+                                                .color(egui::Color32::from_rgb(246, 181, 70)),
+                                        );
+                                    }
+
+                                    let alternatives: Vec<_> = report
+                                        .candidates
+                                        .iter()
+                                        .filter(|candidate| {
+                                            report
+                                                .selected
+                                                .as_ref()
+                                                .map(|selected| selected.rank != candidate.rank)
+                                                .unwrap_or(true)
+                                        })
+                                        .take(4)
+                                        .cloned()
+                                        .collect();
+                                    if !alternatives.is_empty() {
+                                        ui.add_space(8.0);
+                                        egui::CollapsingHeader::new(format!(
+                                            "Другие варианты ({})",
+                                            alternatives.len()
+                                        ))
+                                        .id_salt("audio_search_alternatives")
+                                        .show(ui, |ui| {
+                                            for candidate in alternatives {
+                                                egui::Frame::none()
+                                                    .fill(egui::Color32::from_rgb(16, 20, 27))
+                                                    .rounding(8.0)
+                                                    .inner_margin(egui::vec2(10.0, 8.0))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.vertical(|ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(&candidate.title)
+                                                                        .size(11.5)
+                                                                        .color(text),
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(format!(
+                                                                        "{} · {}",
+                                                                        audio_source_label(&candidate.source),
+                                                                        format_audio_duration(candidate.duration_sec)
+                                                                    ))
+                                                                    .size(10.0)
+                                                                    .color(muted),
+                                                                );
+                                                            });
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!(
+                                                                            "{:.0}%",
+                                                                            candidate.score
+                                                                        ))
+                                                                        .monospace()
+                                                                        .color(muted),
+                                                                    );
+                                                                },
+                                                            );
+                                                        });
+                                                    });
+                                                ui.add_space(4.0);
+                                            }
+                                        });
+                                    }
+
+                                    let safe = !report.safe_mode.download_performed
+                                        && !report.safe_mode.direct_media_url_requested;
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(if safe {
+                                            "✓ Безопасный режим: медиафайлы и прямые ссылки не запрашивались"
+                                        } else {
+                                            "Проверьте границы безопасного режима"
+                                        })
+                                        .size(10.5)
+                                        .color(if safe { success } else { muted }),
+                                    );
+                                }
+                                ui.add_space(6.0);
+                                egui::CollapsingHeader::new("Технические детали")
+                                    .id_salt("dl_log_details_single")
+                                    .default_open(self.dl_is_running)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Диагностика источников и оценки совпадения")
+                                                    .size(11.0)
+                                                    .color(muted),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("Очистить").clicked() {
+                                                        self.dl_log_output.clear();
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        egui::ScrollArea::vertical()
+                                            .max_height(260.0)
+                                            .id_salt("dl_log_scroll_single")
+                                            .stick_to_bottom(self.dl_is_running)
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::TextEdit::multiline(&mut self.dl_log_output)
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .desired_width(f32::INFINITY)
+                                                        .desired_rows(10)
+                                                        .interactive(false),
+                                                );
+                                            });
                                     });
                             });
                         });
@@ -6315,10 +5279,10 @@ impl eframe::App for KaraokeApp {
                 ui.horizontal(|ui| {
                     ui.add_space(batch_margin);
                     ui.vertical(|ui| {
-                        ui.set_width(content_width.max(720.0));
+                        ui.set_width(content_width.max(280.0));
                         ui.set_height(col_height);
                         card_frame.show(ui, |ui| {
-                            ui.set_min_width(content_width - 36.0);
+                            ui.set_width(ui.available_width().max(240.0));
                             ui.set_min_height(col_height - 36.0);
 
                             ui.label(
@@ -6406,7 +5370,7 @@ impl eframe::App for KaraokeApp {
                                             egui::RichText::new("Оптимизировать презентацию")
                                                 .strong(),
                                         )
-                                        .fill(egui::Color32::from_rgb(45, 118, 255)),
+                                        .fill(egui::Color32::from_rgb(76, 121, 195)),
                                     )
                                     .clicked()
                                 {
@@ -6490,765 +5454,25 @@ impl eframe::App for KaraokeApp {
                     ui.add_space(batch_margin);
                 });
             } else {
-            let total_width = ui.available_width();
-            let spacing = 18.0;
-            let col_width = ((total_width - page_margin * 2.0) - spacing) / 2.0;
+                self.single_workspace_ui(ui, ctx);
 
-            let result_height = if self.generated_file.is_some() {
-                (ui.available_height() * 0.48).clamp(320.0, 520.0)
-            } else {
-                0.0
-            };
-            let main_height = (ui.available_height() - result_height - 18.0).max(220.0);
-
-            ui.horizontal(|ui| {
-                ui.add_space(page_margin);
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col_width, main_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("left_settings_scroll")
-                            .max_height(main_height)
-                            .show(ui, |ui| {
-                                card_frame.show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Исходник").strong().size(16.0).color(text));
-                                    ui.label(egui::RichText::new("MP3-файл, исполнитель и название").size(12.0).color(muted));
-                                    ui.add_space(12.0);
-
-                                    drop_zone_frame.show(ui, |ui| {
-                                        ui.vertical_centered(|ui| {
-                                            let picker_text = match &self.audio_path {
-                                                Some(path) => format!("Выбран файл: {}", std::path::Path::new(path).file_name().unwrap().to_string_lossy()),
-                                                None => "Перетащите MP3 сюда или выберите файл".to_string(),
-                                            };
-
-                                            let text_color = if self.audio_path.is_some() {
-                                                success
-                                            } else {
-                                                egui::Color32::from_rgb(198, 205, 216)
-                                            };
-
-                                            let file_btn = egui::Button::new(
-                                                egui::RichText::new(picker_text)
-                                                    .color(text_color)
-                                                    .strong()
-                                                    .size(12.0)
-                                            )
-                                            .fill(egui::Color32::TRANSPARENT)
-                                            .min_size(egui::vec2(ui.available_width(), 34.0));
-
-                                            if ui.add(file_btn).clicked() && !self.is_generating
-                                                && let Some(path) = rfd::FileDialog::new()
-                                                    .add_filter("Аудио", &["mp3"])
-                                                    .pick_file()
-                                                {
-                                                    self.set_audio_file(path, ctx);
-                                                }
-
-                                            if self.audio_path.is_some() {
-                                                ui.add_space(4.0);
-                                                ui.label(egui::RichText::new("Название и исполнитель заполнены из имени файла, если найден формат Artist - Title.").size(11.0).color(muted));
-                                            }
-                                        });
-                                    });
-                                    ui.add_space(16.0);
-
-                                    if self.audio_path.is_some() {
-                                        ui.label(
-                                            egui::RichText::new("Обрезка аудио")
-                                                .strong()
-                                                .size(14.0)
-                                                .color(text),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Выберите рабочий фрагмент и прослушайте его перед генерацией.",
-                                            )
-                                            .size(12.0)
-                                            .color(muted),
-                                        );
-                                        ui.add_space(8.0);
-
-                                        if let Some(duration_ms) = self.audio_duration_ms {
-                                            self.trim_timeline_ui(
-                                                ui,
-                                                duration_ms,
-                                                accent,
-                                                success,
-                                                muted,
-                                            );
-                                            ui.add_space(4.0);
-
-                                            ui.horizontal(|ui| {
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        let is_playing = self.is_preview_playing();
-                                                        if is_playing {
-                                                            if ui
-                                                                .add_enabled(
-                                                                    !self.is_generating,
-                                                                    egui::Button::new("Стоп"),
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                self.stop_preview();
-                                                                self.trim_status =
-                                                                    "Предпросмотр остановлен."
-                                                                        .to_string();
-                                                            }
-                                                        } else if ui
-                                                            .add_enabled(
-                                                                !self.is_generating,
-                                                                egui::Button::new(
-                                                                    "Прослушать с позиции",
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.preview_trimmed_audio();
-                                                        }
-                                                        if ui
-                                                            .add_enabled(
-                                                                !self.is_generating,
-                                                                egui::Button::new("Сбросить"),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.stop_preview();
-                                                            self.trim_start_ms = 0;
-                                                            self.trim_end_ms = duration_ms;
-                                                            self.trim_playhead_ms = 0;
-                                                            self.fade_in_ms = 0;
-                                                            self.fade_out_ms = 0;
-                                                            self.trim_status = format!(
-                                                                "Обрезка сброшена: {}",
-                                                                ffmpeg::format_time_ms(duration_ms)
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                        }
-
-                                        if !self.trim_status.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new(&self.trim_status)
-                                                    .size(11.0)
-                                                    .color(muted),
-                                            );
-                                        }
-
-                                        ui.add_space(18.0);
-                                        ui.separator();
-                                        ui.add_space(18.0);
-                                    }
-
-                                    ui.label(egui::RichText::new("Метаданные").strong().size(14.0).color(text));
-                                    ui.add_space(8.0);
-                                    ui.horizontal(|ui| {
-                                        ui.add(egui::TextEdit::singleline(&mut self.artist)
-                                            .hint_text("Исполнитель")
-                                            .margin(egui::vec2(10.0, 8.0))
-                                            .desired_width(ui.available_width() * 0.47));
-                                        ui.add_space(10.0);
-                                        ui.add(egui::TextEdit::singleline(&mut self.title)
-                                            .hint_text("Название песни")
-                                            .margin(egui::vec2(10.0, 8.0))
-                                            .desired_width(ui.available_width()));
-                                    });
-
-                                    ui.add_space(18.0);
-                                    ui.separator();
-                                    ui.add_space(18.0);
-
-                                    ui.label(egui::RichText::new("Рендер").strong().size(16.0).color(text));
-                                    ui.label(egui::RichText::new("Модель, качество и шрифт будущего видео").size(12.0).color(muted));
-                                    ui.add_space(8.0);
-                                    egui::Grid::new("settings_grid")
-                                        .num_columns(2)
-                                        .spacing([14.0, 12.0])
-                                        .show(ui, |ui| {
-                                            ui.label(egui::RichText::new("Модель Whisper").color(muted));
-                                            egui::ComboBox::from_id_salt("model_combo")
-                                                .selected_text(match self.model.as_str() {
-                                                    "medium" => "medium (1.5 GB)",
-                                                    "small" => "small (460 MB)",
-                                                    _ => "base (140 MB)",
-                                                })
-                                                .width(ui.available_width() - 10.0)
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(&mut self.model, "base".to_string(), "base (140 MB)");
-                                                    ui.selectable_value(&mut self.model, "small".to_string(), "small (460 MB)");
-                                                    ui.selectable_value(&mut self.model, "medium".to_string(), "medium (1.5 GB)");
-                                                });
-                                            ui.end_row();
-
-                                            ui.label(egui::RichText::new("Качество").color(muted));
-                                            egui::ComboBox::from_id_salt("quality_combo")
-                                                .selected_text(match self.quality.as_str() {
-                                                    "ultra" => "Ультра HD",
-                                                    "high" => "Высокое",
-                                                    _ => "Стандартное",
-                                                })
-                                                .width(ui.available_width() - 10.0)
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(&mut self.quality, "medium".to_string(), "Стандартное");
-                                                    ui.selectable_value(&mut self.quality, "high".to_string(), "Высокое");
-                                                    ui.selectable_value(&mut self.quality, "ultra".to_string(), "Ультра HD");
-                                                });
-                                            ui.end_row();
-
-                                            ui.label(egui::RichText::new("Шрифт").color(muted));
-                                            egui::ComboBox::from_id_salt("font_combo")
-                                                .selected_text(font_display_name(&self.font))
-                                                .width(ui.available_width() - 10.0)
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(&mut self.font, "montserrat".to_string(), "Montserrat");
-                                                });
-                                            ui.end_row();
-                                        });
-
-                                    ui.add_space(18.0);
-                                    ui.separator();
-                                    ui.add_space(18.0);
-
-                                    ui.label(egui::RichText::new("Внешний вид и тайминг").strong().size(16.0).color(text));
-                                    ui.label(egui::RichText::new("Цвета субтитров и ручная поправка синхронизации").size(12.0).color(muted));
-                                    ui.add_space(8.0);
-
-                                    ui.horizontal(|ui| {
-                                        ui.color_edit_button_srgb(&mut self.color_active);
-                                        ui.label(egui::RichText::new("Активный").size(12.0).color(text));
-                                        ui.add_space(12.0);
-                                        ui.color_edit_button_srgb(&mut self.color_inactive);
-                                        ui.label(egui::RichText::new("Будущий").size(12.0).color(text));
-                                        ui.add_space(12.0);
-                                        ui.color_edit_button_srgb(&mut self.color_bg);
-                                        ui.label(egui::RichText::new("Фон").size(12.0).color(text));
-                                    });
-                                    ui.add_space(14.0);
-
-                                    ui.label(egui::RichText::new("Прозрачность соседних строк").color(muted));
-                                    ui.horizontal(|ui| {
-                                        ui.add_sized(
-                                            egui::vec2(ui.available_width() - 90.0, 20.0),
-                                            egui::Slider::new(&mut self.inactive_opacity, 0.0..=1.0).show_value(false)
-                                        );
-                                        ui.label(egui::RichText::new(format!("{}%", (self.inactive_opacity * 100.0).round() as i32)).strong().color(accent));
-                                    });
-                                    ui.add_space(14.0);
-
-                                    ui.label(egui::RichText::new("Сдвиг синхронизации").color(muted));
-                                    ui.horizontal(|ui| {
-                                        ui.add_sized(
-                                            egui::vec2(ui.available_width() - 130.0, 20.0),
-                                            egui::Slider::new(&mut self.audio_delay_ms, -500..=500).show_value(false)
-                                        );
-                                        ui.label(egui::RichText::new(format!("{:+} мс", self.audio_delay_ms)).strong().color(accent));
-                                        ui.add_space(4.0);
-                                        if ui.button("Сброс").clicked() {
-                                            self.audio_delay_ms = 0;
-                                        }
-                                    });
-                                    ui.add_space(12.0);
-                                    ui.checkbox(
-                                        &mut self.plain_lines,
-                                        "Только строки без подсветки слов",
-                                    );
-                                    ui.checkbox(
-                                        &mut self.verify_lrc_with_whisper,
-                                        "Проверять LRC через Whisper даже в режиме строк",
-                                    );
-                                    ui.checkbox(
-                                        &mut self.separate_vocals_for_word_level,
-                                        "Выделять вокал для word-level через Demucs (точнее, но дольше)",
-                                    );
-                                });
-                            });
-                    }
-                );
-
-                ui.add_space(spacing);
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col_width, main_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("right_scroll_area")
-                            .max_height(main_height)
-                            .show(ui, |ui| {
-                                card_frame.show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.label(egui::RichText::new("Текст песни").strong().size(16.0).color(text));
-                                            ui.label(egui::RichText::new("Вставьте текст или перетащите сюда .txt/.lrc файл").size(12.0).color(muted));
-                                        });
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            let lines = self.lyrics.lines().filter(|line| !line.trim().is_empty()).count();
-                                            ui.label(egui::RichText::new(format!("{} строк", lines)).size(12.0).color(muted));
-                                        });
-                                    });
-                                    ui.add_space(8.0);
-
-                                    ui.add(egui::TextEdit::multiline(&mut self.lyrics)
-                                        .hint_text("Вставьте текст песни построчно или перетащите .txt/.lrc файл...")
-                                        .desired_width(ui.available_width())
-                                        .desired_rows(16)
-                                        .font(egui::TextStyle::Monospace));
-
-                                    ui.add_space(8.0);
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                !self.is_generating,
-                                                egui::Button::new(
-                                                    egui::RichText::new("Загрузить .txt/.lrc")
-                                                        .size(12.0)
-                                                        .strong(),
-                                                ),
-                                            )
-                                            .clicked()
-                                            && let Some(path) = rfd::FileDialog::new()
-                                                .add_filter("Текст песни", &["txt", "lrc"])
-                                                .pick_file()
-                                            {
-                                                self.set_lyrics_file(path);
-                                            }
-                                        ui.label(egui::RichText::new("LRC с таймкодами тоже поддерживается.").size(11.0).color(muted));
-                                    });
-                                });
-                                ui.add_space(12.0);
-
-                                card_frame.show(ui, |ui| {
-                                    let is_ready = self.audio_path.is_some() && !self.lyrics.trim().is_empty();
-                                    let btn_text = if self.is_generating { "ГЕНЕРАЦИЯ..." } else { "СГЕНЕРИРОВАТЬ ВИДЕО" };
-
-                                    let btn_color = if self.is_generating {
-                                        egui::Color32::from_rgb(44, 51, 65)
-                                    } else if is_ready {
-                                        egui::Color32::from_rgb(45, 118, 255)
-                                    } else {
-                                        egui::Color32::from_rgb(42, 48, 60)
-                                    };
-
-                                    let gen_btn = egui::Button::new(
-                                        egui::RichText::new(btn_text)
-                                            .strong()
-                                            .size(14.0)
-                                            .color(egui::Color32::WHITE)
-                                    )
-                                    .min_size(egui::vec2(ui.available_width(), 44.0))
-                                    .fill(btn_color)
-                                    .rounding(8.0);
-
-                                    ui.add_enabled_ui(is_ready && !self.is_generating, |ui| {
-                                        if ui.add(gen_btn).clicked() {
-                                            self.start_generation(ctx.clone());
-                                        }
-                                    });
-
-                                    if self.is_generating || self.progress > 0.0 {
-                                        ui.add_space(12.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new(&self.status_text).strong().color(text));
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new(format!("{}%", (self.progress * 100.0) as i32)).strong().color(accent));
-                                            });
-                                        });
-                                        ui.add_space(6.0);
-                                        ui.add(egui::ProgressBar::new(self.progress).animate(self.is_generating));
-
-                                        if !self.is_generating && self.status_text.contains("успешно")
-                                            && let Some(ref file_path) = self.generated_file {
-                                                let path = std::path::PathBuf::from(file_path);
-                                                if path.exists() {
-                                                    ui.add_space(6.0);
-                                                    if ui.button("📁 Открыть папку с видео").clicked() {
-                                                        open_in_explorer(&path);
-                                                    }
-                                                }
-                                            }
-
-                                        ui.add_space(10.0);
-                                        log_frame.show(ui, |ui| {
-                                            egui::ScrollArea::vertical()
-                                                .max_height(100.0)
-                                                .id_salt("log_scroll")
-                                                .stick_to_bottom(true)
-                                                .show(ui, |ui| {
-                                                    ui.add(egui::TextEdit::multiline(&mut self.log_output)
-                                                        .desired_width(ui.available_width())
-                                                        .desired_rows(4)
-                                                        .font(egui::TextStyle::Monospace)
-                                                        .text_color(egui::Color32::from_rgb(150, 196, 255))
-                                                        .interactive(false));
-                                                });
-                                        });
-                                    }
-                                });
-                            });
-                    }
-                );
-
-                ui.add_space(page_margin);
-            });
-
-            if let Some(file_path) = self.generated_file.clone() {
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(page_margin);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width() - page_margin * 2.0, 78.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            card_frame.show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("Видео готово")
-                                                .strong()
-                                                .size(16.0)
-                                                .color(success),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Проверьте результат прямо здесь или сохраните копию в нужное место.",
-                                            )
-                                            .size(12.0)
-                                            .color(muted),
-                                        );
-                                        if !self.video_status.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new(&self.video_status)
-                                                    .size(11.0)
-                                                    .color(muted),
-                                            );
-                                        }
-                                        if let Some((start_ms, end_ms, _duration_ms, true)) =
-                                            self.generated_video_trim_bounds()
-                                        {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Фрагмент: {} - {}",
-                                                    ffmpeg::format_time_ms(start_ms),
-                                                    ffmpeg::format_time_ms(end_ms)
-                                                ))
-                                                .size(11.0)
-                                                .color(muted),
-                                            );
-                                        }
-                                    });
-
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let save_btn = egui::Button::new(
-                                                egui::RichText::new("СОХРАНИТЬ КАК...")
-                                                    .strong()
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(egui::Color32::from_rgb(36, 156, 112))
-                                            .rounding(8.0)
-                                            .min_size(egui::vec2(160.0, 36.0));
-
-                                            if ui.add(save_btn).clicked() {
-                                                let default_name = format!(
-                                                    "{} - {} ({}).mp4",
-                                                    self.artist,
-                                                    self.title,
-                                                    karaoke_output_suffix(self.plain_lines)
-                                                )
-                                                .replace("/", "_")
-                                                .replace("\\", "_");
-
-                                                if let Some(dest_path) = rfd::FileDialog::new()
-                                                    .set_file_name(&default_name)
-                                                    .add_filter("Видео", &["mp4"])
-                                                    .save_file()
-                                                {
-                                                    if let Err(e) = std::fs::copy(
-                                                        file_path.as_str(),
-                                                        dest_path,
-                                                    ) {
-                                                        self.log_output.push_str(&format!(
-                                                            "❌ Ошибка копирования: {}\n",
-                                                            e
-                                                        ));
-                                                    } else {
-                                                        self.log_output.push_str(
-                                                            "✅ Видеоролик успешно сохранен!\n",
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let trim_btn = egui::Button::new(
-                                                egui::RichText::new("ОБРЕЗАТЬ MP4")
-                                                    .strong()
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(egui::Color32::from_rgb(37, 99, 235))
-                                            .rounding(8.0)
-                                            .min_size(egui::vec2(140.0, 36.0));
-                                            let can_trim_video = !self.is_generating
-                                                && self
-                                                    .generated_video_trim_bounds()
-                                                    .map(|(_, _, _, is_trimmed)| is_trimmed)
-                                                    .unwrap_or(false);
-                                            if ui.add_enabled(can_trim_video, trim_btn).clicked() {
-                                                self.start_generated_video_trim(ctx.clone());
-                                            }
-                                        },
-                                    );
-                                });
-                            });
-                        },
-                    );
-                    ui.add_space(page_margin);
-                });
-            }
-
-            if let Some(file_path) = self.generated_file.clone() {
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(page_margin);
-                    let available_width = ui.available_width() - page_margin * 2.0;
-                    let preview_max_height = (result_height - 132.0).clamp(180.0, 380.0);
-                    let preview_size = if let Some(texture) = &self.video_texture {
-                        let texture_size = texture.size_vec2();
-                        let aspect = if texture_size.y > 0.0 {
-                            texture_size.x / texture_size.y
-                        } else {
-                            16.0 / 9.0
-                        };
-                        egui::vec2(available_width, (available_width / aspect).min(preview_max_height))
-                    } else {
-                        egui::vec2(
-                            available_width,
-                            (available_width * 9.0 / 16.0).min(preview_max_height),
-                        )
-                    };
-
-                    card_frame.show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Предпросмотр")
-                                        .strong()
-                                        .size(13.0)
-                                        .color(text),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(if self.is_video_playing() {
-                                                "идет воспроизведение"
-                                            } else {
-                                                "готов к запуску"
-                                            })
-                                            .size(11.0)
-                                            .color(muted),
-                                        );
-                                    },
-                                );
-                            });
-                            ui.add_space(8.0);
-
-                            let (preview_rect, preview_response) =
-                                ui.allocate_exact_size(preview_size, egui::Sense::click());
-                            let painter = ui.painter();
-                            painter.rect_filled(
-                                preview_rect,
-                                8.0,
-                                egui::Color32::from_rgb(8, 10, 14),
-                            );
-
-                            if let Some(texture) = &self.video_texture {
-                                painter.image(
-                                    texture.id(),
-                                    preview_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            } else {
-                                painter.rect_filled(
-                                    preview_rect,
-                                    8.0,
-                                    egui::Color32::from_rgb(8, 10, 14),
-                                );
-                                painter.text(
-                                    egui::pos2(
-                                        preview_rect.center().x,
-                                        preview_rect.center().y + 48.0,
-                                    ),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Нажмите play, чтобы посмотреть видео здесь",
-                                    egui::FontId::proportional(13.0),
-                                    muted,
-                                );
-                            }
-
-                            painter.rect_stroke(
-                                preview_rect,
-                                8.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 58, 74)),
-                            );
-
-                            let is_video_playing = self.is_video_playing();
-                            if !is_video_playing {
-                                painter.circle_filled(preview_rect.center(), 28.0, accent);
-                                painter.text(
-                                    preview_rect.center() + egui::vec2(2.0, 0.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    "▶",
-                                    egui::FontId::proportional(26.0),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-
-                            if preview_response.clicked() && !is_video_playing
-                                && let Err(err) = self.start_video_preview(&file_path, ctx) {
-                                    self.video_status = err;
-                                }
-
-                            let controls_rect = egui::Rect::from_min_max(
-                                egui::pos2(preview_rect.left() + 12.0, preview_rect.bottom() - 54.0),
-                                egui::pos2(preview_rect.right() - 12.0, preview_rect.bottom() - 12.0),
-                            );
-                            painter.rect_filled(
-                                controls_rect,
-                                8.0,
-                                egui::Color32::from_rgba_unmultiplied(12, 16, 24, 232),
-                            );
-
-                            ui.allocate_new_ui(
-                                egui::UiBuilder::new().max_rect(controls_rect.shrink(6.0)),
-                                |ui| {
-                                ui.horizontal_centered(|ui| {
-                                    let is_video_playing = self.is_video_playing();
-                                    let play_label = if is_video_playing { "Пауза" } else { "▶" };
-                                    let play_btn = egui::Button::new(
-                                        egui::RichText::new(play_label)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(if is_video_playing {
-                                        egui::Color32::from_rgb(78, 86, 103)
-                                    } else {
-                                        accent
-                                    })
-                                    .rounding(8.0)
-                                    .min_size(egui::vec2(58.0, 30.0));
-
-                                    if ui.add(play_btn).clicked() {
-                                        if is_video_playing {
-                                            self.pause_video_preview();
-                                        } else if let Err(err) =
-                                            self.start_video_preview(&file_path, ctx)
-                                        {
-                                            self.video_status = err;
-                                        }
-                                    }
-
-                                    let stop_btn = egui::Button::new(
-                                        egui::RichText::new("Стоп")
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(egui::Color32::from_rgb(48, 56, 70))
-                                    .rounding(8.0)
-                                    .min_size(egui::vec2(66.0, 30.0));
-
-                                    if ui.add(stop_btn).clicked() {
-                                        self.stop_video_preview();
-                                    }
-
-                                    let mut position = self
-                                        .video_position_ms
-                                        .clamp(0, self.video_duration_ms.max(0));
-                                    let slider_enabled = self.video_duration_ms > 0;
-                                    let slider_width = (ui.available_width() - 96.0).max(120.0);
-                                    let slider = egui::Slider::new(
-                                        &mut position,
-                                        0..=self.video_duration_ms.max(1),
-                                    )
-                                    .show_value(false);
-
-                                    let slider_response = ui.add_sized(
-                                        egui::vec2(slider_width, 28.0),
-                                        slider.text("Позиция воспроизведения"),
-                                    );
-                                    if slider_enabled && slider_response.changed() {
-                                        self.video_position_ms = position;
-                                        if is_video_playing {
-                                            self.pause_video_preview();
-                                        }
-                                        self.video_status = format!(
-                                            "Позиция: {}.",
-                                            ffmpeg::format_time_ms(self.video_position_ms)
-                                        );
-                                    }
-
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} / {}",
-                                            ffmpeg::format_time_ms(self.video_position_ms),
-                                            if self.video_duration_ms > 0 {
-                                                ffmpeg::format_time_ms(self.video_duration_ms)
-                                            } else {
-                                                "--:--".to_string()
-                                            }
-                                        ))
-                                        .size(12.0)
-                                        .color(muted),
-                                    );
-                                });
-                                },
-                            );
-                        });
-                    });
-                    ui.add_space(page_margin);
-                });
-            }
             }
         });
 
-        // Автосохранение настроек при изменении
-        let new_settings = AppSettings {
-            model: self.model.clone(),
-            quality: self.quality.clone(),
-            font: self.font.clone(),
-            color_active: self.color_active,
-            color_inactive: self.color_inactive,
-            color_bg: self.color_bg,
-            inactive_opacity: self.inactive_opacity,
-            audio_delay_ms: self.audio_delay_ms,
-            fade_in_ms: self.fade_in_ms,
-            fade_out_ms: self.fade_out_ms,
-            artist: self.artist.clone(),
-            title: self.title.clone(),
-            lyrics: self.lyrics.clone(),
-            plain_lines: self.plain_lines,
-            verify_lrc_with_whisper: self.verify_lrc_with_whisper,
-            separate_vocals_for_word_level: self.separate_vocals_for_word_level,
-            batch_overwrite_timings: self.batch_overwrite_timings,
-        };
+        self.workspace_windows(ctx);
 
-        if old_settings != new_settings
-            && let Ok(data) = serde_json::to_string_pretty(&new_settings)
-        {
-            let _ = std::fs::write(paths::settings_path(), data);
+        if self.last_autosave.elapsed() >= Duration::from_secs(1) {
+            self.persist_state();
+            self.last_autosave = Instant::now();
         }
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_state();
+        self.batch_cancel.store(true, Ordering::Release);
+        self.waveform_cancel.store(true, Ordering::Release);
+        self.stop_preview();
+        self.halt_video_preview();
     }
 }
 
@@ -7266,7 +5490,7 @@ fn main() -> eframe::Result {
                 APP_VERSION
             ))
             .with_icon(app_icon())
-            .with_inner_size([1100.0, 750.0])
+            .with_inner_size([1160.0, 820.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
@@ -7333,16 +5557,78 @@ fn update_download_quality_by_pos(tracks: &mut [TrackItem], pos: usize, log_line
             .map(|(_, tail)| tail.trim())
             .unwrap_or(log_line)
             .to_string();
-        t.quality_note = Some(detail.clone());
+        t.quality_note = Some(humanize_download_quality_note(&detail));
         if detail.starts_with("suspicious") {
             t.status = TrackStatus::Warning;
         }
     }
 }
 
+fn humanize_download_quality_note(detail: &str) -> String {
+    let reasons = detail
+        .split_once(';')
+        .map(|(_, tail)| tail.trim())
+        .unwrap_or(detail);
+    if reasons == "clean_match" || detail.starts_with("ok") {
+        return "Совпадение подтверждено".to_string();
+    }
+
+    reasons
+        .split(',')
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| {
+            if let Some(value) = reason.strip_prefix("actual_duration_diff:") {
+                format!(
+                    "Фактическая длительность отличается на {} сек.",
+                    value.trim_end_matches('s')
+                )
+            } else if let Some(value) = reason.strip_prefix("title_match:") {
+                format!("Совпадение названия: {value}%")
+            } else if let Some(value) = reason.strip_prefix("artist_match:") {
+                format!("Совпадение исполнителя: {value}%")
+            } else if let Some(value) = reason.strip_prefix("low_score:") {
+                format!("Низкая общая уверенность: {value}%")
+            } else if let Some(value) = reason.strip_prefix("fallback_score:") {
+                format!("Низкая уверенность резервного поиска: {value}")
+            } else if reason == "duration_unknown" {
+                "Не удалось подтвердить длительность".to_string()
+            } else if let Some(value) = reason.strip_prefix("critical_marker:") {
+                format!("Обнаружена другая версия: {value}")
+            } else if let Some(value) = reason.strip_prefix("source:") {
+                format!("Источник: {value}")
+            } else if let Some(value) = reason.strip_prefix("candidate:") {
+                format!("Выбранный вариант: {value}")
+            } else {
+                reason.replace('_', " ")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[test]
+    fn moving_trim_start_past_end_keeps_end_fixed() {
+        assert_eq!(clamp_trim_window(9000, 6000, 10000), (5000, 6000));
+        assert_eq!(clamp_trim_window(2500, 6000, 10000), (2500, 6000));
+        assert_eq!(clamp_trim_window(100, 250, 250), (0, 250));
+    }
+
+    #[test]
+    fn loudness_settings_migrate_and_round_trip() {
+        let mut settings: AppSettings = serde_json::from_str(r#"{"quality":"high"}"#).unwrap();
+        assert!(settings.normalize_audio);
+        assert_eq!(settings.loudness_target_db, 89);
+        settings.normalize_audio = false;
+        settings.loudness_target_db = 92;
+        let saved = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, settings);
+    }
 
     #[test]
     fn suspicious_source_markers_detect_live_versions() {
@@ -7354,5 +5640,41 @@ mod app_tests {
     #[test]
     fn suspicious_source_markers_ignore_clean_names() {
         assert!(suspicious_source_markers("Artist - Song.mp3").is_empty());
+    }
+
+    #[test]
+    fn parses_safe_audio_search_report() {
+        let json = r#"{
+            "track":{"title":"Искала","artists":["Земфира"],"duration_sec":214},
+            "providers":[{"provider":"youtube","status":"ok","candidates":1,"error":null}],
+            "selected":{"rank":1,"score":91.1,"source":"youtube","title":"Official Video","artists":["Zemfira"],"duration_sec":211,"public_url":"https://example.com","public_url_ok":true,"flags":[]},
+            "candidates":[],
+            "safe_mode":{"download_performed":false,"direct_media_url_requested":false}
+        }"#;
+
+        let report: AudioSearchReport = serde_json::from_str(json).unwrap();
+
+        assert_eq!(report.track.title, "Искала");
+        assert_eq!(report.selected.unwrap().public_url_ok, Some(true));
+        assert!(!report.safe_mode.download_performed);
+    }
+
+    #[test]
+    fn humanizes_download_quality_warning() {
+        let note = humanize_download_quality_note(
+            "suspicious; actual_duration_diff:18s, source:youtube-search",
+        );
+        assert!(note.contains("Фактическая длительность отличается на 18 сек."));
+        assert!(note.contains("Источник: youtube-search"));
+    }
+
+    #[test]
+    fn responsive_panel_split_never_exceeds_available_width() {
+        for width in [320.0, 640.0, 900.0, 1800.0] {
+            let gap = 18.0;
+            let (left, right) = split_panel_widths(width, gap, 0.38);
+            assert!(left >= 0.0 && right >= 0.0);
+            assert!((left + gap + right - width).abs() < 0.01);
+        }
     }
 }

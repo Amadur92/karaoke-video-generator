@@ -1076,17 +1076,20 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "desktop_app"
-version = "0.5.16"
+version = "0.5.23"
 dependencies = [
  "ab_glyph",
  "dirs",
  "eframe",
+ "hound",
  "image",
  "imageproc",
+ "libc",
  "rfd",
  "rodio",
  "serde",
  "serde_json",
+ "sha2",
  "zip",
 ]
 
@@ -3741,6 +3744,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

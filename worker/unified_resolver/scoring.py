@@ -68,16 +68,62 @@ def duration_score(expected: int | None, actual: int | None) -> float:
     return 0.0
 
 
+_BENIGN_TITLE_TOKENS = {
+    "official", "video", "audio", "clip", "hd", "4k",
+    "ofitsialnoe", "ofitsialnyy", "ofitsialnyj", "klip",
+}
+
+
+def title_match_score(track: TrackMetadata, candidate: Candidate) -> float:
+    """Title similarity with precision, not only target-token recall.
+
+    ``partial_word_match`` intentionally answers "are all requested words
+    present?" and therefore returns 100 for a one-word title contained in a
+    much longer unrelated phrase. Candidate ranking also needs the inverse
+    question: how much unexplained text remains after artist and harmless
+    presentation labels are removed?
+    """
+    target = normalize(track.title)
+    candidate_normalized = normalize(candidate.title)
+    if not target or not candidate_normalized:
+        return 0.0
+
+    artist_tokens = set(normalize(" ".join(track.artists)).split())
+    cleaned_tokens = [
+        token
+        for token in candidate_normalized.split()
+        if token not in artist_tokens and token not in _BENIGN_TITLE_TOKENS
+    ]
+    cleaned = " ".join(cleaned_tokens) or candidate_normalized
+    target_tokens = target.split()
+    extra_tokens = max(0, len(cleaned_tokens) - len(target_tokens))
+    containment = partial_word_match(target, cleaned)
+    if containment > 0 and extra_tokens:
+        containment = max(0.0, containment - min(55.0, extra_tokens * 18.0))
+
+    return max(ratio(target, candidate_normalized), ratio(target, cleaned), containment)
+
+
 def score_candidate(track: TrackMetadata, candidate: Candidate) -> ScoredCandidate:
-    title_score = max(ratio(track.title, candidate.title), partial_word_match(track.title, candidate.title))
+    title_score = title_match_score(track, candidate)
     artist_target = " ".join(track.artists)
     artist_candidate = " ".join(candidate.artists)
     
-    # Fix bug: only match artist against title for YouTube sources where format is Artist - Title
+    # Artist fields often contain harmless qualifiers ("Группа КИНО",
+    # "The Beatles - Topic"). Exact ratio alone underrates these correct
+    # matches, so combine it with target-token containment. YouTube titles may
+    # additionally carry the artist when the channel/uploader field does not.
+    artist_field_score = max(
+        ratio(artist_target, artist_candidate),
+        partial_word_match(artist_target, artist_candidate),
+    )
     if "youtube" in candidate.source:
-        artist_score = max(ratio(artist_target, artist_candidate), partial_word_match(artist_target, candidate.title))
+        artist_score = max(
+            artist_field_score,
+            partial_word_match(artist_target, candidate.title),
+        )
     else:
-        artist_score = ratio(artist_target, artist_candidate)
+        artist_score = artist_field_score
 
     dur_score = duration_score(track.duration_sec, candidate.duration_sec)
     album_score = ratio(track.album or "", candidate.album or "") if track.album and candidate.album else 50.0

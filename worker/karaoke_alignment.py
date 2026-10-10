@@ -241,6 +241,15 @@ def evaluate_alignment_quality(karaoke, audio_duration=None, source=None, text_m
     lines = karaoke or []
     report = {
         "source": source or "unknown",
+        "verification": (
+            "acoustic_text_match"
+            if text_match is not None
+            else "structural_only"
+            if source == "lrc"
+            else "forced_alignment"
+            if source == "whisper_forced_alignment"
+            else "unknown"
+        ),
         "line_count": len(lines),
         "word_count": 0,
         "duration": round(float(audio_duration), 3) if audio_duration else None,
@@ -443,6 +452,11 @@ def evaluate_alignment_quality(karaoke, audio_duration=None, source=None, text_m
         report["summary"] = "suspicious"
     elif report["issues"]:
         report["summary"] = "minor_warnings"
+    elif source == "lrc" and text_match is None:
+        # A structurally perfect LRC can still be shifted or belong to another
+        # recording. Do not label it as acoustically verified unless a Whisper
+        # comparison was actually performed.
+        report["summary"] = "unverified"
     return report
 
 

@@ -5,6 +5,7 @@
 или:    python3 worker/test_karaoke_logic.py
 """
 
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from karaoke_worker import (  # noqa: E402
     strip_lrc_timestamps,
     _redistribute_words_in_line,
 )
+from audio_loudness import gain_from_report
 from karaoke_alignment import normalize_lyrics_text  # noqa: E402
 
 
@@ -230,6 +232,22 @@ def test_alignment_quality_report_accepts_good_text_match():
     )
     assert report["summary"] == "ok"
     assert report["metrics"]["text_match_score"] == 0.9
+
+
+def test_alignment_quality_marks_unprobed_lrc_as_unverified():
+    karaoke = [
+        {"start": 1.0, "end": 2.0, "words": [
+            {"word": "hello", "start": 1.0, "end": 2.0},
+        ]},
+    ]
+    report = evaluate_alignment_quality(
+        karaoke,
+        audio_duration=3.0,
+        source="lrc",
+        text_match=None,
+    )
+    assert report["score"] == 1.0
+    assert report["summary"] == "unverified"
 
 
 # ----------------- match_lyrics_to_whisper -----------------
@@ -564,6 +582,28 @@ def test_build_karaoke_applies_redistribution_by_default():
     assert kara[0]["start"] == 1.0 and kara[0]["end"] == 5.0
     for w in kara[0]["words"]:
         assert w["end"] - w["start"] <= 0.9 + 0.01
+
+
+def test_replaygain_target_and_peak_limit():
+    report = "track_gain = -6.00 dB\ntrack_peak = 0.8"
+    assert gain_from_report(report, 89) == (-6.0, -6.0)
+    assert gain_from_report(report, 92) == (-3.0, -3.0)
+    requested, applied = gain_from_report(report, 100)
+    assert requested == 5.0
+    assert abs(0.8 * math.pow(10, applied / 20) - math.pow(10, -1 / 20)) < 1e-10
+    assert gain_from_report("track_gain = 64 dB\ntrack_peak = 0", 89) == (0.0, 0.0)
+
+
+def test_replaygain_rejects_bad_measurements_and_targets():
+    for report, target in [("", 89), ("track_gain = NaN\ntrack_peak = 1", 89),
+                           ("track_gain = 2\ntrack_peak = -1", 89),
+                           ("track_gain = -6\ntrack_peak = 1", 101)]:
+        try:
+            gain_from_report(report, target)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid report/target: {report!r}, {target}")
 
 
 def _run():

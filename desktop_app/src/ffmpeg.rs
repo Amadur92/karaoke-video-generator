@@ -145,6 +145,26 @@ pub fn render_trimmed_audio(
     fade_out_ms: i64,
     output: &Path,
 ) -> Result<(), String> {
+    render_trimmed_audio_cancellable(
+        input,
+        start_ms,
+        end_ms,
+        fade_in_ms,
+        fade_out_ms,
+        output,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+pub fn render_trimmed_audio_cancellable(
+    input: &str,
+    start_ms: i64,
+    end_ms: i64,
+    fade_in_ms: i64,
+    fade_out_ms: i64,
+    output: &Path,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
     let duration_ms = end_ms - start_ms;
     if duration_ms < 1000 {
         return Err("Оставьте хотя бы 1 секунду аудио после обрезки.".to_string());
@@ -170,6 +190,15 @@ pub fn render_trimmed_audio(
         ));
     }
 
+    let temporary = output.with_file_name(format!(
+        ".{}.{}.{}.part.wav",
+        output.file_stem().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
     let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
     hide_subprocess_window(&mut cmd);
     cmd.arg("-y")
@@ -185,39 +214,33 @@ pub fn render_trimmed_audio(
         cmd.arg("-af").arg(audio_filters.join(","));
     }
 
-    let output_result = cmd
-        .arg("-acodec")
+    cmd.arg("-acodec")
         .arg("pcm_s16le")
         .arg("-ar")
         .arg("44100")
         .arg("-ac")
         .arg("2")
-        .arg(output)
-        .output()
-        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
-
-    if output_result.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output_result.stderr);
-        let tail = stderr
-            .lines()
-            .filter(|line| !is_ffmpeg_noise(line.trim()))
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        if tail.trim().is_empty() {
-            Err("ffmpeg не смог создать обрезанный аудиофайл.".to_string())
-        } else {
-            Err(format!(
-                "ffmpeg не смог создать обрезанный аудиофайл:\n{}",
-                tail
-            ))
+        .arg(&temporary);
+    let mut diagnostic = std::collections::VecDeque::new();
+    let success = desktop_app::process_runner::run(cmd, cancel.clone(), |_, line| {
+        if !is_ffmpeg_noise(line) {
+            if diagnostic.len() == 8 {
+                diagnostic.pop_front();
+            }
+            diagnostic.push_back(line.to_string());
         }
+    })?;
+    if success {
+        desktop_app::cache::replace_file(&temporary, output)
+    } else if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = std::fs::remove_file(&temporary);
+        Err("Подготовка аудио отменена".into())
+    } else {
+        let _ = std::fs::remove_file(&temporary);
+        Err(format!(
+            "Не удалось подготовить аудио:\n{}",
+            diagnostic.into_iter().collect::<Vec<_>>().join("\n")
+        ))
     }
 }
 
@@ -327,33 +350,6 @@ pub fn preview_video_size(path: &str) -> Result<(usize, usize), String> {
         .max(2)
         .next_multiple_of(2);
     Ok((target_width, scaled_height))
-}
-
-pub fn render_video_preview_audio(input: &str, output: &Path, start_ms: i64) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(paths::tool_path("ffmpeg"));
-    hide_subprocess_window(&mut cmd);
-    let status = cmd
-        .arg("-y")
-        .arg("-ss")
-        .arg(format!("{:.3}", start_ms.max(0) as f64 / 1000.0))
-        .arg("-i")
-        .arg(input)
-        .arg("-vn")
-        .arg("-acodec")
-        .arg("pcm_s16le")
-        .arg("-ar")
-        .arg("44100")
-        .arg("-ac")
-        .arg("2")
-        .arg(output)
-        .status()
-        .map_err(|e| format!("Не удалось запустить ffmpeg: {}", e))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ffmpeg не смог подготовить звук для предпросмотра.".to_string())
-    }
 }
 
 #[cfg(test)]

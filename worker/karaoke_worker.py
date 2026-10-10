@@ -9,11 +9,20 @@ import bisect
 import threading
 import subprocess
 import traceback
-import ssl
 import shutil
+import tempfile
 
-# Отключаем проверку SSL-сертификатов: нужна для скачивания моделей/инструментов на macOS.
-ssl._create_default_https_context = ssl._create_unverified_context
+from cache_identity import alignment_identity, atomic_write_json, file_sha256
+from render_output import finish_encoder
+
+try:
+    import certifi
+
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    # Development environments may rely on the OS trust store. Packaged builds
+    # include certifi explicitly via requirements.txt.
+    pass
 
 
 def configure_utf8_stdio() -> None:
@@ -41,6 +50,8 @@ os.makedirs(EXPORT_FOLDER, exist_ok=True)
 # Глобальный словарь для фоновых задач
 # Формат: { job_id: { "progress": float, "status": str, "done": bool, "error": str, "file": str } }
 jobs = {}
+
+from audio_loudness import DEFAULT_TARGET_DB, MIN_TARGET_DB, MAX_TARGET_DB, normalization_filter
 
 from karaoke_alignment import (
     align_timestamped_lrc_words,
@@ -78,8 +89,7 @@ def alignment_report_path_for_timings(timings_path):
 
 def write_timings_and_report(job_id, lyrics_karaoke, timings_output=None, audio_duration=None, source="unknown", text_match=None):
     final_dump_path = timings_output or os.path.join(EXPORT_FOLDER, f"{job_id}_timings_final.json")
-    with open(final_dump_path, 'w', encoding='utf-8') as f:
-        json.dump(lyrics_karaoke, f, ensure_ascii=False, indent=2)
+    atomic_write_json(final_dump_path, lyrics_karaoke)
 
     report = evaluate_alignment_quality(
         lyrics_karaoke,
@@ -88,8 +98,10 @@ def write_timings_and_report(job_id, lyrics_karaoke, timings_output=None, audio_
         text_match=text_match,
     )
     report_path = alignment_report_path_for_timings(final_dump_path)
-    with open(report_path, 'w', encoding='utf-8') as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    if jobs[job_id].get("cache_identity"):
+        report["cache_identity"] = jobs[job_id]["cache_identity"]
+        report["timings_sha256"] = file_sha256(final_dump_path)
+    atomic_write_json(report_path, report)
 
     jobs[job_id]["timings_file"] = final_dump_path
     jobs[job_id]["alignment_report_file"] = report_path
@@ -1324,17 +1336,49 @@ def find_demucs_command():
 
 def separate_vocals_with_demucs(audio_path, status_callback=None):
     cache_path = vocal_cache_path_for_audio(audio_path)
-    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1024:
-        if status_callback:
-            status_callback(f"Используем кэш вокала: {os.path.basename(cache_path)}")
-        return cache_path
+    cache_metadata_path = cache_path + ".cache.json"
+    cache_identity = {"schema": 1, "algorithm": "demucs-mdx_q-v1", "audio_sha256": file_sha256(audio_path)}
+    try:
+        with open(cache_metadata_path, encoding="utf-8") as metadata:
+            cache_matches = json.load(metadata) == cache_identity
+    except (OSError, ValueError):
+        cache_matches = False
+    if cache_matches and os.path.exists(cache_path) and os.path.getsize(cache_path) > 1024:
+        source_duration = audio_duration_seconds(audio_path)
+        cache_duration = audio_duration_seconds(cache_path)
+        if (
+            source_duration > 0
+            and cache_duration > 0
+            and abs(source_duration - cache_duration) <= 1.0
+        ):
+            if status_callback:
+                status_callback(f"Используем кэш вокала: {os.path.basename(cache_path)}")
+            return cache_path
+        # A shared Demucs output directory used by older versions could return
+        # the vocals stem of another track. Never reuse a cache whose duration
+        # does not match the source audio.
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
 
     cmd = find_demucs_command()
 
-    out_dir = os.path.join(os.path.dirname(cache_path), ".karaoke_demucs")
-    model_cache_dir = demucs_model_cache_dir(audio_path, out_dir)
+    audio_stem = os.path.splitext(os.path.basename(audio_path))[0]
+    safe_job_stem = re.sub(r'[^\w\- .А-Яа-яЁё]+', '_', audio_stem).strip() or 'audio'
+    out_root = os.path.join(os.path.dirname(cache_path), ".karaoke_demucs")
+    # Each input gets an isolated output tree. Searching a shared tree for the
+    # first vocals.wav can silently associate one song with another.
+    out_dir = os.path.join(out_root, safe_job_stem)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    model_cache_dir = demucs_model_cache_dir(audio_path, out_root)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
+    requested_device = os.environ.get("KARAOKE_DEMUCS_DEVICE", "").strip().lower()
+    if requested_device in {"cpu", "cuda", "mps"}:
+        # Demucs supports MPS on Apple Silicon even though Stable Whisper still
+        # needs CPU for sparse alignment operations.
+        cmd.extend(["-d", requested_device])
     cmd.extend([
         "--two-stems=vocals",
         "-n", "mdx_q",
@@ -1380,7 +1424,23 @@ def separate_vocals_with_demucs(audio_path, status_callback=None):
     if not found_vocals:
         raise RuntimeError("Demucs не создал vocals.wav")
 
-    shutil.copy2(found_vocals, cache_path)
+    temporary_cache = cache_path + f".{uuid.uuid4().hex}.tmp"
+    try:
+        shutil.copy2(found_vocals, temporary_cache)
+        os.replace(temporary_cache, cache_path)
+        atomic_write_json(cache_metadata_path, cache_identity)
+    finally:
+        if os.path.exists(temporary_cache):
+            os.remove(temporary_cache)
+    # The reusable cache above is the only artifact needed by subsequent
+    # alignment. Demucs also leaves a model-specific directory containing both
+    # stems; removing it prevents large batch jobs from silently consuming many
+    # gigabytes next to the user's media package.
+    shutil.rmtree(out_dir, ignore_errors=True)
+    try:
+        os.rmdir(out_root)
+    except OSError:
+        pass
     if status_callback:
         status_callback(f"Вокал сохранен в кэш: {os.path.basename(cache_path)}")
     return cache_path
@@ -1839,9 +1899,16 @@ def build_karaoke_from_align_result(raw_lines, align_result, redistribute=True):
 
 
 # ----------------- РЕНДЕРИНГ (ФОНОВЫЙ ПОТОК) -----------------
-def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False, inactive_opacity=0.65, verify_lrc_with_whisper=False, separate_vocals_for_alignment=False):
+def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_name, quality='medium', font_family='montserrat', color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF', audio_delay=0.0, vocal_start=0.0, auto_vocal_start=False, timings_only=False, timings_output=None, plain_lines=False, inactive_opacity=0.65, verify_lrc_with_whisper=True, separate_vocals_for_alignment=False, acoustic_text_verification=True, loudness_target_db=DEFAULT_TARGET_DB, font_scale=1.0):
     cleanup_align_audio_path = None
+    temporary_mp4_path = None
+    encoder_diagnostics = None
+    process = None
     try:
+        jobs[job_id]["cache_identity"] = alignment_identity(
+            audio_path, lyrics, model_name, plain_lines, verify_lrc_with_whisper,
+            separate_vocals_for_alignment, acoustic_text_verification,
+        )
         from PIL import Image, ImageDraw, ImageFont
         
         def hex_to_rgba(hex_str, alpha=255):
@@ -1880,16 +1947,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         if timestamped_karaoke and not probe_timestamped_with_whisper:
             lyrics_karaoke = timestamped_karaoke
             jobs[job_id]["status"] = "✅ Использована точная разметка из текста. Тайминги подготовлены."
-            try:
-                write_timings_and_report(
-                    job_id,
-                    lyrics_karaoke,
-                    timings_output=timings_output,
-                    audio_duration=audio_duration_for_lrc,
-                    source="lrc",
-                )
-            except Exception:
-                pass
+            write_timings_and_report(
+                job_id,
+                lyrics_karaoke,
+                timings_output=timings_output,
+                audio_duration=audio_duration_for_lrc,
+                source="lrc",
+            )
 
             if timings_only:
                 jobs[job_id]["progress"] = 1.0
@@ -2002,7 +2066,7 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                     for w in getattr(segment, 'words', []) or []:
                         whisper_words.append(w)
 
-            if not plain_lines or verify_lrc_with_whisper:
+            if acoustic_text_verification and (not plain_lines or verify_lrc_with_whisper):
                 try:
                     text_match_report = measure_lyrics_text_match(
                         model,
@@ -2148,17 +2212,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         f"Строки из LRC, слова размечены внутри границ строк: "
                         f"{refine_stats['matched_words']}/{refine_stats['total_words']}."
                     )
-                    try:
-                        write_timings_and_report(
-                            job_id,
-                            lyrics_karaoke,
-                            timings_output=timings_output,
-                            audio_duration=audio_duration,
-                            source="lrc_whisper_hybrid",
-                            text_match=text_match_report,
-                        )
-                    except Exception:
-                        pass
+                    write_timings_and_report(
+                        job_id,
+                        lyrics_karaoke,
+                        timings_output=timings_output,
+                        audio_duration=audio_duration,
+                        source="lrc_whisper_hybrid",
+                        text_match=text_match_report,
+                    )
                     used_timestamped_hybrid = True
                     if timings_only:
                         jobs[job_id]["progress"] = 1.0
@@ -2192,17 +2253,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                         f"Строки оставлены по LRC, слова размечены внутри границ строк: "
                         f"{refine_stats['matched_words']}/{refine_stats['total_words']}."
                     )
-                    try:
-                        write_timings_and_report(
-                            job_id,
-                            lyrics_karaoke,
-                            timings_output=timings_output,
-                            audio_duration=audio_duration,
-                            source="shifted_lrc_whisper_hybrid",
-                            text_match=text_match_report,
-                        )
-                    except Exception:
-                        pass
+                    write_timings_and_report(
+                        job_id,
+                        lyrics_karaoke,
+                        timings_output=timings_output,
+                        audio_duration=audio_duration,
+                        source="shifted_lrc_whisper_hybrid",
+                        text_match=text_match_report,
+                    )
                     used_timestamped_hybrid = True
                     if timings_only:
                         jobs[job_id]["progress"] = 1.0
@@ -2289,7 +2347,6 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                             status_callback=lambda message: jobs[job_id].update({"status": message}),
                         )
                         if real_start is not None and real_start > lyrics_karaoke[suspect_idx]["start"] + 4.0:
-                            import tempfile
                             nonempty_raw_lines = [line.strip() for line in raw_lines if line.strip()]
                             raw_tail_idx = suspect_idx
                             target_clean = clean_word(target_text)
@@ -2407,17 +2464,14 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         # ДАМП ФИНАЛЬНЫХ ТАЙМИНГОВ для отладки и будущего Rust-рендера.
         # Важно писать его после всех smoothing/overlap фильтров: renderer должен получать
         # ровно те же тайминги, которые рисует текущий Python-путь.
-        try:
-            write_timings_and_report(
-                job_id,
-                lyrics_karaoke,
-                timings_output=timings_output,
-                audio_duration=locals().get("audio_duration", audio_duration_for_lrc),
-                source="whisper_forced_alignment",
-                text_match=text_match_report,
-            )
-        except Exception:
-            pass
+        write_timings_and_report(
+            job_id,
+            lyrics_karaoke,
+            timings_output=timings_output,
+            audio_duration=locals().get("audio_duration", audio_duration_for_lrc),
+            source="whisper_forced_alignment",
+            text_match=text_match_report,
+        )
 
         if timings_only:
             jobs[job_id]["progress"] = 1.0
@@ -2450,8 +2504,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         safe_line_w = max(width * 0.72, width - int(128 * size_scale))
         
         # Размеры шрифтов
-        font_size_max = int(42 * size_scale)
-        font_size_min = int(26 * size_scale)
+        font_size_max = max(1, int(42 * size_scale * font_scale))
+        font_size_min = max(1, int(26 * size_scale * font_scale))
         
         # Центры и смещения
         y_center = height // 2
@@ -2496,6 +2550,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         mode_suffix = "karaoke-lines" if plain_lines else "karaoke-word"
         clean_filename = f"{artist} - {title} ({mode_suffix}).mp4".replace("/", "_").replace("\\", "_")
         output_mp4_path = os.path.join(EXPORT_FOLDER, clean_filename)
+        temporary_mp4_path = os.path.join(EXPORT_FOLDER, f".{clean_filename}.{uuid.uuid4().hex}.part.mp4")
+        encoder_diagnostics = tempfile.TemporaryFile()
+
+        audio_filter = "anull"
+        if loudness_target_db is not None:
+            jobs[job_id]["status"] = f"Выравнивание громкости: {loudness_target_db} дБ ReplayGain..."
+            audio_filter = normalization_filter(audio_path, loudness_target_db)
 
         ffmpeg_cmd = [
             'ffmpeg', '-y',
@@ -2514,18 +2575,19 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
             '-bf', '0',
             '-vsync', 'cfr',
             '-avoid_negative_ts', 'make_zero',
+            '-af', audio_filter,
             '-c:a', 'aac',
             '-b:a', '192k',
             '-movflags', '+faststart',
             '-t', f'{duration:.3f}',
-            output_mp4_path
+            temporary_mp4_path
         ]
         
         process = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=encoder_diagnostics,
             **subprocess_no_window_kwargs()
         )
 
@@ -2757,8 +2819,8 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
                 jobs[job_id]["progress"] = round(prog_val, 2)
                 jobs[job_id]["status"] = f"Рендеринг караоке (плавная заливка): {int((frame_idx/total_frames)*100)}%..."
 
-        process.stdin.close()
-        process.wait()
+        jobs[job_id]["status"] = "Проверка целостности MP4..."
+        finish_encoder(process, encoder_diagnostics, temporary_mp4_path, output_mp4_path, duration)
 
         jobs[job_id]["progress"] = 1.0
         jobs[job_id]["status"] = f"✅ Готово! Караоке-видео успешно создано!"
@@ -2770,6 +2832,13 @@ def generate_karaoke_thread(job_id, audio_path, artist, title, lyrics, model_nam
         jobs[job_id]["status"] = f"❌ Ошибка: {str(e)}"
         traceback.print_exc()
     finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if encoder_diagnostics is not None:
+            encoder_diagnostics.close()
+        if temporary_mp4_path and os.path.exists(temporary_mp4_path):
+            os.remove(temporary_mp4_path)
         if cleanup_align_audio_path:
             try:
                 os.remove(cleanup_align_audio_path)
@@ -2789,16 +2858,20 @@ if __name__ == '__main__':
         parser.add_argument('--cli', action='store_true')
         parser.add_argument('--audio', required=False)
         parser.add_argument('--batch-align-queue')
+        parser.add_argument('--stop-after-current-file')
         parser.add_argument('--artist', default='Исполнитель')
         parser.add_argument('--title', default='Песня')
         parser.add_argument('--lyrics-file')
         parser.add_argument('--model', default='small')
         parser.add_argument('--quality', default='medium')
         parser.add_argument('--font', default='montserrat')
+        parser.add_argument('--font-scale', type=float, default=1.0)
         parser.add_argument('--color-active', default='#000000')
         parser.add_argument('--color-inactive', default='#B4B9C3')
         parser.add_argument('--color-bg', default='#FFFFFF')
         parser.add_argument('--audio-delay', type=float, default=0.0)
+        parser.add_argument('--loudness-target-db', type=int, default=DEFAULT_TARGET_DB)
+        parser.add_argument('--no-normalize-audio', action='store_true')
         parser.add_argument('--inactive-opacity', type=float, default=0.65)
         parser.add_argument('--vocal-start', type=float, default=0.0)
         parser.add_argument('--auto-vocal-start', action='store_true')
@@ -2847,11 +2920,14 @@ class CLIJobsDict(dict):
 def run_batch_align(queue_path, model_name, quality='medium', font_family='montserrat',
                     color_active='#000000', color_inactive='#B4B9C3', color_bg='#FFFFFF',
                     audio_delay=0.0, plain_lines=False, inactive_opacity=0.65,
-                    verify_lrc_with_whisper=False, separate_vocals_for_alignment=False):
+                    verify_lrc_with_whisper=False, separate_vocals_for_alignment=False,
+                    skip_acoustic_text_verification=False, stop_after_current_file=None):
     with open(queue_path, 'r', encoding='utf-8') as f:
         queue = json.load(f)
 
     for item in queue:
+        if stop_after_current_file and os.path.exists(stop_after_current_file):
+            break
         idx = item["index"]
         audio_path = item["audio"]
         artist = item["artist"]
@@ -2894,7 +2970,10 @@ def run_batch_align(queue_path, model_name, quality='medium', font_family='monts
                 inactive_opacity=inactive_opacity,
                 verify_lrc_with_whisper=verify_lrc_with_whisper,
                 separate_vocals_for_alignment=separate_vocals_for_alignment,
+                acoustic_text_verification=not skip_acoustic_text_verification,
             )
+            if jobs[job_id].get("error"):
+                raise RuntimeError(jobs[job_id]["error"])
             # Ensure done message is sent
             jobs[job_id]["progress"] = 1.0
             jobs[job_id]["status"] = "Синхронизация завершена"
@@ -2911,16 +2990,20 @@ def run_cli_entrypoint():
     parser.add_argument('--cli', action='store_true')
     parser.add_argument('--audio', required=False)
     parser.add_argument('--batch-align-queue')
+    parser.add_argument('--stop-after-current-file')
     parser.add_argument('--artist', default='Исполнитель')
     parser.add_argument('--title', default='Песня')
     parser.add_argument('--lyrics-file')
     parser.add_argument('--model', default='small')
     parser.add_argument('--quality', default='medium')
     parser.add_argument('--font', default='montserrat')
+    parser.add_argument('--font-scale', type=float, default=1.0)
     parser.add_argument('--color-active', default='#000000')
     parser.add_argument('--color-inactive', default='#B4B9C3')
     parser.add_argument('--color-bg', default='#FFFFFF')
     parser.add_argument('--audio-delay', type=float, default=0.0)
+    parser.add_argument('--loudness-target-db', type=int, default=DEFAULT_TARGET_DB)
+    parser.add_argument('--no-normalize-audio', action='store_true')
     parser.add_argument('--inactive-opacity', type=float, default=0.65)
     parser.add_argument('--vocal-start', type=float, default=0.0)
     parser.add_argument('--auto-vocal-start', action='store_true')
@@ -2932,8 +3015,11 @@ def run_cli_entrypoint():
     parser.add_argument('--no-scrolling', action='store_true', dest='plain_lines')
     parser.add_argument('--verify-lrc-with-whisper', action='store_true')
     parser.add_argument('--separate-vocals-for-alignment', action='store_true')
+    parser.add_argument('--skip-acoustic-text-verification', action='store_true')
 
     args = parser.parse_args()
+    if not MIN_TARGET_DB <= args.loudness_target_db <= MAX_TARGET_DB:
+        parser.error(f"--loudness-target-db: ожидается {MIN_TARGET_DB}–{MAX_TARGET_DB} дБ")
 
     if args.batch_align_queue:
         try:
@@ -2950,6 +3036,8 @@ def run_cli_entrypoint():
                 inactive_opacity=args.inactive_opacity,
                 verify_lrc_with_whisper=args.verify_lrc_with_whisper,
                 separate_vocals_for_alignment=args.separate_vocals_for_alignment,
+                skip_acoustic_text_verification=args.skip_acoustic_text_verification,
+                stop_after_current_file=args.stop_after_current_file,
             )
             sys.exit(0)
         except Exception as e:
@@ -3013,12 +3101,14 @@ def run_cli_entrypoint():
             model_name=args.model,
             quality=args.quality,
             font_family=args.font,
+            font_scale=max(0.7, min(1.3, args.font_scale)),
             color_active=args.color_active,
             color_inactive=args.color_inactive,
             color_bg=args.color_bg,
             audio_delay=args.audio_delay,
             vocal_start=args.vocal_start,
             auto_vocal_start=args.auto_vocal_start,
+            loudness_target_db=None if args.no_normalize_audio else args.loudness_target_db,
             timings_only=args.timings_only,
             timings_output=args.timings_output,
             plain_lines=args.plain_lines,

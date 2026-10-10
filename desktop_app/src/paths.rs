@@ -16,6 +16,9 @@ pub fn app_base_dir() -> PathBuf {
 }
 
 pub fn settings_path() -> PathBuf {
+    if std::env::var_os("KARAOKE_APP_DATA_DIR").is_some() {
+        return app_data_dir().join("settings.json");
+    }
     let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("karaoke-generator");
     let _ = std::fs::create_dir_all(&p);
@@ -24,6 +27,11 @@ pub fn settings_path() -> PathBuf {
 }
 
 pub fn app_data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("KARAOKE_APP_DATA_DIR") {
+        let path = PathBuf::from(path);
+        let _ = std::fs::create_dir_all(&path);
+        return path;
+    }
     let mut p = dirs::data_dir()
         .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -57,17 +65,18 @@ pub fn find_worker() -> Option<PathBuf> {
 
     let base = app_base_dir();
     let worker_exe = executable_name("karaoke_worker");
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker/karaoke_worker.py"),
-        base.join(&worker_exe),
+    let bundled = [
         base.join("worker").join(&worker_exe),
         base.join("../Resources/worker").join(&worker_exe),
-        base.join("karaoke_worker.py"),
-        base.join("worker/karaoke_worker.py"),
-        base.join("../../../worker/karaoke_worker.py"),
-        base.join("../../../../worker/karaoke_worker.py"),
-        PathBuf::from("/Users/mihailsokolenko/wow_quiz/worker/karaoke_worker.py"),
+        base.join(&worker_exe),
     ];
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker/karaoke_worker.py");
+    let mut candidates = bundled.to_vec();
+    if cfg!(debug_assertions) {
+        candidates.insert(0, development);
+    } else {
+        candidates.push(development);
+    }
 
     for candidate in candidates {
         if candidate.exists() {
@@ -153,6 +162,11 @@ fn clear_quarantine(path: &Path) {
 fn clear_quarantine(_path: &Path) {}
 
 pub fn clear_bundled_runtime_quarantine() {
+    static PREPARED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    PREPARED.get_or_init(clear_bundled_runtime_quarantine_once);
+}
+
+fn clear_bundled_runtime_quarantine_once() {
     if let Some(bin_dir) = bundled_bin_dir() {
         clear_quarantine(&bin_dir);
         repair_macos_bin_runtime(&bin_dir);
@@ -175,6 +189,15 @@ pub fn clear_bundled_runtime_quarantine() {
 /// Это держит защиту централизованной для parse-sheet, download, batch и генерации.
 pub fn prepare_worker_runtime(worker_path: &Path) {
     if is_python_worker(worker_path) {
+        return;
+    }
+    static PREPARED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let mut prepared = PREPARED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !prepared.insert(worker_path.to_path_buf()) {
         return;
     }
     if let Some(worker_dir) = worker_path.parent() {
@@ -414,7 +437,9 @@ pub fn exports_dir() -> PathBuf {
 
 /// Путь к папке для временных файлов
 pub fn temp_dir() -> PathBuf {
-    let temp = app_data_dir().join("tmp");
+    let temp = app_data_dir()
+        .join("tmp")
+        .join(format!("session-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp);
     temp
 }
@@ -423,4 +448,63 @@ pub fn upload_dir() -> PathBuf {
     let uploads = app_data_dir().join("uploads");
     let _ = std::fs::create_dir_all(&uploads);
     uploads
+}
+
+/// Choose an available renderer before starting expensive alignment.
+pub fn render_engine() -> Result<String, String> {
+    static CAPABILITIES: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    let ass = CAPABILITIES
+        .get_or_init(probe_render_capabilities)
+        .clone()?;
+    match std::env::var("KARAOKE_RENDER_ENGINE").ok().as_deref() {
+        Some("ass") if !ass => Err(
+            "В выбранном FFmpeg отсутствует ASS; выберите frames или установите FFmpeg с libass"
+                .into(),
+        ),
+        Some("ass") => Ok("ass".into()),
+        Some("frames") => Ok("frames".into()),
+        Some(value) => Err(format!("Неизвестный движок рендера: {value}")),
+        None => Ok(if ass { "ass" } else { "frames" }.into()),
+    }
+}
+
+fn probe_render_capabilities() -> Result<bool, String> {
+    let ffmpeg = tool_path("ffmpeg");
+    let mut filter_command = std::process::Command::new(&ffmpeg);
+    hide_probe_window(&mut filter_command);
+    let filters = filter_command
+        .args(["-hide_banner", "-filters"])
+        .output()
+        .map_err(|e| format!("FFmpeg недоступен: {e}"))?;
+    if !filters.status.success() {
+        return Err("FFmpeg не смог сообщить доступные фильтры".into());
+    }
+    let text = String::from_utf8_lossy(&filters.stdout);
+    let has = |name| {
+        text.lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(name))
+    };
+    if !has("replaygain") || !has("volume") {
+        return Err("FFmpeg не поддерживает выравнивание громкости (replaygain/volume)".into());
+    }
+    let mut probe_command = std::process::Command::new(tool_path("ffprobe"));
+    hide_probe_window(&mut probe_command);
+    let probe = probe_command
+        .arg("-version")
+        .output()
+        .map_err(|e| format!("FFprobe недоступен: {e}"))?;
+    if !probe.status.success() {
+        return Err("FFprobe не запускается".into());
+    }
+    Ok(has("ass"))
+}
+
+fn hide_probe_window(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }

@@ -10,9 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    name: Tests and rendering checks
+    uses: ./.github/workflows/quality.yml
+
   windows-box:
     name: Build Windows portable box
     runs-on: windows-latest
+    needs: quality
     timeout-minutes: 120
 
     steps:
@@ -57,6 +62,20 @@ jobs:
           $ffmpegDir = $ffmpegExe.Directory.FullName
           .\packaging\windows\build_box.ps1 -Python python -FfmpegDir $ffmpegDir
 
+      - name: Verify packaged renderer
+        shell: pwsh
+        run: |
+          $box = "packaging\dist\KaraokeGenerator-windows"
+          $renderer = Join-Path $box "worker\karaoke_render.exe"
+          $ffmpeg = Join-Path $box "bin\ffmpeg.exe"
+          $ffprobe = Join-Path $box "bin\ffprobe.exe"
+          $filters = (& $ffmpeg -hide_banner -filters 2>&1 | Out-String)
+          if ($filters -notmatch "\sass\s+V->V|\ssubtitles\s+V->V") {
+            throw "Packaged FFmpeg does not contain ASS/subtitles support."
+          }
+          python scripts/render_smoke.py --renderer $renderer --ffmpeg $ffmpeg --ffprobe $ffprobe --engine ass
+          python scripts/render_smoke.py --renderer $renderer --ffmpeg $ffmpeg --ffprobe $ffprobe --engine frames
+
       - name: Create Windows zip
         shell: pwsh
         run: |
@@ -75,6 +94,7 @@ jobs:
   macos-box:
     name: Build macOS portable box (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    needs: quality
     timeout-minutes: 120
     env:
       HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
@@ -120,12 +140,34 @@ jobs:
 
       - name: Install FFmpeg
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1 || ! ffmpeg -filters | grep -q ' ass '; then
-            brew install ffmpeg || brew link --overwrite ffmpeg
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1 && ffmpeg -hide_banner -filters 2>/dev/null | grep ' ass ' >/dev/null; then
+            ffmpeg_dir="$(dirname "$(command -v ffmpeg)")"
+          else
+            brew install ffmpeg-full
+            ffmpeg_dir="$(brew --prefix ffmpeg-full)/bin"
           fi
+          "$ffmpeg_dir/ffmpeg" -hide_banner -filters 2>/dev/null | grep ' ass ' >/dev/null
+          echo "$ffmpeg_dir" >> "$GITHUB_PATH"
+          echo "FFMPEG_BIN=$ffmpeg_dir/ffmpeg" >> "$GITHUB_ENV"
+          echo "FFPROBE_BIN=$ffmpeg_dir/ffprobe" >> "$GITHUB_ENV"
 
       - name: Build portable macOS folder
         run: ./packaging/macos/build_box.sh
+
+      - name: Verify packaged renderer and sandbox
+        run: |
+          BOX="packaging/dist/KaraokeGenerator-macos"
+          ./packaging/macos/smoke_sandbox.sh "$BOX" --check-only
+          python3 scripts/render_smoke.py \
+            --renderer "$BOX/worker/karaoke_render" \
+            --ffmpeg "$BOX/bin/ffmpeg" \
+            --ffprobe "$BOX/bin/ffprobe" \
+            --engine ass
+          python3 scripts/render_smoke.py \
+            --renderer "$BOX/worker/karaoke_render" \
+            --ffmpeg "$BOX/bin/ffmpeg" \
+            --ffprobe "$BOX/bin/ffprobe" \
+            --engine frames
 
       - name: Create macOS tarball
         run: |
@@ -152,7 +194,7 @@ jobs:
           path: packaging/dist/${{ matrix.app_dmg_name }}
 
   release:
-    needs: [windows-box, macos-box]
+    needs: [quality, windows-box, macos-box]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

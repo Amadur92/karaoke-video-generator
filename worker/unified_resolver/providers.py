@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import hashlib
+import os
 import time
 from typing import Iterable
 import urllib.error
@@ -89,19 +90,21 @@ class DeezerISRCProvider(Provider):
 
 class QobuzISRCProvider(Provider):
     name = "qobuz-isrc"
-    app_id = "712109809"
-    secret = "589be88e4538daea11f509d29e4a23b1"
 
     def search(self, track: TrackMetadata, limit: int = 5) -> list[Candidate]:
         if not track.isrc:
+            return []
+        app_id = os.environ.get("QOBUZ_APP_ID", "").strip()
+        secret = os.environ.get("QOBUZ_APP_SECRET", "").strip()
+        if not app_id or not secret:
             return []
         params = {"query": track.isrc, "limit": str(limit)}
         ts = str(int(time.time()))
         signed = {
             **params,
-            "app_id": self.app_id,
+            "app_id": app_id,
             "request_ts": ts,
-            "request_sig": self._signature("track/search", params, ts),
+            "request_sig": self._signature("track/search", params, ts, secret),
         }
         data = get_json("https://www.qobuz.com/api.json/0.2/track/search?" + urlencode(signed))
         items = (data.get("tracks") or {}).get("items") or []
@@ -132,12 +135,12 @@ class QobuzISRCProvider(Provider):
             )
         return candidates
 
-    def _signature(self, path: str, params: dict[str, str], ts: str) -> str:
+    def _signature(self, path: str, params: dict[str, str], ts: str, secret: str) -> str:
         normalized_path = path.strip("/").replace("/", "")
         payload = normalized_path
         for key in sorted(params):
             payload += key + str(params[key])
-        payload += ts + self.secret
+        payload += ts + secret
         return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
     def _quality_hint(self, item: dict) -> str:
@@ -209,7 +212,6 @@ class YouTubeSearchProvider(Provider):
             "extract_flat": True,
             "noplaylist": True,
             "ignoreerrors": True,
-            "nocheckcertificate": True,
         }
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(query, download=False)
@@ -274,7 +276,6 @@ class SoundCloudSearchProvider(Provider):
             "extract_flat": True,
             "noplaylist": True,
             "ignoreerrors": True,
-            "nocheckcertificate": True,
         }
 
         candidates: list[Candidate] = []

@@ -38,6 +38,21 @@ cargo check --manifest-path desktop_app/Cargo.toml --bin desktop_app
 cargo check --manifest-path desktop_app/Cargo.toml --bin karaoke_render
 ```
 
+Перед релизом обязательно прогнать также:
+
+```bash
+python3 worker/test_karaoke_logic.py
+python3 worker/test_resolver_logic.py
+cargo fmt --manifest-path desktop_app/Cargo.toml -- --check
+cargo clippy --manifest-path desktop_app/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path desktop_app/Cargo.toml --all-targets
+```
+
+Релизный workflow выполняет эти проверки автоматически и после упаковки
+рендерит короткий MP4 обоими движками (`ass` и `frames`). Готовый файл сначала
+создаётся как `.part.mp4`, проверяется через `ffprobe` и полное декодирование,
+и только затем атомарно заменяет итоговый файл.
+
 Запустить приложение локально:
 
 ```bash
@@ -405,4 +420,3 @@ v0.2.8
 - [ ] `updatedAt` у assets свежий.
 - [ ] Название файла понятно по платформе.
 - [ ] Если это macOS-пользователь, понятно, Apple Silicon у него или Intel.
-

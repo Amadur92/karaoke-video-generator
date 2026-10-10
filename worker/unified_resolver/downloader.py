@@ -330,11 +330,20 @@ class Downloader:
     def _duration_tolerance(self, default: int) -> int:
         return self.duration_tolerance or default
 
-    def download(self, track: TrackMetadata, candidates: list[ScoredCandidate], override_dir: Optional[str] = None) -> bool:
+    def download(
+        self,
+        track: TrackMetadata,
+        candidates: list[ScoredCandidate],
+        override_dir: Optional[str] = None,
+        result_out: Optional[dict[str, Any]] = None,
+    ) -> bool:
         """
         Attempts to download candidates in order of score. Falls back to YouTube search if all fail.
         Also fetches lyrics from LRCLIB and embeds/saves them.
         """
+        if result_out is not None:
+            result_out.clear()
+
         if override_dir:
             track_dir = override_dir
         else:
@@ -348,6 +357,7 @@ class Downloader:
         temp_audio: Optional[str] = None
         temp_cover: Optional[str] = None
         resolved_candidate = None
+        resolved_scored: Optional[ScoredCandidate] = None
 
         # Provenance-запись: фиксирует, откуда и почему скачан трек, чтобы
         # массово ревьюить пакеты и быстро ловить регрессии (live-версии и т.д.).
@@ -380,18 +390,32 @@ class Downloader:
                     "flags": scored.flags,
                 })
                 continue
-            allow_low_score_exact = (
-                self.duration_tolerance
-                and scored.title_score >= 78
-                and scored.artist_score >= 40
-            )
-            if scored.score < 20 and not allow_low_score_exact:
-                print(f"[#] Skipping candidate '{candidate.title}' due to low score ({scored.score} < 20).")
+            if candidate.public_url_ok is False:
                 provenance["tried"].append({
                     "source": candidate.source,
                     "title": candidate.title,
                     "score": scored.score,
-                    "result": "skipped_low_score",
+                    "result": "skipped_dead_public_url",
+                })
+                continue
+            allow_low_score_exact = (
+                self.duration_tolerance
+                and scored.title_score >= 78
+                and scored.artist_score >= 55
+            )
+            weak_identity = scored.title_score < 60 or scored.artist_score < 50
+            if (scored.score < 45 or weak_identity) and not allow_low_score_exact:
+                print(
+                    f"[#] Skipping candidate '{candidate.title}' due to weak identity "
+                    f"(score={scored.score}, title={scored.title_score}, artist={scored.artist_score})."
+                )
+                provenance["tried"].append({
+                    "source": candidate.source,
+                    "title": candidate.title,
+                    "score": scored.score,
+                    "result": "skipped_weak_identity",
+                    "title_score": scored.title_score,
+                    "artist_score": scored.artist_score,
                 })
                 continue
 
@@ -434,6 +458,7 @@ class Downloader:
                         temp_audio = None
                         continue
                     resolved_candidate = candidate
+                    resolved_scored = scored
                     provenance["selected"] = {
                         "source": candidate.source,
                         "title": candidate.title,
@@ -533,6 +558,14 @@ class Downloader:
             if provenance.get("selected"):
                 provenance["selected"].setdefault("actual_duration", actual_duration)
                 provenance["selected"].setdefault("expected_duration", _ref_dur)
+
+            if result_out is not None:
+                result_out.update({
+                    "selected": dict(provenance.get("selected") or {}),
+                    "scored_candidate": resolved_scored,
+                    "expected_duration": _ref_dur,
+                    "actual_duration": actual_duration,
+                })
 
             # Сохраняем .source.json рядом с аудио для последующего аудита паков.
             self._save_provenance(track, provenance, track_dir)
@@ -744,7 +777,6 @@ class Downloader:
                 "quiet": True,
                 "nooverwrites": True,
                 "noplaylist": True,
-                "nocheckcertificate": True,
             }
             options = self._add_cookie_options(options)
 
@@ -783,7 +815,6 @@ class Downloader:
                 "quiet": True,
                 "nooverwrites": True,
                 "noplaylist": True,
-                "nocheckcertificate": True,
             }
             options = self._add_cookie_options(options)
             
@@ -818,7 +849,8 @@ class Downloader:
         Кандидаты с критическими bad-маркерами в названии полностью исключаются
         (кроме случая, когда искомый трек сам содержит этот маркер).
         """
-        from .scoring import ratio
+        from .models import Candidate
+        from .scoring import partial_word_match, ratio, title_match_score
         from .markers import (
             has_critical_marker,
             has_concert_marker_in_text,
@@ -826,7 +858,6 @@ class Downloader:
             is_official_channel,
         )
 
-        target_title = f"{track.primary_artist} {track.title}".strip()
         expected_dur = track.duration_sec
 
         # Для нормировки view_count в бонус используем максимальное значение
@@ -851,9 +882,35 @@ class Downloader:
                 continue
 
             score = 0.0
-            # 1. Сходство названия.
-            title_sim = max(ratio(target_title, title), ratio(track.title, title))
-            score += title_sim * 0.30
+            uploader = entry.get("uploader") or entry.get("channel") or entry.get("uploader_id") or ""
+
+            # 1. Точность названия и исполнителя. Recall-only сравнение раньше
+            # пропускало ролики, где нужное короткое название было лишь частью
+            # длинного чужого заголовка. Используем тот же precision-aware score,
+            # что и основной resolver, и требуем отдельное подтверждение артиста.
+            title_sim = title_match_score(
+                track,
+                Candidate(source="youtube-search", title=title),
+            )
+            if track.primary_artist:
+                artist_sim = max(
+                    partial_word_match(track.primary_artist, title),
+                    ratio(track.primary_artist, uploader),
+                    partial_word_match(track.primary_artist, uploader),
+                )
+            else:
+                artist_sim = 100.0
+            candidate_duration = entry.get("duration")
+            exact_title_duration = (
+                title_sim >= 90
+                and expected_dur
+                and candidate_duration
+                and abs(expected_dur - candidate_duration) <= 8
+            )
+            if title_sim < 58 or (artist_sim < 50 and not exact_title_duration):
+                continue
+            score += title_sim * 0.32
+            score += artist_sim * 0.18
 
             # 2. Длительность — главный сигнал для выбора правильной версии.
             dur = entry.get("duration")
@@ -879,8 +936,11 @@ class Downloader:
                 score -= 5  # нет длительности — небольшая неуверенность
 
             # 3. Бонус за официальный канал (VEVO, Topic, лейбл ...).
-            uploader = entry.get("uploader") or entry.get("channel") or entry.get("uploader_id") or ""
-            if is_official_channel(uploader):
+            artist_owned_channel = bool(track.primary_artist) and max(
+                ratio(track.primary_artist, uploader),
+                partial_word_match(track.primary_artist, uploader),
+            ) >= 82
+            if is_official_channel(uploader) or artist_owned_channel:
                 score += 15
 
             # 4. Мягкий штраф за «lyrics»/«audio»-видео (часто низкое качество).
@@ -966,6 +1026,9 @@ class Downloader:
         artist = track.primary_artist.strip()
         title = track.title.strip()
         if artist and title:
+            official_audio_query = f"{artist} {title} official audio"
+            if official_audio_query.lower() not in (q.lower() for q in queries):
+                queries.append(official_audio_query)
             topic_query = f"{artist} {title} topic"
             if topic_query.lower() not in (q.lower() for q in queries):
                 queries.append(topic_query)
@@ -994,7 +1057,6 @@ class Downloader:
                 "quiet": True,
                 "nooverwrites": True,
                 "noplaylist": True,
-                "nocheckcertificate": True,
             }
             options = self._add_cookie_options(options)
 
@@ -1006,7 +1068,7 @@ class Downloader:
                 for q in self._youtube_search_queries(query, track):
                     print(f"[*] Searching YouTube for: '{q}'...")
                     try:
-                        info = ydl.extract_info(f"ytsearch8:{q}", download=False)
+                        info = ydl.extract_info(f"ytsearch10:{q}", download=False)
                     except Exception as exc:
                         print(f"[!] YouTube search '{q}' failed: {exc}", file=sys.stderr)
                         continue
@@ -1022,40 +1084,83 @@ class Downloader:
 
                 ranked = self._rank_youtube_entries(all_entries, track)
                 if ranked:
-                    # Отчитываемся о выборе для прозрачности.
-                    best_score, best_entry = ranked[0]
-                    dur = best_entry.get("duration")
-                    uploader = best_entry.get("uploader") or best_entry.get("channel") or ""
-                    print(
-                        f"[*] Selected YouTube video: '{best_entry.get('title')}' "
-                        f"({dur}s, score={best_score:.1f}, channel='{uploader}')"
-                    )
-                    webpage_url = (
-                        best_entry.get("webpage_url")
-                        or f"https://www.youtube.com/watch?v={best_entry.get('id')}"
-                    )
+                    # Не связываем весь результат с единственным rank-1:
+                    # недоступность или битый файл первого кандидата не должны
+                    # скрывать второй, почти столь же уверенный результат.
+                    for candidate_rank, (best_score, best_entry) in enumerate(ranked[:5], 1):
+                        dur = best_entry.get("duration")
+                        uploader = best_entry.get("uploader") or best_entry.get("channel") or ""
+                        print(
+                            f"[*] Trying YouTube candidate #{candidate_rank}: "
+                            f"'{best_entry.get('title')}' "
+                            f"({dur}s, score={best_score:.1f}, channel='{uploader}')"
+                        )
+                        webpage_url = (
+                            best_entry.get("webpage_url")
+                            or f"https://www.youtube.com/watch?v={best_entry.get('id')}"
+                        )
+                        try:
+                            download_info = ydl.extract_info(webpage_url, download=True)
+                        except Exception as exc:
+                            if out_provenance is not None:
+                                out_provenance.setdefault("tried", []).append({
+                                    "source": "youtube-search",
+                                    "rank": candidate_rank,
+                                    "title": best_entry.get("title"),
+                                    "url": webpage_url,
+                                    "result": f"error:{type(exc).__name__}",
+                                })
+                            continue
 
-                    download_info = ydl.extract_info(webpage_url, download=True)
-                    video_id = (download_info or best_entry).get("id")
-                    ext = (download_info or {}).get("ext") or "webm"
-                    downloaded_path = os.path.join(temp_dir, f"{video_id}.{ext}")
-                    if downloaded_path and is_valid_audio_file(downloaded_path):
+                        video_id = (download_info or best_entry).get("id")
+                        downloaded_path = ydl.prepare_filename(download_info) if download_info else None
+                        if downloaded_path and is_valid_audio_file(downloaded_path):
+                            actual_duration = get_audio_duration(downloaded_path)
+                            if (
+                                track.duration_sec
+                                and actual_duration
+                                and abs(track.duration_sec - actual_duration)
+                                > self._duration_tolerance(25)
+                            ):
+                                if out_provenance is not None:
+                                    out_provenance.setdefault("tried", []).append({
+                                        "source": "youtube-search",
+                                        "rank": candidate_rank,
+                                        "title": best_entry.get("title"),
+                                        "url": webpage_url,
+                                        "result": "rejected_actual_duration_mismatch",
+                                        "expected_duration": track.duration_sec,
+                                        "actual_duration": actual_duration,
+                                    })
+                                print(
+                                    f"[!] YouTube candidate actual duration differs by "
+                                    f"{abs(track.duration_sec - actual_duration)}s; trying next."
+                                )
+                                _safe_remove(downloaded_path)
+                                continue
+                            if out_provenance is not None:
+                                out_provenance["selected"] = {
+                                    "source": "youtube-search",
+                                    "title": best_entry.get("title"),
+                                    "channel": uploader,
+                                    "url": webpage_url,
+                                    "external_id": video_id,
+                                    "rank_score": round(best_score, 2),
+                                    "expected_duration": track.duration_sec,
+                                    "actual_duration": actual_duration or dur,
+                                    "queries": self._youtube_search_queries(query, track),
+                                }
+                            return downloaded_path
+                        print("[!] YouTube candidate produced invalid audio, trying the next one...")
                         if out_provenance is not None:
-                            out_provenance.clear()
-                            out_provenance.update({
+                            out_provenance.setdefault("tried", []).append({
                                 "source": "youtube-search",
+                                "rank": candidate_rank,
                                 "title": best_entry.get("title"),
-                                "channel": uploader,
                                 "url": webpage_url,
-                                "external_id": video_id,
-                                "rank_score": round(best_score, 2),
-                                "expected_duration": track.duration_sec,
-                                "actual_duration": dur,
-                                "queries": self._youtube_search_queries(query, track),
+                                "result": "invalid_audio",
                             })
-                        return downloaded_path
-                    print("[!] YouTube search download produced invalid audio, discarding...")
-                    _safe_remove(downloaded_path)
+                        _safe_remove(downloaded_path)
                 else:
                     print("[-] All YouTube candidates filtered out by bad markers.")
         except Exception as e:
@@ -1081,7 +1186,6 @@ class Downloader:
                 "quiet": True,
                 "nooverwrites": True,
                 "noplaylist": True,
-                "nocheckcertificate": True,
             }
 
             with YoutubeDL(options) as ydl:
@@ -1106,29 +1210,69 @@ class Downloader:
 
                 ranked = self._rank_youtube_entries(all_entries, track)
                 if ranked:
-                    best_score, best_entry = ranked[0]
-                    dur = best_entry.get("duration")
-                    uploader = best_entry.get("uploader") or best_entry.get("channel") or ""
-                    print(
-                        f"[*] Selected SoundCloud track: '{best_entry.get('title')}' "
-                        f"({dur}s, score={best_score:.1f}, channel='{uploader}')"
-                    )
-                    track_url = best_entry.get("url") or best_entry.get("webpage_url")
-                    if track_url:
-                        result = self._download_soundcloud(track_url)
-                        if result and out_provenance is not None:
-                            out_provenance.clear()
-                            out_provenance.update({
+                    for candidate_rank, (best_score, best_entry) in enumerate(ranked[:5], 1):
+                        dur = best_entry.get("duration")
+                        uploader = best_entry.get("uploader") or best_entry.get("channel") or ""
+                        print(
+                            f"[*] Trying SoundCloud candidate #{candidate_rank}: "
+                            f"'{best_entry.get('title')}' "
+                            f"({dur}s, score={best_score:.1f}, channel='{uploader}')"
+                        )
+                        track_url = best_entry.get("url") or best_entry.get("webpage_url")
+                        if not track_url:
+                            continue
+                        try:
+                            result = self._download_soundcloud(track_url)
+                        except Exception as exc:
+                            if out_provenance is not None:
+                                out_provenance.setdefault("tried", []).append({
+                                    "source": "soundcloud-search",
+                                    "rank": candidate_rank,
+                                    "title": best_entry.get("title"),
+                                    "url": track_url,
+                                    "result": f"error:{type(exc).__name__}",
+                                })
+                            continue
+                        if result:
+                            actual_duration = get_audio_duration(result)
+                            if (
+                                track.duration_sec
+                                and actual_duration
+                                and abs(track.duration_sec - actual_duration)
+                                > self._duration_tolerance(25)
+                            ):
+                                if out_provenance is not None:
+                                    out_provenance.setdefault("tried", []).append({
+                                        "source": "soundcloud-search",
+                                        "rank": candidate_rank,
+                                        "title": best_entry.get("title"),
+                                        "url": track_url,
+                                        "result": "rejected_actual_duration_mismatch",
+                                        "expected_duration": track.duration_sec,
+                                        "actual_duration": actual_duration,
+                                    })
+                                _safe_remove(result)
+                                continue
+                            if out_provenance is not None:
+                                out_provenance["selected"] = {
+                                    "source": "soundcloud-search",
+                                    "title": best_entry.get("title"),
+                                    "channel": uploader,
+                                    "url": track_url,
+                                    "external_id": best_entry.get("id"),
+                                    "rank_score": round(best_score, 2),
+                                    "expected_duration": track.duration_sec,
+                                    "actual_duration": actual_duration or dur,
+                                }
+                            return result
+                        if out_provenance is not None:
+                            out_provenance.setdefault("tried", []).append({
                                 "source": "soundcloud-search",
+                                "rank": candidate_rank,
                                 "title": best_entry.get("title"),
-                                "channel": uploader,
                                 "url": track_url,
-                                "external_id": best_entry.get("id"),
-                                "rank_score": round(best_score, 2),
-                                "expected_duration": track.duration_sec,
-                                "actual_duration": dur,
+                                "result": "no_stream",
                             })
-                        return result
                 else:
                     print("[-] All SoundCloud candidates filtered out by bad markers.")
         except Exception as e:

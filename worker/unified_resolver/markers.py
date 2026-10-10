@@ -105,9 +105,8 @@ OFFICIAL_CHANNEL_KEYWORDS: list[str] = [
     "vevo",
     "topic",  # YouTube Music auto-generated «... - Topic»
     "official",
-    "records", "recordings", "label", "music",
-    "мьюзик", "музыка",
-    "tv", "channel", "канал",
+    "records", "recordings", "label",
+    "мьюзик",
 ]
 
 
