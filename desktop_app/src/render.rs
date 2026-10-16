@@ -58,12 +58,24 @@ struct LineCache {
     height: u32,
 }
 
-fn line_highlight_is_live(words: &[WordLayer], t: f64) -> bool {
+fn highlight_sample(start: f64, end: f64, frame_time: f64, frame_duration: f64) -> Option<f64> {
+    // Render any lyric that intersects this output frame, even if it lasts
+    // less than a frame. The final sampled position fills a completed word.
+    let visible_end = end.max(start + f64::EPSILON);
+    (frame_time < visible_end && frame_time + frame_duration > start).then_some(
+        if end - start < frame_duration {
+            end.max(start)
+        } else {
+            (frame_time + frame_duration / 2.0).clamp(start, end)
+        },
+    )
+}
+
+fn line_highlight_sample(words: &[WordLayer], t: f64, frame_duration: f64) -> Option<f64> {
     words
         .first()
         .zip(words.last())
-        .map(|(first, last)| t >= first.start && t <= last.end)
-        .unwrap_or(false)
+        .and_then(|(first, last)| highlight_sample(first.start, last.end, t, frame_duration))
 }
 
 fn paint_line_highlight(img: &mut RgbaImage, words: &[WordLayer], t: f64) {
@@ -71,7 +83,7 @@ fn paint_line_highlight(img: &mut RgbaImage, words: &[WordLayer], t: f64) {
         if t < layer.start {
             continue;
         }
-        if t > layer.end {
+        if t >= layer.end {
             paste_alpha(img, &layer.image, layer.paste_x, 0, 1.0, None);
         } else {
             let progress =
@@ -591,7 +603,7 @@ fn build_line_cache(
         .collect()
 }
 
-fn transition_times(lines: &[KaraokeLine], visual_lead: f64) -> Vec<f64> {
+fn transition_times(lines: &[KaraokeLine]) -> Vec<f64> {
     lines
         .iter()
         .enumerate()
@@ -599,12 +611,7 @@ fn transition_times(lines: &[KaraokeLine], visual_lead: f64) -> Vec<f64> {
             if idx == 0 {
                 f64::NEG_INFINITY
             } else {
-                let prev = &lines[idx - 1];
-                if line.start > prev.end + 0.25 {
-                    line.start + visual_lead
-                } else {
-                    line.start
-                }
+                line.start
             }
         })
         .collect()
@@ -643,7 +650,9 @@ fn scroll_positions(
     let mut positions = Vec::with_capacity(total_frames);
     let mut scroll_y = 0.0_f32;
 
-    let transition_duration = 0.80_f64; // 0.80 seconds
+    // The line starts moving one visual-lead interval before it sings, so it
+    // should reach the centre by the lyric timestamp, including after pauses.
+    let transition_duration = visual_lead_seconds().max(0.05);
     let transition_total_frames = (transition_duration * fps).round().max(1.0) as usize;
 
     let mut last_target_y = 0.0_f32;
@@ -742,13 +751,12 @@ fn ass_fill_width(metric: &AssLineMetric, t: f64) -> f32 {
     fill
 }
 
-fn ass_line_highlight_is_live(metric: &AssLineMetric, t: f64) -> bool {
+fn ass_line_highlight_sample(metric: &AssLineMetric, t: f64, frame_duration: f64) -> Option<f64> {
     metric
         .words
         .first()
         .zip(metric.words.last())
-        .map(|(first, last)| t >= first.start && t <= last.end)
-        .unwrap_or(false)
+        .and_then(|(first, last)| highlight_sample(first.start, last.end, t, frame_duration))
 }
 
 // TODO: объединить параметры в структуру конфига асс-рендера при распиле рендерера.
@@ -766,6 +774,7 @@ fn write_ass_file(
     display_delay: f64,
     highlight_delay: f64,
     event_fps: f64,
+    output_fps: f64,
     size_scale: f32,
     scrolling: bool,
     plain_lines: bool,
@@ -780,15 +789,20 @@ fn write_ass_file(
     ass.push_str("ScaledBorderAndShadow: yes\nWrapStyle: 2\n\n");
     ass.push_str("[V4+ Styles]\n");
     ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
-    ass.push_str(&format!(
-        "Style: Dynamic,{},{:.0},{},{},{},{},1,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n\n",
-        ass_font_name,
-        ASS_BASE_FONT_SIZE * size_scale * font_scale,
-        ass_color(active, 0),
-        ass_color(active, 0),
-        ass_color(active, 255),
-        ass_color(active, 255)
-    ));
+    for (style, name, synthetic_bold) in [
+        ("Base", ass_font_name, 1),
+        ("Highlight", "Montserrat Black", 0),
+    ] {
+        ass.push_str(&format!(
+            "Style: {style},{name},{:.0},{},{},{},{},{synthetic_bold},0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n",
+            ASS_BASE_FONT_SIZE * size_scale * font_scale,
+            ass_color(active, 0),
+            ass_color(active, 0),
+            ass_color(active, 255),
+            ass_color(active, 255)
+        ));
+    }
+    ass.push('\n');
     ass.push_str("[Events]\n");
     ass.push_str(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
@@ -796,6 +810,8 @@ fn write_ass_file(
 
     let font = FontArc::try_from_slice(font_bytes)
         .map_err(|_| format!("Не удалось загрузить {font_log_name}"))?;
+    let highlight_font = FontArc::try_from_slice(MONTSERRAT_BLACK)
+        .map_err(|_| "Не удалось загрузить Montserrat Black".to_string())?;
     let base_font_size = ASS_BASE_FONT_SIZE * size_scale * font_scale;
     let min_font_size = base_font_size * (26.0 / 42.0);
     let line_spacing = 62.0_f32 * size_scale;
@@ -804,6 +820,7 @@ fn write_ass_file(
     let dist_cutoff = 95.0_f32 * size_scale;
     let safe_line_w = safe_text_width(width, size_scale);
     let metrics = build_ass_metrics(lines, &font, base_font_size);
+    let highlight_metrics = build_ass_metrics(lines, &highlight_font, base_font_size);
     let total_frames = (duration * event_fps).ceil() as usize;
     let scrolls = scroll_positions(
         transitions,
@@ -852,8 +869,13 @@ fn write_ass_file(
         if end <= start {
             return;
         }
+        let style = if plain_lines && ev.is_active {
+            "Highlight"
+        } else {
+            "Base"
+        };
         ass.push_str(&format!(
-            "Dialogue: 0,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
+            "Dialogue: 0,{},{},{style},,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&}}{}\n",
             ass_time(start), ass_time(end), x, ev.y, ev.fs,
             ass_color(color, 0), ev.alpha, metrics[idx].text
         ));
@@ -871,7 +893,7 @@ fn write_ass_file(
             return;
         }
         ass.push_str(&format!(
-            "Dialogue: 1,{},{},Dynamic,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&\\clip({:.0},0,{:.0},{height})}}{}\n",
+            "Dialogue: 1,{},{},Highlight,,0,0,0,,{{\\pos({:.1},{:.1})\\fs{:.1}\\1c{}\\alpha&H{:02X}&\\clip({:.0},0,{:.0},{height})}}{}\n",
             ass_time(start), ass_time(end), x, ev.y, ev.fs,
             ass_color(active, 0), ev.alpha, ev.clip_left.max(0.0), ev.clip_right,
             metrics[idx].text
@@ -888,6 +910,7 @@ fn write_ass_file(
         };
 
         for (idx, metric) in metrics.iter().enumerate() {
+            let highlight_metric = &highlight_metrics[idx];
             if !scrolling && idx != active_idx {
                 if let Some(ev) = open_base[idx].take() {
                     let color = if plain_lines {
@@ -898,7 +921,7 @@ fn write_ass_file(
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
-                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                    flush_clip(&ev, frame_idx, &mut ass, &highlight_metrics, idx, height);
                 }
                 continue;
             }
@@ -922,7 +945,7 @@ fn write_ass_file(
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
-                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                    flush_clip(&ev, frame_idx, &mut ass, &highlight_metrics, idx, height);
                 }
                 continue;
             }
@@ -934,7 +957,10 @@ fn write_ass_file(
                 1.0
             };
             let is_display_active = idx == active_idx;
-            let is_highlight_live = !plain_lines && ass_line_highlight_is_live(metric, highlight_t);
+            let highlight_sample = (!plain_lines)
+                .then(|| ass_line_highlight_sample(highlight_metric, highlight_t, 1.0 / output_fps))
+                .flatten();
+            let is_highlight_live = highlight_sample.is_some();
             let is_active_for_event = if plain_lines {
                 is_display_active
             } else {
@@ -942,7 +968,8 @@ fn write_ass_file(
             };
 
             let target_font_size = min_font_size + (base_font_size - min_font_size) * weight;
-            let fit_font_size = base_font_size * (safe_line_w / metric.width).min(1.0);
+            let fit_font_size =
+                base_font_size * (safe_line_w / metric.width.max(highlight_metric.width)).min(1.0);
             let font_size = target_font_size.min(fit_font_size);
             let scale = font_size / base_font_size;
             let mut opacity = if scrolling {
@@ -963,7 +990,7 @@ fn write_ass_file(
                     flush_base(&ev, frame_idx, &mut ass, &metrics, idx, color);
                 }
                 if let Some(ev) = open_clip[idx].take() {
-                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                    flush_clip(&ev, frame_idx, &mut ass, &highlight_metrics, idx, height);
                 }
                 continue;
             }
@@ -1001,9 +1028,9 @@ fn write_ass_file(
 
             // --- Clip event (active word fill) ---
             if is_highlight_live {
-                let fill = ass_fill_width(metric, highlight_t) * scale;
+                let fill = ass_fill_width(highlight_metric, highlight_sample.unwrap()) * scale;
                 if fill > 0.0 {
-                    let left = x - metric.width * scale / 2.0;
+                    let left = x - highlight_metric.width * scale / 2.0;
                     let clip_left = (left - 1.0 * size_scale).max(0.0);
                     let clip_right = (left + fill).clamp(0.0, width as f32);
 
@@ -1019,7 +1046,7 @@ fn write_ass_file(
                     };
                     if need_new_clip {
                         if let Some(ev) = open_clip[idx].take() {
-                            flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                            flush_clip(&ev, frame_idx, &mut ass, &highlight_metrics, idx, height);
                         }
                         open_clip[idx] = Some(LineEvent {
                             start_frame: frame_idx,
@@ -1034,13 +1061,13 @@ fn write_ass_file(
                 } else {
                     // fill == 0, no clip event needed
                     if let Some(ev) = open_clip[idx].take() {
-                        flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                        flush_clip(&ev, frame_idx, &mut ass, &highlight_metrics, idx, height);
                     }
                 }
             } else {
                 // Not active anymore — flush any open clip event
                 if let Some(ev) = open_clip[idx].take() {
-                    flush_clip(&ev, frame_idx, &mut ass, &metrics, idx, height);
+                    flush_clip(&ev, frame_idx, &mut ass, &highlight_metrics, idx, height);
                 }
             }
         }
@@ -1049,11 +1076,15 @@ fn write_ass_file(
     // Flush all remaining open events at end of video
     for idx in 0..num_lines {
         if let Some(ev) = open_base[idx].take() {
-            let color = if plain_lines { active } else { inactive };
+            let color = if plain_lines && ev.is_active {
+                active
+            } else {
+                inactive
+            };
             flush_base(&ev, total_frames, &mut ass, &metrics, idx, color);
         }
         if let Some(ev) = open_clip[idx].take() {
-            flush_clip(&ev, total_frames, &mut ass, &metrics, idx, height);
+            flush_clip(&ev, total_frames, &mut ass, &highlight_metrics, idx, height);
         }
     }
 
@@ -1093,6 +1124,7 @@ fn render_ass(
         display_delay,
         highlight_delay,
         event_fps,
+        fps,
         size_scale,
         scrolling,
         plain_lines,
@@ -1475,7 +1507,7 @@ fn render_unvalidated(config: RenderConfig) -> Result<(), String> {
     let visual_lead = visual_lead_seconds();
     let display_delay = config.audio_delay - visual_lead;
     let highlight_delay = config.audio_delay + visual_lag_seconds();
-    let transitions = transition_times(&lines, visual_lead);
+    let transitions = transition_times(&lines);
 
     if use_ass_renderer {
         return render_ass(
@@ -1599,14 +1631,16 @@ fn render_unvalidated(config: RenderConfig) -> Result<(), String> {
                 1.0
             };
             let center_strength = weight * weight * (3.0 - 2.0 * weight);
-            let is_highlight_live =
-                !config.plain_lines && line_highlight_is_live(&line_cache.words, highlight_t);
+            let highlight_sample = (!config.plain_lines)
+                .then(|| line_highlight_sample(&line_cache.words, highlight_t, 1.0 / fps))
+                .flatten();
+            let is_highlight_live = highlight_sample.is_some();
 
             let (target_img, target_variant) = if config.plain_lines {
                 (line_cache.active_plain.clone(), 2_u8)
             } else if is_highlight_live {
                 let mut img = line_cache.active_inactive.clone();
-                paint_line_highlight(&mut img, &line_cache.words, highlight_t);
+                paint_line_highlight(&mut img, &line_cache.words, highlight_sample.unwrap());
                 (img, 3_u8)
             } else {
                 (line_cache.active_inactive.clone(), 1_u8)
@@ -1964,6 +1998,106 @@ pub fn run_cli() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subframe_lyric_is_highlighted_on_the_frame_it_intersects() {
+        let frame_duration = 1.0 / 60.0;
+        assert_eq!(
+            highlight_sample(0.010, 0.011, 0.0, frame_duration),
+            Some(0.011)
+        );
+        assert_eq!(
+            highlight_sample(0.010, 0.011, frame_duration, frame_duration),
+            None
+        );
+        assert_eq!(highlight_sample(0.0, 0.0, 0.0, frame_duration), Some(0.0));
+    }
+
+    #[test]
+    fn completed_subframe_word_is_fully_painted() {
+        let word = WordLayer {
+            start: 0.010,
+            end: 0.011,
+            paste_x: 0,
+            fill_width: 2,
+            image: ImageBuffer::from_pixel(2, 2, Rgba([0, 0, 0, 255])),
+        };
+        let mut frame = ImageBuffer::from_pixel(2, 2, Rgba([255, 255, 255, 255]));
+        paint_line_highlight(&mut frame, &[word], 0.011);
+        assert_eq!(*frame.get_pixel(0, 0), Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn next_line_reaches_center_by_its_timestamp_even_after_a_pause() {
+        let lines = [
+            KaraokeLine {
+                start: 0.0,
+                end: 1.0,
+                words: vec![],
+            },
+            KaraokeLine {
+                start: 3.0,
+                end: 4.0,
+                words: vec![],
+            },
+        ];
+        let fps = 60.0;
+        let positions = scroll_positions(
+            &transition_times(&lines),
+            4 * fps as usize,
+            fps,
+            -visual_lead_seconds(),
+            62.0,
+        );
+        assert!(positions[(3.0 * fps) as usize] > 61.0);
+        assert_eq!(positions[(3.0 * fps) as usize], 62.0);
+    }
+
+    #[test]
+    fn ass_render_includes_black_highlight_for_a_subframe_line() {
+        let output = std::env::temp_dir().join(format!(
+            "karaoke-short-line-{}-{:?}.ass",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let lines = vec![KaraokeLine {
+            start: 0.010,
+            end: 0.011,
+            words: vec![KaraokeWord {
+                word: "Миг".to_string(),
+                start: 0.010,
+                end: 0.011,
+            }],
+        }];
+        write_ass_file(
+            &output,
+            &lines,
+            &transition_times(&lines),
+            0.1,
+            1352,
+            224,
+            Rgba([0, 0, 0, 255]),
+            Rgba([180, 185, 195, 255]),
+            0.65,
+            -visual_lead_seconds(),
+            0.0,
+            100.0,
+            60.0,
+            1.0,
+            true,
+            false,
+            "montserrat",
+            1.0,
+        )
+        .unwrap();
+        let ass = std::fs::read_to_string(&output).unwrap();
+        let _ = std::fs::remove_file(output);
+        assert!(ass.contains("Style: Highlight,Montserrat Black"));
+        assert!(
+            ass.lines()
+                .any(|line| line.starts_with("Dialogue: 1,") && line.contains("Миг"))
+        );
+    }
 
     #[test]
     fn preview_uses_output_dimensions_and_font_scale_changes_pixels() {
