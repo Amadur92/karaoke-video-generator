@@ -37,12 +37,17 @@ def write_audio(path: Path, duration: float = 2.0) -> None:
 def write_timings(path: Path) -> None:
     payload = [
         {
-            "start": 0.15,
+            "start": 0.151,
+            "end": 0.152,
+            "words": [{"word": "Миг", "start": 0.151, "end": 0.152}],
+        },
+        {
+            "start": 0.8,
             "end": 1.85,
             "words": [
-                {"word": "Render", "start": 0.15, "end": 0.85},
-                {"word": "smoke", "start": 0.90, "end": 1.35},
-                {"word": "test", "start": 1.40, "end": 1.85},
+                {"word": "Render", "start": 0.8, "end": 1.2},
+                {"word": "smoke", "start": 1.2, "end": 1.5},
+                {"word": "test", "start": 1.5, "end": 1.85},
             ],
         }
     ]
@@ -79,6 +84,30 @@ def verify_output(ffprobe: str, output: Path, expected_fps: int) -> None:
     duration = float(payload["format"]["duration"])
     if abs(duration - 2.0) > 0.25:
         raise RuntimeError(f"unexpected duration: {duration}")
+
+
+def verify_short_line_highlight(ffmpeg: str, output: Path, expected_fps: int) -> None:
+    def dark_pixels(frame_index: int) -> int:
+        raw = subprocess.check_output(
+            [
+                ffmpeg, "-v", "error", "-i", str(output), "-vf",
+                f"select=eq(n\\,{frame_index})", "-frames:v", "1",
+                "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
+            ]
+        )
+        if len(raw) != 1352 * 224 * 3:
+            raise RuntimeError(f"unexpected decoded frame size: {len(raw)}")
+        return sum(
+            1 for pixel in range(0, len(raw), 3)
+            if max(raw[pixel:pixel + 3]) < 60
+        )
+
+    before = dark_pixels(0)
+    during = dark_pixels(int(0.151 * expected_fps))
+    if during < before + 50:
+        raise RuntimeError(
+            f"sub-frame line was not highlighted: before={before}, during={during}"
+        )
 
 
 def main() -> int:
@@ -124,6 +153,7 @@ def main() -> int:
             ]
         )
         verify_output(args.ffprobe, output, expected_fps)
+        verify_short_line_highlight(args.ffmpeg, output, expected_fps)
         print(result.stderr.strip())
         print(f"render smoke passed: engine={args.engine}, fps={expected_fps}")
     return 0
